@@ -7,9 +7,11 @@ This repo owns the typed local policy model, schemas, templates, packaging, and
 operator commands. Real site policy is loaded at runtime from the XDG config
 root and should live in a private repo or private host configuration system.
 
-This repository is intentionally safe to clone and test on a workstation. The
-current live-mutating commands refuse to run unless they are explicit dry-runs;
-fleet configuration changes remain a separate deployment phase.
+This repository is intentionally safe to clone and test on a workstation. It
+does not apply fleet configuration changes: generated files are rendered only
+to operator-chosen staging directories, lifecycle commands emit reviewable
+plans, and the current live-operation stubs refuse to run unless invoked as
+dry-runs. Runtime rollout remains a separate deployment phase.
 
 The source tree is intentionally free of real site topology. The checked-in
 `examples/site-config` tree uses reserved example names and addresses so tests
@@ -90,12 +92,17 @@ Plans can also be emitted as JSON for tests, scripts, or future executors:
 cargo run --bin grafhome-ca -- plan --json user-login --user alice --device ca-host
 ```
 
-Guarded live commands:
+Guarded live-operation stubs:
 
 ```sh
 cargo run --bin grafhome-ca -- init-ca --dry-run
 cargo run --bin grafhome-ssh-login -- --dry-run --user alice
 ```
+
+`grafhome-ca init-ca --dry-run` prints the same reviewed initialization plan as
+`grafhome-ca plan init-ca`. `grafhome-ssh-login` is a placeholder for future
+user certificate issuance; without `--dry-run` it exits before invoking `step`
+or `ssh-agent`, and its dry-run mode currently validates only the CLI surface.
 
 ## Release Versioning
 
