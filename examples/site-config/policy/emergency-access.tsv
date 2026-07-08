@@ -1,0 +1,5 @@
+host	account	key_id	storage	test_interval
+ca-host	alice	ca-host-breakglass-1	password-manager-or-offline	quarterly
+proxy-host	alice	proxy-host-breakglass-1	password-manager-or-offline	quarterly
+edge-host	alice	edge-host-breakglass-1	password-manager-or-offline	quarterly
+laptop-a	alice	laptop-a-breakglass-1	password-manager-or-offline	quarterly

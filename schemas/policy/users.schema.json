@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA users policy",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "user",
+      "principal",
+      "unix_account",
+      "root_ssh",
+      "provisioner",
+      "cert_ttl",
+      "status",
+      "notes"
+    ],
+    "properties": {
+      "user": { "$ref": "#/definitions/account" },
+      "principal": { "$ref": "#/definitions/principal" },
+      "unix_account": { "$ref": "#/definitions/account" },
+      "root_ssh": { "enum": ["yes", "no"] },
+      "provisioner": { "$ref": "#/definitions/name" },
+      "cert_ttl": { "$ref": "#/definitions/ttl" },
+      "status": { "enum": ["active", "planned", "disabled"] },
+      "notes": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "account": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "principal": { "type": "string", "pattern": "^[A-Za-z0-9._@-]+$" },
+    "ttl": { "type": "string", "pattern": "^[1-9][0-9]*[smh]$" }
+  }
+}

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+tmp=$(mktemp -d)
+
+cleanup() {
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+assert_contains() {
+  local needle=$1
+  local path=$2
+  local content
+
+  content=$(<"$path")
+  if [[ "$content" != *"$needle"* ]]; then
+    printf 'expected %s to contain %q\n' "$path" "$needle" >&2
+    printf '%s\n' "$content" >&2
+    exit 1
+  fi
+}
+
+export GRAFHOME_CA_BUILD_COMMIT=0123456789abcdef0123456789abcdef01234567
+export GRAFHOME_CA_BUILD_TIMESTAMP=20260708-120102
+
+version=$("$repo_root/scripts/release-version.sh")
+if [[ "$version" != "20260708-120102-01234567" ]]; then
+  printf 'unexpected version: %s\n' "$version" >&2
+  exit 1
+fi
+
+tag=$("$repo_root/scripts/release-tag.sh")
+if [[ "$tag" != "$version" ]]; then
+  printf 'tag/version mismatch: %s vs %s\n' "$tag" "$version" >&2
+  exit 1
+fi
+
+if "$repo_root/scripts/package-release.sh" x86_64-unknown-linux-musl x86_64-unknown-linux-musl >/dev/null 2>"$tmp/package.err"; then
+  printf 'package script accepted a Rust target triple as asset label\n' >&2
+  exit 1
+fi
+assert_contains 'public release label' "$tmp/package.err"
+
+if "$repo_root/scripts/smoke-release.sh" x86_64-unknown-linux-musl >/dev/null 2>"$tmp/smoke.err"; then
+  printf 'smoke script accepted a Rust target triple as asset label\n' >&2
+  exit 1
+fi
+assert_contains 'public release label' "$tmp/smoke.err"

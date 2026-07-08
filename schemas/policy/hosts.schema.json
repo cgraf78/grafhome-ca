@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA hosts policy",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["host", "kind", "ssh_server", "ssh_client", "renewal_owner", "principals"],
+    "properties": {
+      "host": { "$ref": "#/definitions/name" },
+      "kind": { "enum": ["server", "personal-laptop", "workstation", "vm"] },
+      "ssh_server": { "enum": ["yes", "no"] },
+      "ssh_client": { "enum": ["yes", "no"] },
+      "renewal_owner": { "enum": ["systemd", "dot-cron", "manual", "none"] },
+      "principals": { "type": "string", "pattern": "^[A-Za-z0-9._,-]+$" }
+    }
+  },
+  "definitions": {
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+  }
+}

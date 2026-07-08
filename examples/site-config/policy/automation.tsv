@@ -1,0 +1,3 @@
+name	source_ref	target_ref	purpose	auth_model	notes
+dot-cron	fleet	fleet	routine CA checks	existing-dotfiles-cron	preferred scheduler where practical
+ca-backup	laptop-a	ca_origin.target	encrypted CA backup pull	restricted-static-key	dedicated ca-backup account, forced command only

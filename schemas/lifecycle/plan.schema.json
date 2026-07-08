@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA lifecycle plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation", "summary", "steps"],
+  "properties": {
+    "operation": {
+      "enum": [
+        "init-ca",
+        "host-bootstrap",
+        "host-renew",
+        "host-renew-all",
+        "user-login",
+        "add-host",
+        "add-user"
+      ]
+    },
+    "summary": { "$ref": "#/definitions/nonEmptyString" },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/step" }
+    }
+  },
+  "definitions": {
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "summary", "hosts", "commands", "files", "manual"],
+      "properties": {
+        "id": {
+          "enum": [
+            "render",
+            "initialize-smallstep-state",
+            "review-secrets",
+            "activate-service",
+            "install-client",
+            "bootstrap-trust",
+            "install-rendered-files",
+            "renew-host-cert",
+            "issue-user-cert",
+            "edit-policy",
+            "bootstrap-host"
+          ]
+        },
+        "summary": { "$ref": "#/definitions/nonEmptyString" },
+        "hosts": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/hostName" },
+          "uniqueItems": true
+        },
+        "commands": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/nonEmptyString" }
+        },
+        "files": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/nonEmptyString" }
+        },
+        "manual": { "type": "boolean" }
+      }
+    },
+    "hostName": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "nonEmptyString": { "type": "string", "minLength": 1 }
+  }
+}

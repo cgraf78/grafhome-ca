@@ -1,0 +1,18 @@
+# Examples
+
+This directory contains sanitized site configuration examples. They are safe to
+commit publicly and are used by the test suite to keep examples valid.
+
+`site-config/` mirrors the runtime config root expected by `grafhome-ca`:
+
+```text
+${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/
+  config/deployment.env
+  policy/*.tsv
+```
+
+To adapt the example for a real deployment, copy the `site-config/` contents to
+that XDG location in a private repository or private host configuration system,
+then replace every example hostname, address, account, and path with site-local
+values. Runtime secrets such as CA private keys, passwords, provisioner
+encrypted keys, SSH private keys, and tokens still do not belong in these files.

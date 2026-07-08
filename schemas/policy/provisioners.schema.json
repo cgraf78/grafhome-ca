@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA provisioners policy",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "role",
+      "name",
+      "type",
+      "default_ttl",
+      "max_ttl",
+      "renewal_check",
+      "status",
+      "notes"
+    ],
+    "properties": {
+      "role": { "enum": ["host_bootstrap", "host_renew", "user_login", "proxy_x509"] },
+      "name": { "$ref": "#/definitions/name" },
+      "type": { "enum": ["JWK", "SSHPOP", "ACME", "OIDC", "X5C"] },
+      "default_ttl": { "$ref": "#/definitions/ttl" },
+      "max_ttl": { "$ref": "#/definitions/ttl" },
+      "renewal_check": { "type": "string", "pattern": "^(manual|[1-9][0-9]*[mh](-jitter)?)$" },
+      "status": { "enum": ["active", "planned", "disabled"] },
+      "notes": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+    "ttl": { "type": "string", "pattern": "^[1-9][0-9]*[smh]$" }
+  }
+}

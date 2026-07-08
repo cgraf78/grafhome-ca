@@ -1,0 +1,3 @@
+role	name	dns_name	target	interface	address	port	scheme
+ca_api	example-ca-api	ca.example.test	proxy-host	eth0	198.51.100.21	443	https
+ca_origin	example-ca-origin	ca-origin.example.test	ca-host	eth0	198.51.100.20	8443	https

@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA static keys policy",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["account", "host_ref", "purpose", "class", "required_controls"],
+    "properties": {
+      "account": {
+        "allOf": [{ "$ref": "#/definitions/account" }, { "not": { "const": "root" } }]
+      },
+      "host_ref": { "$ref": "#/definitions/ref" },
+      "purpose": { "type": "string", "minLength": 1 },
+      "class": { "enum": ["service-account", "automation", "breakglass"] },
+      "required_controls": { "type": "string", "minLength": 1 }
+    }
+  },
+  "definitions": {
+    "account": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
+    "ref": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+  }
+}

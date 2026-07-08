@@ -1,0 +1,2 @@
+user	principal	unix_account	root_ssh	provisioner	cert_ttl	status	notes
+alice	alice	alice	no	grafhome-user-login	16h	active	example human admin; no root SSH

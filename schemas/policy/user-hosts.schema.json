@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA user hosts policy",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["user", "host", "unix_account", "allow_ssh", "sudo_expected", "status", "notes"],
+    "properties": {
+      "user": { "$ref": "#/definitions/account" },
+      "host": { "$ref": "#/definitions/name" },
+      "unix_account": { "$ref": "#/definitions/account" },
+      "allow_ssh": { "enum": ["yes", "no"] },
+      "sudo_expected": { "enum": ["yes", "no", "local"] },
+      "status": { "enum": ["active", "planned", "disabled"] },
+      "notes": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "account": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+  }
+}

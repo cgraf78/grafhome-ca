@@ -1,0 +1,5 @@
+device	owner	user	key_name	status
+ca-host	alice	alice	alice_ca_host_ed25519	active
+proxy-host	alice	alice	alice_proxy_host_ed25519	active
+edge-host	alice	alice	alice_edge_host_ed25519	active
+laptop-a	alice	alice	alice_laptop_a_ed25519	active

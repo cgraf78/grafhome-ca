@@ -1,0 +1,4 @@
+# Managed by grafhome-ca. Rendered copies must not contain secrets.
+Host *
+    UserKnownHostsFile ~/.ssh/known_hosts
+    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts

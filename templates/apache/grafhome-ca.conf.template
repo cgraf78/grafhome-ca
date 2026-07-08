@@ -1,0 +1,3 @@
+# Managed by grafhome-ca. Intended for Apache reverse proxy rollout.
+ProxyPass        / https://${GRAFHOME_CA_ORIGIN_DNS_NAME}:${GRAFHOME_CA_ORIGIN_PORT}/
+ProxyPassReverse / https://${GRAFHOME_CA_ORIGIN_DNS_NAME}:${GRAFHOME_CA_ORIGIN_PORT}/

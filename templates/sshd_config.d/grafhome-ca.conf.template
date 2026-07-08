@@ -1,0 +1,5 @@
+# Managed by grafhome-ca. Rendered copies must be reviewed before rollout.
+PermitRootLogin no
+TrustedUserCAKeys ${GRAFHOME_CA_SSH_TRUST_DIR}/user_ca_keys.pem
+AuthorizedPrincipalsFile ${GRAFHOME_CA_AUTH_PRINCIPALS_DIR}/%u
+RevokedKeys ${GRAFHOME_CA_SSH_TRUST_DIR}/revoked_user_certs

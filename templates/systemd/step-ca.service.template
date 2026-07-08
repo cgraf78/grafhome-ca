@@ -1,0 +1,19 @@
+[Unit]
+Description=Grafhome Smallstep CA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=${GRAFHOME_CA_SERVICE_USER}
+Group=${GRAFHOME_CA_SERVICE_USER}
+Environment=STEPPATH=${GRAFHOME_CA_STATE_DIR}/step
+ExecStart=${GRAFHOME_CA_STEP_CA_BIN} ${GRAFHOME_CA_STATE_DIR}/step/config/ca.json --password-file=${GRAFHOME_CA_PASSWORD_FILE}
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=${GRAFHOME_CA_STATE_DIR}
+
+[Install]
+WantedBy=multi-user.target

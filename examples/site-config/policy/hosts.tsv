@@ -1,0 +1,5 @@
+host	kind	ssh_server	ssh_client	renewal_owner	principals
+ca-host	server	yes	yes	systemd	ca-host,ca-origin.example.test
+proxy-host	server	yes	yes	systemd	proxy-host,ca.example.test
+edge-host	server	yes	yes	dot-cron	edge-host,edge-host.example.test
+laptop-a	personal-laptop	yes	yes	systemd	laptop-a,laptop-a.example.test

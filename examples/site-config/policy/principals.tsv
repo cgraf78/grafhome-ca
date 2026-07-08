@@ -1,0 +1,10 @@
+principal	type	owner	allowed_accounts	notes
+alice	user	alice	alice	example human admin principal; no root account mapping
+ca-host	host	ca-host	-	host cert principal
+ca-origin.example.test	host	ca-host	-	host cert principal
+proxy-host	host	proxy-host	-	host cert principal
+ca.example.test	host	proxy-host	-	host cert principal
+edge-host	host	edge-host	-	host cert principal
+edge-host.example.test	host	edge-host	-	host cert principal
+laptop-a	host	laptop-a	-	host cert principal
+laptop-a.example.test	host	laptop-a	-	host cert principal

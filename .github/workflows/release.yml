@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@46a41d60a847142da203b8a283112160662bd260
+    permissions:
+      contents: write
+    with:
+      tag-command: scripts/release-tag.sh
+      setup-command: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+        fi
+      package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+      smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"

@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  STEP_CLI_PACKAGE_VERSION: 0.30.6-1
+  STEP_CA_PACKAGE_VERSION: 0.30.2-1
+  STEP_CLI_VERSION: 0.30.6
+  STEP_CA_VERSION: 0.30.2
+
+jobs:
+  rust:
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@46a41d60a847142da203b8a283112160662bd260
+    with:
+      clippy-command: cargo clippy --locked --all-targets --all-features -- -D warnings
+      doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
+      package-smoke-setup-command: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+        fi
+      package-smoke-command: |
+        scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+        scripts/smoke-release.sh linux-x86_64-musl
+
+  shell:
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@46a41d60a847142da203b8a283112160662bd260
+    with:
+      profiles: base,shellcheck
+      test-command: tests/shell/release-scripts-test
+
+  step-ca-integration:
+    name: Step CA Integration / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install Smallstep packages
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://packages.smallstep.com/keys/apt/repo-signing-key.gpg | sudo tee /etc/apt/keyrings/smallstep.asc >/dev/null
+          sudo tee /etc/apt/sources.list.d/smallstep.sources >/dev/null <<'EOF'
+          Types: deb
+          URIs: https://packages.smallstep.com/stable/debian
+          Suites: debs
+          Components: main
+          Signed-By: /etc/apt/keyrings/smallstep.asc
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y "step-cli=${STEP_CLI_PACKAGE_VERSION}" "step-ca=${STEP_CA_PACKAGE_VERSION}"
+          step version | grep -F "Smallstep CLI/${STEP_CLI_VERSION}"
+          step-ca version | grep -F "Smallstep CA/${STEP_CA_VERSION}"
+
+      - name: Run step-ca integration test
+        env:
+          GRAFHOME_CA_RUN_STEP_CA_INTEGRATION: "1"
+          GRAFHOME_CA_REQUIRE_STEP_CA_INTEGRATION: "1"
+        run: cargo test --locked --test step_ca_integration

@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Grafhome CA deployment environment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "GRAFHOME_CA_STATE_DIR",
+    "GRAFHOME_CA_SERVER_STEPPATH",
+    "GRAFHOME_CA_USER_STEPPATH",
+    "GRAFHOME_CA_SSH_TRUST_DIR",
+    "GRAFHOME_CA_AUTH_PRINCIPALS_DIR",
+    "GRAFHOME_CA_PROXY_TLS_DIR",
+    "GRAFHOME_CA_STEP_CA_BIN",
+    "GRAFHOME_CA_ROOT_STEP_BIN",
+    "GRAFHOME_CA_HELPER_BIN",
+    "GRAFHOME_CA_HOST_KEY_PATH",
+    "GRAFHOME_CA_PASSWORD_FILE",
+    "GRAFHOME_CA_SERVICE_USER",
+    "GRAFHOME_CA_OPERATOR_GROUP",
+    "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
+    "GRAFHOME_CA_APACHE_SITES_AVAILABLE"
+  ],
+  "properties": {
+    "GRAFHOME_CA_STATE_DIR": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_SERVER_STEPPATH": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_USER_STEPPATH": {
+      "type": "string",
+      "pattern": "^[^/][A-Za-z0-9._/-]*$"
+    },
+    "GRAFHOME_CA_SSH_TRUST_DIR": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_AUTH_PRINCIPALS_DIR": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_PROXY_TLS_DIR": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_STEP_CA_BIN": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_ROOT_STEP_BIN": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_HELPER_BIN": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_HOST_KEY_PATH": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_PASSWORD_FILE": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_SERVICE_USER": { "$ref": "#/definitions/accountName" },
+    "GRAFHOME_CA_OPERATOR_GROUP": { "$ref": "#/definitions/accountName" },
+    "GRAFHOME_CA_APACHE_CONF_AVAILABLE": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_APACHE_SITES_AVAILABLE": { "$ref": "#/definitions/absolutePath" }
+  },
+  "definitions": {
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^/[^\\u0000]*$"
+    },
+    "accountName": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
+    }
+  }
+}

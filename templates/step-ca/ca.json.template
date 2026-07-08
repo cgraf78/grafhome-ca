@@ -1,0 +1,34 @@
+{
+  "root": "${GRAFHOME_CA_STATE_DIR}/step/certs/root_ca.crt",
+  "crt": "${GRAFHOME_CA_STATE_DIR}/step/certs/intermediate_ca.crt",
+  "key": "${GRAFHOME_CA_STATE_DIR}/step/secrets/intermediate_ca_key",
+  "address": "${GRAFHOME_CA_ORIGIN_ADDRESS}:${GRAFHOME_CA_ORIGIN_PORT}",
+  "dnsNames": [
+    "${GRAFHOME_CA_API_DNS_NAME}",
+    "${GRAFHOME_CA_ORIGIN_DNS_NAME}"
+  ],
+  "logger": {
+    "format": "text"
+  },
+  "db": {
+    "type": "badger",
+    "dataSource": "${GRAFHOME_CA_STATE_DIR}/step/db",
+    "valueDir": "${GRAFHOME_CA_STATE_DIR}/step/valuedb",
+    "badgerFileLoadingMode": "MemoryMap"
+  },
+  "authority": {
+    "policy": {
+      "x509": {
+        "allow": {
+          "dns": ${GRAFHOME_CA_X509_ALLOWED_DNS_JSON}
+        },
+        "allowWildcardNames": false
+      }
+    },
+    "provisioners": ${GRAFHOME_CA_PROVISIONERS_JSON}
+  },
+  "ssh": {
+    "hostKey": "${GRAFHOME_CA_STATE_DIR}/step/secrets/ssh_host_ca_key",
+    "userKey": "${GRAFHOME_CA_STATE_DIR}/step/secrets/ssh_user_ca_key"
+  }
+}

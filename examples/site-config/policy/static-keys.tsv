@@ -1,0 +1,5 @@
+account	host_ref	purpose	class	required_controls
+git	ca-host	git hosting	service-account	restricted key; policy-owned inventory
+backup	ca-host	backup	service-account	restricted key; policy-owned inventory
+workload	proxy-host	workload access	service-account	restricted key; policy-owned inventory
+ca-backup	ca_origin.target	encrypted CA backup pull	automation	from=laptop-a; restrict; command=grafhome-ca backup --emit
