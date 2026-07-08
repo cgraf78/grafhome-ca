@@ -44,13 +44,13 @@ tar -xzf "$archive" -C "$smoke"
 # Keep the smoke test intentionally small and user-facing. Unit tests already
 # cover policy/schema behavior; this catches packaging mistakes such as a
 # missing executable bit, omitted schema/templates, or archive name drift.
-test -x "$smoke/grafhome-ca"
-test -x "$smoke/grafhome-ssh-login"
+test -x "$smoke/bin/grafhome-ca"
+test -x "$smoke/bin/grafhome-ssh-login"
 test -f "$smoke/.grafhome-ca-install.json"
 test -d "$smoke/schemas"
 test -d "$smoke/templates"
 test -d "$smoke/examples"
 
-"$smoke/grafhome-ca" version
-"$smoke/grafhome-ca" help >/dev/null
-"$smoke/grafhome-ssh-login" --version
+"$smoke/bin/grafhome-ca" version
+"$smoke/bin/grafhome-ca" help >/dev/null
+"$smoke/bin/grafhome-ssh-login" --version
