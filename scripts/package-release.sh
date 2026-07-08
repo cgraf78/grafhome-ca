@@ -49,12 +49,13 @@ trap cleanup EXIT
 GRAFHOME_CA_BUILD_COMMIT="$commit" GRAFHOME_CA_BUILD_VERSION="$tag" \
   cargo build --release --locked --target "$target"
 
-install -m 0755 "target/${target}/release/grafhome-ca" "$staging/grafhome-ca"
-install -m 0755 "target/${target}/release/grafhome-ssh-login" "$staging/grafhome-ssh-login"
+mkdir -p "$staging/bin"
+install -m 0755 "target/${target}/release/grafhome-ca" "$staging/bin/grafhome-ca"
+install -m 0755 "target/${target}/release/grafhome-ssh-login" "$staging/bin/grafhome-ssh-login"
 install -m 0644 README.md "$staging/README.md"
 install -m 0644 LICENSE "$staging/LICENSE"
 
-for dir in bin completions examples schemas templates docs man; do
+for dir in completions examples schemas templates docs man; do
   if [[ -d "$dir" ]]; then
     mkdir -p "$staging/$dir"
     cp -R "$dir/." "$staging/$dir/"
