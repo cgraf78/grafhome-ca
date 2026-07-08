@@ -51,6 +51,18 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Export public CA trust material into a staging directory.
+    ExportPublic {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Output directory for exported public trust material.
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Show exported paths without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print a JSON fixture with JWK placeholders materialized for tests.
     MaterializeTestCaFixture {
         /// Site config root containing config/ and policy/.
@@ -192,6 +204,30 @@ fn run() -> grafhome_ca::Result<()> {
             } else {
                 grafhome_ca::render::write(&files, &out_dir)?;
                 println!("rendered {} files under {}", files.len(), out_dir.display());
+            }
+            Ok(())
+        }
+        Command::ExportPublic {
+            config_root,
+            out_dir,
+            dry_run,
+        } => {
+            let config_root = resolve_config_root(config_root)?;
+            let model = SiteModel::load(&config_root)?;
+            grafhome_ca::schema::validate_config_root(&config_root)?;
+            if dry_run {
+                let files = grafhome_ca::public_material::planned_files();
+                for file in &files {
+                    println!("{:04o}\t{}", file.mode, file.path.display());
+                }
+            } else {
+                let files = grafhome_ca::public_material::collect(&model)?;
+                grafhome_ca::public_material::write(&files, &out_dir)?;
+                println!(
+                    "exported {} public files under {}",
+                    files.len(),
+                    out_dir.display()
+                );
             }
             Ok(())
         }

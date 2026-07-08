@@ -115,6 +115,17 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
         .filter(|host| host.ssh_client == "yes")
     {
         files.push(RenderedFile {
+            path: host_path(
+                &host.host,
+                absolute_child(
+                    &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"],
+                    "ssh_known_hosts",
+                )?,
+            )?,
+            mode: 0o644,
+            content: String::new(),
+        });
+        files.push(RenderedFile {
             path: host_path(&host.host, "etc/ssh/ssh_config.d/grafhome-ca.conf")?,
             mode: 0o644,
             content: render_template(
@@ -275,6 +286,10 @@ fn variables(model: &SiteModel) -> Result<BTreeMap<String, String>> {
         ca_origin.address.clone(),
     );
     variables.insert(
+        "GRAFHOME_CA_HOST_CERT_PATH".to_owned(),
+        format!("{}-cert.pub", variables["GRAFHOME_CA_HOST_KEY_PATH"]),
+    );
+    variables.insert(
         "GRAFHOME_CA_X509_ALLOWED_DNS_JSON".to_owned(),
         x509_allowed_dns_json(ca_api, ca_origin)?,
     );
@@ -396,7 +411,7 @@ fn test_jwk_provisioner(provisioner: &Provisioner) -> Result<Value> {
     }))
 }
 
-fn provisioner_placeholder(name: &str) -> String {
+pub(crate) fn provisioner_placeholder(name: &str) -> String {
     format!(
         "RUNTIME_SECRET_PLACEHOLDER:{}",
         provisioner_object_secret_name(name)
@@ -651,6 +666,7 @@ mod tests {
         assert!(paths.contains(&"hosts/ca-host/etc/systemd/system/step-ca.service".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/user_ca_keys.pem".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/revoked_user_certs".to_owned()));
+        assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/ssh_known_hosts".to_owned()));
         assert!(paths.contains(
             &"hosts/proxy-host/etc/apache2/conf-available/grafhome-ca-proxy.conf".to_owned()
         ));
@@ -723,6 +739,10 @@ mod tests {
                 .ends_with("etc/ssh/sshd_config.d/grafhome-ca.conf")
         }) {
             assert!(file.content.contains("PermitRootLogin no"));
+            assert!(
+                file.content
+                    .contains("HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub")
+            );
             for path in referenced_sshd_files(&file.content) {
                 let host = file.path.components().nth(1).unwrap();
                 let relative = super::host_path(&host.as_os_str().to_string_lossy(), path).unwrap();
@@ -733,6 +753,35 @@ mod tests {
                     relative.display()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rendered_ssh_client_fragments_reference_host_ca_known_hosts() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let rendered_paths = files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+
+        for file in files
+            .iter()
+            .filter(|file| file.path.ends_with("etc/ssh/ssh_config.d/grafhome-ca.conf"))
+        {
+            assert!(file.content.contains("/etc/ssh/grafhome/ssh_known_hosts"));
+            let host = file.path.components().nth(1).unwrap();
+            let relative = super::host_path(
+                &host.as_os_str().to_string_lossy(),
+                "/etc/ssh/grafhome/ssh_known_hosts",
+            )
+            .unwrap();
+            assert!(
+                rendered_paths.contains(&relative),
+                "{} references missing rendered support file {}",
+                file.path.display(),
+                relative.display()
+            );
         }
     }
 

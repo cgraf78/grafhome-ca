@@ -9,6 +9,7 @@ pub mod error;
 pub mod lifecycle;
 pub mod model;
 pub mod policy;
+pub mod public_material;
 pub mod render;
 pub mod schema;
 pub mod smallstep;

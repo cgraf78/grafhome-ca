@@ -37,6 +37,8 @@ being stored independently.
 `GRAFHOME_CA_HOST_KEY_PATH`
 : Absolute path to the SSH host private key used by host certificate renewal.
   The certificate path is derived as `<GRAFHOME_CA_HOST_KEY_PATH>-cert.pub`.
+  Rendered sshd fragments reference that derived host certificate path with
+  `HostCertificate`.
 
 `GRAFHOME_CA_PASSWORD_FILE`
 : Absolute path to the root-readable `step-ca` key password file. The file path
@@ -88,6 +90,25 @@ being stored independently.
   replaces them with complete Smallstep-generated provisioner objects containing
   both the public `key` and encrypted private-key material. Non-secret
   provisioner types that do not require generated key material render directly.
+
+`GRAFHOME_CA_HOST_CERT_PATH`
+: Template variable derived from `GRAFHOME_CA_HOST_KEY_PATH`. It is not stored
+  in `deployment.env`.
+
+`user_ca_keys.pem`
+: Public trust file exported by `grafhome-ca export-public` and installed at
+  `${GRAFHOME_CA_SSH_TRUST_DIR}/user_ca_keys.pem` for `TrustedUserCAKeys`.
+
+`ssh_known_hosts`
+: Public host-CA trust file exported by `grafhome-ca export-public` and
+  installed at `${GRAFHOME_CA_SSH_TRUST_DIR}/ssh_known_hosts` for SSH clients.
+  It contains `@cert-authority` entries for managed host certificate
+  principals, so real exports can reveal private topology even though they do
+  not contain secrets.
+
+`root_fingerprint`
+: Public SHA-256 fingerprint of the X.509 root CA certificate. Host bootstrap
+  plans use it for `step ca bootstrap --fingerprint`.
 
 `principal`
 : A name embedded in an SSH certificate and later matched by OpenSSH policy.
