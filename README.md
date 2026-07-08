@@ -66,6 +66,19 @@ Preview rendered files without writing:
 cargo run --bin grafhome-ca -- render --out-dir /tmp/grafhome-ca-render --dry-run
 ```
 
+After CA state has been initialized, export public trust material for private
+rollout:
+
+```sh
+cargo run --bin grafhome-ca -- export-public --out-dir /tmp/grafhome-ca-public
+```
+
+The export bundle contains no secrets: `root_ca.crt`, `root_fingerprint`,
+`ssh_host_ca_key.pub`, `ssh_user_ca_key.pub`, `user_ca_keys.pem`,
+`ssh_known_hosts`, and `manifest.json`. It may contain private topology in the
+CA URL and host certificate principals, so do not commit real export bundles to
+this public repo.
+
 Print a local validation-only JSON fixture with JWK placeholders replaced by
 deterministic public test provisioners and live CA state paths rewritten to
 unusable fixture paths:
@@ -140,6 +153,13 @@ by this repository until the separate rollout phase is explicitly started.
   `RevokedKeys` points at a missing path. Rollout must replace
   `user_ca_keys.pem` with the exported SSH user CA public key before certificate
   auth is expected to work.
+- Rendered SSH client fragments point at
+  `${GRAFHOME_CA_SSH_TRUST_DIR}/ssh_known_hosts`. Rollout must replace that
+  placeholder with the exported host-CA known-hosts file before host
+  certificates are expected to verify.
+- Rendered sshd fragments include `HostCertificate` for the certificate derived
+  from `GRAFHOME_CA_HOST_KEY_PATH`. The host bootstrap plan issues the initial
+  host certificate before the fragment should be activated.
 
 No private CA keys, SSH private keys, passwords, provisioner secrets, or tokens
 belong in this repo.
@@ -157,3 +177,11 @@ deterministic public JWKs, and omits private JWK material and `encryptedKey` so
 tests can validate config shape without checking in provisioner issuance
 credentials. Runtime rollout must still replace the placeholders in rendered
 deployment files with operator-generated Smallstep provisioner objects.
+
+Lifecycle plans use quoted angle-bracket placeholders for operator-provided
+runtime inputs, such as `<public-material-dir>`,
+`<host-bootstrap-provisioner-password-file>`, and
+`<user-login-provisioner-password-file>`. Replace those with private local paths
+or automation-provided files during rollout; they are not public repo inputs and
+must not contain or expose CA passwords, provisioner secrets, or topology-bearing
+real export bundles.

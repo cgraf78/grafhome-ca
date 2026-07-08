@@ -4,11 +4,16 @@
 //! do. They are intentionally separate from command execution so tests can mock
 //! behavior and operators can review actions before deployment code exists.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
-use crate::error::{Error, Result};
-use crate::model::SiteModel;
 use crate::policy::Host;
+use crate::render::RenderedFile;
+use crate::{
+    error::{Error, Result},
+    model::SiteModel,
+};
 
 /// CA initialization operation key.
 pub const OP_INIT_CA: &str = "init-ca";
@@ -31,6 +36,8 @@ pub const STEP_RENDER: &str = "render";
 pub const STEP_INITIALIZE_SMALLSTEP_STATE: &str = "initialize-smallstep-state";
 /// Review runtime secret material step key.
 pub const STEP_REVIEW_SECRETS: &str = "review-secrets";
+/// Export public CA trust material step key.
+pub const STEP_EXPORT_PUBLIC_MATERIAL: &str = "export-public-material";
 /// Activate the step-ca service step key.
 pub const STEP_ACTIVATE_SERVICE: &str = "activate-service";
 /// Ensure client tooling exists step key.
@@ -39,6 +46,8 @@ pub const STEP_INSTALL_CLIENT: &str = "install-client";
 pub const STEP_BOOTSTRAP_TRUST: &str = "bootstrap-trust";
 /// Install rendered host files step key.
 pub const STEP_INSTALL_RENDERED_FILES: &str = "install-rendered-files";
+/// Issue the first SSH host certificate step key.
+pub const STEP_ISSUE_HOST_CERT: &str = "issue-host-cert";
 /// Renew one SSH host certificate step key.
 pub const STEP_RENEW_HOST_CERT: &str = "renew-host-cert";
 /// Issue one SSH user certificate step key.
@@ -80,6 +89,11 @@ pub struct PlanStep {
 pub fn init_ca(model: &SiteModel) -> Result<Plan> {
     let ca_origin = required_endpoint(model, "ca_origin")?;
     let ca_api = required_endpoint(model, "ca_api")?;
+    let bootstrap = required_provisioner(model, "host_bootstrap")?;
+    let provisioner_review_commands =
+        runtime_provisioner_review_commands(model, &ca_origin.target, &bootstrap.name);
+    let install_steps = rendered_install_steps(model, &[&ca_origin.target, &ca_api.target])?;
+    let install_hosts = unique_hosts([ca_origin.target.clone(), ca_api.target.clone()]);
     Ok(Plan {
         operation: OP_INIT_CA.to_owned(),
         summary: format!(
@@ -92,8 +106,9 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
                 summary: "render reviewed CA, systemd, Apache, SSH, and principals files".to_owned(),
                 hosts: Vec::new(),
                 commands: vec![format!(
-                    "grafhome-ca render --out-dir <staging-dir> --config-root {}",
-                    model.config_root.display()
+                    "grafhome-ca render --out-dir {} --config-root {}",
+                    sh("<staging-dir>"),
+                    sh_display(&model.config_root)
                 )],
                 files: vec!["<staging-dir>/hosts/...".to_owned()],
                 manual: false,
@@ -103,8 +118,29 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
                 summary: "initialize or import Smallstep CA state on the CA origin host".to_owned(),
                 hosts: vec![ca_origin.target.clone()],
                 commands: vec![
-                    format!("install -d -m 0750 {}", model.deployment.ca_steppath()),
-                    "step ca init --ssh --deployment-type standalone --name grafhome-ca".to_owned(),
+                    format!(
+                        "install -d -m 0750 {} {}",
+                        sh(&model.deployment.ca_steppath()),
+                        sh(&parent_dir(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"])),
+                    ),
+                    format!(
+                        "umask 077; test -s {} || {} crypto rand --format ascii 48 > {}",
+                        sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+                        sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    ),
+                    format!(
+                        "STEPPATH={} {} ca init --ssh --deployment-type standalone --name grafhome-ca --dns {} --dns {} --address {} --with-ca-url {} --provisioner {} --password-file {} --provisioner-password-file {}",
+                        sh(&model.deployment.ca_steppath()),
+                        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+                        sh(&ca_api.dns_name),
+                        sh(&ca_origin.dns_name),
+                        sh(&format!("{}:{}", ca_origin.address, ca_origin.port)),
+                        sh(&ca_api.url()),
+                        sh(&bootstrap.name),
+                        sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                        sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    ),
                 ],
                 files: vec![
                     format!("{}/config/ca.json", model.deployment.ca_steppath()),
@@ -117,8 +153,40 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
                 summary: "replace runtime provisioner placeholders with complete Smallstep-generated provisioner objects"
                     .to_owned(),
                 hosts: vec![ca_origin.target.clone()],
-                commands: vec!["step ca provisioner add ...".to_owned()],
-                files: vec![format!("{}/config/ca.json", model.deployment.ca_steppath())],
+                commands: provisioner_review_commands,
+                files: vec![
+                    format!("{}/config/ca.json", model.deployment.ca_steppath()),
+                    staged_ca_config_path(model, &ca_origin.target),
+                ],
+                manual: true,
+            },
+            PlanStep {
+                id: STEP_INSTALL_RENDERED_FILES.to_owned(),
+                summary: "install reviewed rendered files for the CA origin and proxy hosts"
+                    .to_owned(),
+                hosts: install_hosts,
+                commands: install_steps,
+                files: vec![
+                    format!("<staging-dir>/hosts/{}/...", ca_origin.target),
+                    format!("<staging-dir>/hosts/{}/...", ca_api.target),
+                ],
+                manual: true,
+            },
+            PlanStep {
+                id: STEP_EXPORT_PUBLIC_MATERIAL.to_owned(),
+                summary: "export root fingerprint and SSH CA public keys for rollout".to_owned(),
+                hosts: vec![ca_origin.target.clone()],
+                commands: vec![format!(
+                    "grafhome-ca export-public --out-dir {} --config-root {}",
+                    sh("<public-material-dir>"),
+                    sh_display(&model.config_root)
+                )],
+                files: vec![
+                    "<public-material-dir>/root_fingerprint".to_owned(),
+                    "<public-material-dir>/user_ca_keys.pem".to_owned(),
+                    "<public-material-dir>/ssh_known_hosts".to_owned(),
+                    "<public-material-dir>/manifest.json".to_owned(),
+                ],
                 manual: true,
             },
             PlanStep {
@@ -140,43 +208,71 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
 pub fn host_bootstrap(model: &SiteModel, host: &str) -> Result<Plan> {
     let host = required_host(model, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
+    let bootstrap = required_provisioner(model, "host_bootstrap")?;
+    let mut steps = vec![
+        PlanStep {
+            id: STEP_INSTALL_CLIENT.to_owned(),
+            summary: "ensure step CLI and grafhome-ca helper are installed".to_owned(),
+            hosts: vec![host.host.clone()],
+            commands: vec![
+                "shdeps update step".to_owned(),
+                "shdeps update grafhome-ca".to_owned(),
+            ],
+            files: vec![model.deployment.values["GRAFHOME_CA_HELPER_BIN"].clone()],
+            manual: false,
+        },
+        PlanStep {
+            id: STEP_BOOTSTRAP_TRUST.to_owned(),
+            summary: "bootstrap CA trust for the host root account".to_owned(),
+            hosts: vec![host.host.clone()],
+            commands: vec![format!(
+                "STEPPATH={} {} ca bootstrap --ca-url {} --fingerprint \"$(cat {})\"",
+                sh(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
+                sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+                sh(&ca_api.url()),
+                sh("<public-material-dir>/root_fingerprint")
+            )],
+            files: vec![
+                model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"].clone(),
+                "<public-material-dir>/root_fingerprint".to_owned(),
+            ],
+            manual: true,
+        },
+    ];
+    if host.ssh_server == "yes" {
+        steps.push(PlanStep {
+            id: STEP_ISSUE_HOST_CERT.to_owned(),
+            summary: "issue the initial SSH host certificate before enabling HostCertificate"
+                .to_owned(),
+            hosts: vec![host.host.clone()],
+            commands: vec![host_certificate_command(
+                model,
+                host,
+                &ca_api.url(),
+                &bootstrap.name,
+                &bootstrap.default_ttl,
+            )],
+            files: vec![host_public_key_path(model), host_cert_path(model)],
+            manual: true,
+        });
+    }
+    let install_commands = host_bootstrap_install_steps(model, host)?;
+    steps.push(PlanStep {
+        id: STEP_INSTALL_RENDERED_FILES.to_owned(),
+        summary: "install reviewed host-specific SSH config and public trust files".to_owned(),
+        hosts: vec![host.host.clone()],
+        commands: install_commands,
+        files: vec![
+            format!("hosts/{}/...", host.host),
+            "<public-material-dir>/user_ca_keys.pem".to_owned(),
+            "<public-material-dir>/ssh_known_hosts".to_owned(),
+        ],
+        manual: true,
+    });
     Ok(Plan {
         operation: OP_HOST_BOOTSTRAP.to_owned(),
         summary: format!("bootstrap {} for Grafhome SSH certificates", host.host),
-        steps: vec![
-            PlanStep {
-                id: STEP_INSTALL_CLIENT.to_owned(),
-                summary: "ensure step CLI and grafhome-ca helper are installed".to_owned(),
-                hosts: vec![host.host.clone()],
-                commands: vec![
-                    "shdeps update step".to_owned(),
-                    "shdeps update grafhome-ca".to_owned(),
-                ],
-                files: vec![model.deployment.values["GRAFHOME_CA_HELPER_BIN"].clone()],
-                manual: false,
-            },
-            PlanStep {
-                id: STEP_BOOTSTRAP_TRUST.to_owned(),
-                summary: "bootstrap CA trust for the host root account".to_owned(),
-                hosts: vec![host.host.clone()],
-                commands: vec![format!(
-                    "STEPPATH={} {} ca bootstrap --ca-url {} --fingerprint <root-fingerprint>",
-                    model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"],
-                    model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"],
-                    ca_api.url()
-                )],
-                files: vec![model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"].clone()],
-                manual: true,
-            },
-            PlanStep {
-                id: STEP_INSTALL_RENDERED_FILES.to_owned(),
-                summary: "install reviewed host-specific SSH and renewal config".to_owned(),
-                hosts: vec![host.host.clone()],
-                commands: vec![format!("install rendered files for host {}", host.host)],
-                files: vec![format!("hosts/{}/...", host.host)],
-                manual: true,
-            },
-        ],
+        steps,
     })
 }
 
@@ -242,19 +338,23 @@ pub fn user_login(model: &SiteModel, user: &str, device: Option<&str>) -> Result
     }
     let ca_api = required_endpoint(model, "ca_api")?;
     let devices = select_user_login_devices(model, &user.user, device)?;
-    let user_steppath = format!("~/{}", model.deployment.values["GRAFHOME_CA_USER_STEPPATH"]);
+    let user_steppath = format!(
+        "$HOME/{}",
+        model.deployment.values["GRAFHOME_CA_USER_STEPPATH"]
+    );
     let commands = devices
         .iter()
         .map(|device| {
             let public_key = user_public_key_path(&device.key_name);
             format!(
-                "STEPPATH={} step ssh certificate --ca-url {} --provisioner {} --sign --principal {} --not-after {} {} {}",
+                "STEPPATH={} step ssh certificate --ca-url {} --provisioner {} --provisioner-password-file {} --sign --principal {} --not-after {} {} {}",
                 user_steppath,
-                ca_api.url(),
-                user.provisioner,
-                user.principal,
-                user.cert_ttl,
-                user.principal,
+                sh(&ca_api.url()),
+                sh(&user.provisioner),
+                sh("<user-login-provisioner-password-file>"),
+                sh(&user.principal),
+                sh(&user.cert_ttl),
+                sh(&user.principal),
                 public_key
             )
         })
@@ -310,7 +410,10 @@ pub fn add_host(model: &SiteModel, host: &str) -> Result<Plan> {
                 id: STEP_BOOTSTRAP_HOST.to_owned(),
                 summary: "run host-bootstrap plan after policy is merged".to_owned(),
                 hosts: vec![host.to_owned()],
-                commands: vec![format!("grafhome-ca plan host-bootstrap --host {host}")],
+                commands: vec![format!(
+                    "grafhome-ca plan host-bootstrap --host {}",
+                    sh(host)
+                )],
                 files: vec![],
                 manual: true,
             },
@@ -352,7 +455,9 @@ pub fn add_user(model: &SiteModel, user: &str) -> Result<Plan> {
                 summary: "issue a user cert after policy is merged and reviewed".to_owned(),
                 hosts: Vec::new(),
                 commands: vec![format!(
-                    "grafhome-ca plan user-login --user {user} --device <device>"
+                    "grafhome-ca plan user-login --user {} --device {}",
+                    sh(user),
+                    sh("<device>")
                 )],
                 files: vec![],
                 manual: true,
@@ -406,12 +511,41 @@ fn host_renew_command(model: &SiteModel, ca_url: &str, provisioner: &str) -> Str
     let host_cert = host_cert_path(model);
     format!(
         "STEPPATH={} {} ssh renew --ca-url {} --provisioner {} {} {}",
-        model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"],
-        model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"],
-        ca_url,
-        provisioner,
-        host_cert,
-        host_key
+        sh(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
+        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+        sh(ca_url),
+        sh(provisioner),
+        sh(&host_cert),
+        sh(host_key)
+    )
+}
+
+fn host_certificate_command(
+    model: &SiteModel,
+    host: &Host,
+    ca_url: &str,
+    provisioner: &str,
+    ttl: &str,
+) -> String {
+    let principal_args = host
+        .principals
+        .split(',')
+        .map(str::trim)
+        .filter(|principal| !principal.is_empty())
+        .map(|principal| format!("--principal {}", sh(principal)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "STEPPATH={} {} ssh certificate --ca-url {} --provisioner {} --provisioner-password-file {} --host --sign --force {} --not-after {} {} {}",
+        sh(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
+        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+        sh(ca_url),
+        sh(provisioner),
+        sh("<host-bootstrap-provisioner-password-file>"),
+        principal_args,
+        sh(ttl),
+        sh(&host.host),
+        sh(&host_public_key_path(model))
     )
 }
 
@@ -422,12 +556,201 @@ fn host_cert_path(model: &SiteModel) -> String {
     )
 }
 
+fn host_public_key_path(model: &SiteModel) -> String {
+    format!(
+        "{}.pub",
+        model.deployment.values["GRAFHOME_CA_HOST_KEY_PATH"]
+    )
+}
+
+fn rendered_install_steps(model: &SiteModel, hosts: &[&str]) -> Result<Vec<String>> {
+    rendered_install_steps_filtered(model, hosts, |_| true)
+}
+
+fn host_bootstrap_install_steps(model: &SiteModel, host: &Host) -> Result<Vec<String>> {
+    let mut commands = Vec::new();
+    if host.ssh_server == "yes" {
+        commands.push(install_public_material_command(
+            "user_ca_keys.pem",
+            &absolute_deployment_child(model, "GRAFHOME_CA_SSH_TRUST_DIR", "user_ca_keys.pem")?,
+        ));
+    }
+    if host.ssh_client == "yes" {
+        commands.push(install_public_material_command(
+            "ssh_known_hosts",
+            &absolute_deployment_child(model, "GRAFHOME_CA_SSH_TRUST_DIR", "ssh_known_hosts")?,
+        ));
+    }
+
+    commands.extend(rendered_install_steps_filtered(
+        model,
+        &[&host.host],
+        |file| !is_public_trust_placeholder(file),
+    )?);
+    Ok(commands)
+}
+
+fn rendered_install_steps_filtered(
+    model: &SiteModel,
+    hosts: &[&str],
+    keep: impl Fn(&RenderedFile) -> bool,
+) -> Result<Vec<String>> {
+    let mut commands = crate::render::render(model)?
+        .into_iter()
+        .filter(|file| keep(file))
+        .filter_map(|file| {
+            let (host, target) = rendered_target(&file)?;
+            if !hosts.iter().any(|expected| *expected == host) {
+                return None;
+            }
+            Some(rendered_install_command(&file, &target))
+        })
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    Ok(commands)
+}
+
+fn rendered_target(file: &RenderedFile) -> Option<(String, String)> {
+    let mut components = file.path.components();
+    let first = components.next()?.as_os_str().to_string_lossy();
+    let host = components.next()?.as_os_str().to_string_lossy();
+    if first != "hosts" {
+        return None;
+    }
+    let target = components
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some((host.to_string(), format!("/{target}")))
+}
+
+fn rendered_install_command(file: &RenderedFile, target: &str) -> String {
+    format!(
+        "install -D -m {:04o} {} {}",
+        file.mode,
+        sh(&format!("<staging-dir>/{}", file.path.display())),
+        sh(target)
+    )
+}
+
+fn is_public_trust_placeholder(file: &RenderedFile) -> bool {
+    let Some((_, target)) = rendered_target(file) else {
+        return false;
+    };
+    target.ends_with("/user_ca_keys.pem") || target.ends_with("/ssh_known_hosts")
+}
+
+fn install_public_material_command(file_name: &str, target: &str) -> String {
+    format!(
+        "install -D -m 0644 {} {}",
+        sh(&format!("<public-material-dir>/{file_name}")),
+        sh(target)
+    )
+}
+
+fn absolute_deployment_child(model: &SiteModel, key: &str, child: &str) -> Result<String> {
+    let base = &model.deployment.values[key];
+    let path = PathBuf::from(base).join(child);
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Validation {
+            field: format!("config/deployment.env:{key}"),
+            message: "path is not valid UTF-8".to_owned(),
+        })
+}
+
+fn runtime_provisioner_review_commands(
+    model: &SiteModel,
+    ca_host: &str,
+    bootstrap_provisioner: &str,
+) -> Vec<String> {
+    let ca_config = format!("{}/config/ca.json", model.deployment.ca_steppath());
+    let staged_ca_config = staged_ca_config_path(model, ca_host);
+    let password_file = &model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"];
+    let step_bin = &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"];
+    let mut commands = Vec::new();
+
+    for provisioner in model
+        .policy
+        .provisioners
+        .iter()
+        .filter(|entry| entry.status == "active" && entry.r#type == "JWK")
+        .filter(|entry| entry.name != bootstrap_provisioner)
+    {
+        commands.push(format!(
+            "STEPPATH={} {} ca provisioner add {} --type JWK --create --ca-config {} --password-file {}",
+            sh(&model.deployment.ca_steppath()),
+            sh(step_bin),
+            sh(&provisioner.name),
+            sh(&ca_config),
+            sh(password_file)
+        ));
+    }
+
+    for provisioner in model
+        .policy
+        .provisioners
+        .iter()
+        .filter(|entry| entry.status == "active" && entry.r#type == "JWK")
+    {
+        commands.push(format!(
+            "copy authority.provisioners entry named {} from {} into {} at \"{}\"",
+            sh(&provisioner.name),
+            sh(&ca_config),
+            sh(&staged_ca_config),
+            crate::render::provisioner_placeholder(&provisioner.name)
+        ));
+    }
+
+    commands
+}
+
+fn staged_ca_config_path(model: &SiteModel, ca_host: &str) -> String {
+    format!(
+        "<staging-dir>/hosts/{}/{}",
+        ca_host,
+        format!("{}/config/ca.json", model.deployment.ca_steppath()).trim_start_matches('/')
+    )
+}
+
+fn parent_dir(path: &str) -> String {
+    std::path::Path::new(path)
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_else(|| ".".to_owned())
+}
+
+fn sh_display(path: &std::path::Path) -> String {
+    sh(&path.display().to_string())
+}
+
+fn sh(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    if value
+        .bytes()
+        .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'='))
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn unique_hosts<const N: usize>(hosts: [String; N]) -> Vec<String> {
+    let mut hosts = hosts.into_iter().collect::<Vec<_>>();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 fn user_public_key_path(key_name: &str) -> String {
-    format!("~/.ssh/{key_name}.pub")
+    format!("$HOME/.ssh/{key_name}.pub")
 }
 
 fn user_cert_path(key_name: &str) -> String {
-    format!("~/.ssh/{key_name}-cert.pub")
+    format!("$HOME/.ssh/{key_name}-cert.pub")
 }
 
 fn reject_root_user_arg(user: &str) -> Result<()> {
@@ -478,10 +801,11 @@ mod tests {
     use super::{
         OP_ADD_HOST, OP_ADD_USER, OP_HOST_BOOTSTRAP, OP_HOST_RENEW, OP_HOST_RENEW_ALL, OP_INIT_CA,
         OP_USER_LOGIN, STEP_ACTIVATE_SERVICE, STEP_BOOTSTRAP_HOST, STEP_BOOTSTRAP_TRUST,
-        STEP_EDIT_POLICY, STEP_INITIALIZE_SMALLSTEP_STATE, STEP_INSTALL_CLIENT,
-        STEP_INSTALL_RENDERED_FILES, STEP_ISSUE_USER_CERT, STEP_RENDER, STEP_RENEW_HOST_CERT,
-        STEP_REVIEW_SECRETS, add_host, add_user, host_bootstrap, host_renew, host_renew_all,
-        init_ca, renewable_hosts, user_login,
+        STEP_EDIT_POLICY, STEP_EXPORT_PUBLIC_MATERIAL, STEP_INITIALIZE_SMALLSTEP_STATE,
+        STEP_INSTALL_CLIENT, STEP_INSTALL_RENDERED_FILES, STEP_ISSUE_HOST_CERT,
+        STEP_ISSUE_USER_CERT, STEP_RENDER, STEP_RENEW_HOST_CERT, STEP_REVIEW_SECRETS, add_host,
+        add_user, host_bootstrap, host_renew, host_renew_all, init_ca, renewable_hosts, sh,
+        user_login,
     };
 
     #[test]
@@ -496,14 +820,58 @@ mod tests {
                 STEP_RENDER,
                 STEP_INITIALIZE_SMALLSTEP_STATE,
                 STEP_REVIEW_SECRETS,
+                STEP_INSTALL_RENDERED_FILES,
+                STEP_EXPORT_PUBLIC_MATERIAL,
                 STEP_ACTIVATE_SERVICE
             ]
         );
         assert!(!plan.steps[0].manual);
         assert!(plan.steps[1..].iter().all(|step| step.manual));
         assert_eq!(plan.steps[1].hosts, vec!["ca-host".to_owned()]);
-        assert!(plan.steps[2].commands[0].contains("step ca provisioner add"));
-        assert!(plan.steps[3].commands[1].contains("systemctl enable --now step-ca.service"));
+        assert!(plan.steps[1].commands[0].contains("/srv/example-ca/secrets"));
+        assert!(plan.steps[1].commands[1].contains("crypto rand --format ascii 48"));
+        assert!(plan.steps[1].commands[2].contains("--dns ca.example.test"));
+        assert!(plan.steps[1].commands[2].contains("--dns ca-origin.example.test"));
+        assert!(plan.steps[1].commands[2].contains("--address 198.51.100.20:8443"));
+        assert!(plan.steps[1].commands[2].contains("--with-ca-url https://ca.example.test"));
+        assert!(plan.steps[2].commands[0].contains("ca provisioner add grafhome-user-login"));
+        assert!(
+            plan.steps[2]
+                .commands
+                .iter()
+                .any(|command| command.contains(
+                    "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_HOST_BOOTSTRAP_JSON"
+                ))
+        );
+        assert!(
+            plan.steps[2]
+                .commands
+                .iter()
+                .any(|command| command.contains(
+                    "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_LOGIN_JSON"
+                ))
+        );
+        assert!(
+            !plan.steps[2]
+                .commands
+                .iter()
+                .any(|command| command.contains("..."))
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command.contains("/srv/example-ca/step/config/ca.json"))
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command
+                    .contains("/etc/apache2/conf-available/grafhome-ca-proxy.conf"))
+        );
+        assert!(plan.steps[4].commands[0].contains("export-public"));
+        assert!(plan.steps[5].commands[1].contains("systemctl enable --now step-ca.service"));
     }
 
     #[test]
@@ -517,6 +885,7 @@ mod tests {
             vec![
                 STEP_INSTALL_CLIENT,
                 STEP_BOOTSTRAP_TRUST,
+                STEP_ISSUE_HOST_CERT,
                 STEP_INSTALL_RENDERED_FILES
             ]
         );
@@ -529,7 +898,51 @@ mod tests {
         assert!(plan.steps[1].manual);
         assert!(plan.steps[1].commands[0].contains("ca bootstrap"));
         assert!(plan.steps[1].commands[0].contains("https://ca.example.test"));
+        assert!(
+            plan.steps[1].commands[0].contains("$(cat '<public-material-dir>/root_fingerprint')")
+        );
         assert!(plan.steps[1].commands[0].contains("STEPPATH=/etc/step/grafhome"));
+        assert!(plan.steps[2].commands[0].contains("step ssh certificate"));
+        assert!(plan.steps[2].commands[0].contains("--host"));
+        assert!(
+            plan.steps[2].commands[0].contains(
+                "--provisioner-password-file '<host-bootstrap-provisioner-password-file>'"
+            )
+        );
+        assert!(plan.steps[2].commands[0].contains("--principal proxy-host"));
+        assert!(plan.steps[2].commands[0].contains("--principal ca.example.test"));
+        assert!(plan.steps[2].commands[0].contains("/etc/ssh/ssh_host_ed25519_key.pub"));
+        assert!(
+            plan.steps[2]
+                .files
+                .contains(&"/etc/ssh/ssh_host_ed25519_key-cert.pub".to_owned())
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command
+                    == "install -D -m 0644 '<public-material-dir>/user_ca_keys.pem' /etc/ssh/grafhome/user_ca_keys.pem")
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command
+                    == "install -D -m 0644 '<public-material-dir>/ssh_known_hosts' /etc/ssh/grafhome/ssh_known_hosts")
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command.contains("/etc/ssh/sshd_config.d/grafhome-ca.conf"))
+        );
+        assert!(
+            !plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command.starts_with("install rendered files"))
+        );
     }
 
     #[test]
@@ -611,17 +1024,21 @@ mod tests {
         assert!(plan.steps[0].commands[0].contains("step ssh certificate"));
         assert!(plan.steps[0].commands[0].contains("--sign"));
         assert!(plan.steps[0].commands[0].contains("--provisioner grafhome-user-login"));
-        assert!(plan.steps[0].commands[0].contains("STEPPATH=~/.config/grafhome/step"));
+        assert!(
+            plan.steps[0].commands[0]
+                .contains("--provisioner-password-file '<user-login-provisioner-password-file>'")
+        );
+        assert!(plan.steps[0].commands[0].contains("STEPPATH=$HOME/.config/grafhome/step"));
         assert!(
             plan.steps[0]
                 .commands
                 .iter()
-                .any(|command| command.contains("~/.ssh/alice_ca_host_ed25519.pub"))
+                .any(|command| command.contains("$HOME/.ssh/alice_ca_host_ed25519.pub"))
         );
         assert!(
             plan.steps[0]
                 .files
-                .contains(&"~/.ssh/alice_ca_host_ed25519-cert.pub".to_owned())
+                .contains(&"$HOME/.ssh/alice_ca_host_ed25519-cert.pub".to_owned())
         );
     }
 
@@ -715,7 +1132,7 @@ mod tests {
         assert!(plan.steps[1].hosts.is_empty());
         assert_eq!(
             plan.steps[1].commands,
-            vec!["grafhome-ca plan user-login --user new-user --device <device>"]
+            vec!["grafhome-ca plan user-login --user new-user --device '<device>'"]
         );
     }
 
@@ -733,6 +1150,22 @@ mod tests {
         let error = add_user(&model, "alice").unwrap_err().to_string();
 
         assert!(error.contains("user already exists"));
+    }
+
+    #[test]
+    fn shell_quotes_dynamic_plan_arguments() {
+        assert_eq!(
+            sh("/etc/ssh/ssh_host_ed25519_key"),
+            "/etc/ssh/ssh_host_ed25519_key"
+        );
+        assert_eq!(
+            sh("<public-material-dir>/root_fingerprint"),
+            "'<public-material-dir>/root_fingerprint'"
+        );
+        assert_eq!(
+            sh("path with spaces/and'a quote"),
+            "'path with spaces/and'\"'\"'a quote'"
+        );
     }
 
     fn step_ids(plan: &super::Plan) -> Vec<&str> {

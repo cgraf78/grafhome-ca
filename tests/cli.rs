@@ -147,6 +147,94 @@ fn render_writes_to_staging_directory() {
 }
 
 #[test]
+fn export_public_dry_run_lists_bundle_without_live_ca_state() {
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("export-public")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("--out-dir")
+        .arg("/tmp/not-used-by-dry-run")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("root_fingerprint"))
+        .stdout(predicate::str::contains("ssh_known_hosts"))
+        .stdout(predicate::str::contains("manifest.json"));
+}
+
+#[cfg(unix)]
+#[test]
+fn export_public_writes_trust_bundle_and_manifest() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let config_root = dir.path().join("grafhome-ca");
+    let ca_state = dir.path().join("state");
+    let step_bin = dir.path().join("fake-step");
+    let out_dir = dir.path().join("public");
+    copy_dir(&example_config_root(), &config_root);
+    fs::create_dir_all(ca_state.join("step/certs")).unwrap();
+    fs::write(
+        ca_state.join("step/certs/root_ca.crt"),
+        "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    fs::write(
+        ca_state.join("step/certs/ssh_host_ca_key.pub"),
+        "ssh-ed25519 AAAAhost grafhome-host-ca\n",
+    )
+    .unwrap();
+    fs::write(
+        ca_state.join("step/certs/ssh_user_ca_key.pub"),
+        "ssh-ed25519 AAAAuser grafhome-user-ca\n",
+    )
+    .unwrap();
+    fs::write(
+        &step_bin,
+        "#!/bin/sh\nprintf '%s\\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    fs::set_permissions(&step_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let deployment = fs::read_to_string(config_root.join("config/deployment.env")).unwrap();
+    let deployment = deployment
+        .replace(
+            "GRAFHOME_CA_STATE_DIR=/srv/example-ca",
+            &format!("GRAFHOME_CA_STATE_DIR={}", ca_state.display()),
+        )
+        .replace(
+            "GRAFHOME_CA_ROOT_STEP_BIN=/root/.local/bin/step",
+            &format!("GRAFHOME_CA_ROOT_STEP_BIN={}", step_bin.display()),
+        );
+    fs::write(config_root.join("config/deployment.env"), deployment).unwrap();
+
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    cmd.arg("export-public")
+        .arg("--config-root")
+        .arg(&config_root)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("exported 7 public files"));
+
+    assert!(out_dir.join("root_ca.crt").exists());
+    assert!(out_dir.join("user_ca_keys.pem").exists());
+    assert!(out_dir.join("ssh_known_hosts").exists());
+    let known_hosts = fs::read_to_string(out_dir.join("ssh_known_hosts")).unwrap();
+    assert!(known_hosts.contains("@cert-authority"));
+    assert!(known_hosts.contains("ca-origin.example.test"));
+    assert!(known_hosts.contains("ssh-ed25519 AAAAhost"));
+
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("schemas/public/export-manifest.schema.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out_dir.join("manifest.json")).unwrap()).unwrap();
+    grafhome_ca::schema::validate(manifest_path, &manifest).unwrap();
+}
+
+#[test]
 fn materialize_test_ca_fixture_emits_parseable_placeholder_free_json() {
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
     let output = cmd

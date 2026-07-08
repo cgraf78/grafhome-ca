@@ -84,7 +84,15 @@ fn rendered_config_can_start_throwaway_step_ca() {
         .arg(steppath.join("config/ca.json")));
 
     let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/site-config");
-    let model = grafhome_ca::model::SiteModel::load(config_root).unwrap();
+    let mut model = grafhome_ca::model::SiteModel::load(config_root).unwrap();
+    model.deployment.values.insert(
+        "GRAFHOME_CA_STATE_DIR".to_owned(),
+        temp.path().display().to_string(),
+    );
+    model
+        .deployment
+        .values
+        .insert("GRAFHOME_CA_ROOT_STEP_BIN".to_owned(), "step".to_owned());
     let rendered = grafhome_ca::render::render(&model).unwrap();
     let ca_json = rendered
         .iter()
@@ -128,6 +136,12 @@ fn rendered_config_can_start_throwaway_step_ca() {
         child.as_mut(),
         config["address"].as_str().unwrap(),
         &steppath,
+    );
+    exercise_public_export_and_host_certificate_lifecycle(
+        &model,
+        temp.path(),
+        config["address"].as_str().unwrap(),
+        &password,
     );
 }
 
@@ -250,4 +264,74 @@ fn wait_for_health(child: &mut Child, address: &str, steppath: &std::path::Path)
         thread::sleep(Duration::from_millis(250));
     }
     panic!("step-ca did not become healthy");
+}
+
+fn exercise_public_export_and_host_certificate_lifecycle(
+    model: &grafhome_ca::model::SiteModel,
+    temp: &std::path::Path,
+    address: &str,
+    password: &std::path::Path,
+) {
+    let public_dir = temp.join("public");
+    let public_files = grafhome_ca::public_material::collect(model).unwrap();
+    grafhome_ca::public_material::write(&public_files, &public_dir).unwrap();
+    let fingerprint = std::fs::read_to_string(public_dir.join("root_fingerprint")).unwrap();
+    let known_hosts = std::fs::read_to_string(public_dir.join("ssh_known_hosts")).unwrap();
+    assert!(known_hosts.contains("@cert-authority"));
+    assert!(known_hosts.contains("ca-origin.example.test"));
+
+    let client_steppath = temp.join("client-step");
+    run(Command::new("step")
+        .env("STEPPATH", &client_steppath)
+        .arg("ca")
+        .arg("bootstrap")
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--fingerprint")
+        .arg(fingerprint.trim()));
+
+    let host_key = temp.join("ssh_host_ed25519_key");
+    run(Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(&host_key));
+    let host_public_key = temp.join("ssh_host_ed25519_key.pub");
+    let host_cert = temp.join("ssh_host_ed25519_key-cert.pub");
+    run(Command::new("step")
+        .env("STEPPATH", &client_steppath)
+        .arg("ssh")
+        .arg("certificate")
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--provisioner")
+        .arg("grafhome-host-bootstrap")
+        .arg("--provisioner-password-file")
+        .arg(password)
+        .arg("--host")
+        .arg("--sign")
+        .arg("--force")
+        .arg("--principal")
+        .arg("edge-host")
+        .arg("--principal")
+        .arg("edge-host.example.test")
+        .arg("--not-after")
+        .arg("720h")
+        .arg("edge-host")
+        .arg(&host_public_key));
+    assert!(host_cert.exists());
+
+    run(Command::new("step")
+        .env("STEPPATH", &client_steppath)
+        .arg("ssh")
+        .arg("renew")
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--provisioner")
+        .arg("grafhome-host-renew")
+        .arg("--force")
+        .arg(&host_cert)
+        .arg(&host_key));
 }
