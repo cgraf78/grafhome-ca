@@ -1,9 +1,16 @@
 //! Grafhome CA repository and lifecycle CLI.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use grafhome_ca::model::SiteModel;
+
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        write_stdout(format_args!($($arg)*))?
+    };
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "grafhome-ca")]
@@ -50,6 +57,9 @@ enum Command {
         /// Show rendered paths without writing files.
         #[arg(long)]
         dry_run: bool,
+        /// Remove stale files under the output directory before writing.
+        #[arg(long)]
+        clean: bool,
     },
     /// Export public CA trust material into a staging directory.
     ExportPublic {
@@ -109,6 +119,16 @@ enum PlanCommand {
     },
     /// Plan certificate renewal for every managed SSH server host.
     HostRenewAll,
+    /// Plan CA state backup and restore-test.
+    BackupCa,
+    /// Plan live non-mutating rollout verification.
+    VerifyLive {
+        /// Limit verification to one host's SSH rollout checks.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Plan proxy X.509 certificate issuance or renewal.
+    ProxyCert,
     /// Plan user certificate issuance.
     UserLogin {
         /// User policy name.
@@ -142,14 +162,14 @@ fn main() {
 fn run() -> grafhome_ca::Result<()> {
     match Cli::parse().command {
         Command::Version => {
-            println!("grafhome-ca {}", grafhome_ca::version::cli());
+            outln!("grafhome-ca {}", grafhome_ca::version::cli());
             Ok(())
         }
         Command::Check { config_root } => {
             let config_root = resolve_config_root(config_root)?;
             let model = SiteModel::load(&config_root)?;
             grafhome_ca::schema::validate_config_root(&config_root)?;
-            println!(
+            outln!(
                 "ok: config and policy valid; ca_api={} ca_origin={}",
                 model
                     .policy
@@ -177,14 +197,14 @@ fn run() -> grafhome_ca::Result<()> {
             let config_root = resolve_config_root(config_root)?;
             SiteModel::load(&config_root)?;
             grafhome_ca::schema::validate_config_root(&config_root)?;
-            println!("ok: config-only doctor passed");
+            outln!("ok: config-only doctor passed");
             Ok(())
         }
         Command::Endpoints { config_root } => {
             let config_root = resolve_config_root(config_root)?;
             let model = SiteModel::load(&config_root)?;
             for endpoint in &model.policy.endpoints {
-                println!("{}\t{}\t{}", endpoint.role, endpoint.target, endpoint.url());
+                outln!("{}\t{}\t{}", endpoint.role, endpoint.target, endpoint.url());
             }
             Ok(())
         }
@@ -192,6 +212,7 @@ fn run() -> grafhome_ca::Result<()> {
             config_root,
             out_dir,
             dry_run,
+            clean,
         } => {
             let config_root = resolve_config_root(config_root)?;
             let model = SiteModel::load(&config_root)?;
@@ -199,11 +220,15 @@ fn run() -> grafhome_ca::Result<()> {
             let files = grafhome_ca::render::render(&model)?;
             if dry_run {
                 for file in &files {
-                    println!("{:04o}\t{}", file.mode, file.path.display());
+                    outln!("{:04o}\t{}", file.mode, file.path.display());
                 }
             } else {
-                grafhome_ca::render::write(&files, &out_dir)?;
-                println!("rendered {} files under {}", files.len(), out_dir.display());
+                if clean {
+                    grafhome_ca::render::write_clean(&files, &out_dir)?;
+                } else {
+                    grafhome_ca::render::write(&files, &out_dir)?;
+                }
+                outln!("rendered {} files under {}", files.len(), out_dir.display());
             }
             Ok(())
         }
@@ -218,12 +243,12 @@ fn run() -> grafhome_ca::Result<()> {
             if dry_run {
                 let files = grafhome_ca::public_material::planned_files();
                 for file in &files {
-                    println!("{:04o}\t{}", file.mode, file.path.display());
+                    outln!("{:04o}\t{}", file.mode, file.path.display());
                 }
             } else {
                 let files = grafhome_ca::public_material::collect(&model)?;
                 grafhome_ca::public_material::write(&files, &out_dir)?;
-                println!(
+                outln!(
                     "exported {} public files under {}",
                     files.len(),
                     out_dir.display()
@@ -235,7 +260,7 @@ fn run() -> grafhome_ca::Result<()> {
             let config_root = resolve_config_root(config_root)?;
             let model = SiteModel::load(&config_root)?;
             grafhome_ca::schema::validate_config_root(&config_root)?;
-            println!(
+            outln!(
                 "{}",
                 grafhome_ca::render::materialize_test_ca_fixture_json(&model)?
             );
@@ -258,6 +283,11 @@ fn run() -> grafhome_ca::Result<()> {
                     grafhome_ca::lifecycle::host_renew(&model, &host)?
                 }
                 PlanCommand::HostRenewAll => grafhome_ca::lifecycle::host_renew_all(&model)?,
+                PlanCommand::BackupCa => grafhome_ca::lifecycle::backup_ca(&model)?,
+                PlanCommand::VerifyLive { host } => {
+                    grafhome_ca::lifecycle::verify_live(&model, host.as_deref())?
+                }
+                PlanCommand::ProxyCert => grafhome_ca::lifecycle::proxy_cert(&model)?,
                 PlanCommand::UserLogin { user, device } => {
                     grafhome_ca::lifecycle::user_login(&model, &user, device.as_deref())?
                 }
@@ -266,12 +296,12 @@ fn run() -> grafhome_ca::Result<()> {
             };
             grafhome_ca::schema::validate_lifecycle_plan(&plan)?;
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::to_string_pretty(&plan).expect("plan serializes")
                 );
             } else {
-                print_plan(&plan);
+                print_plan(&plan)?;
             }
             Ok(())
         }
@@ -283,7 +313,7 @@ fn run() -> grafhome_ca::Result<()> {
                 let config_root = resolve_config_root(config_root)?;
                 let model = SiteModel::load(&config_root)?;
                 let plan = grafhome_ca::lifecycle::init_ca(&model)?;
-                print_plan(&plan);
+                print_plan(&plan)?;
                 Ok(())
             } else {
                 Err(grafhome_ca::Error::Validation {
@@ -304,21 +334,41 @@ fn resolve_config_root(config_root: Option<PathBuf>) -> grafhome_ca::Result<Path
     }
 }
 
-fn print_plan(plan: &grafhome_ca::lifecycle::Plan) {
-    println!("{}: {}", plan.operation, plan.summary);
+fn write_stdout(args: std::fmt::Arguments<'_>) -> grafhome_ca::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    if let Err(source) = stdout.write_fmt(args) {
+        return handle_stdout_error(source);
+    }
+    if let Err(source) = stdout.write_all(b"\n") {
+        return handle_stdout_error(source);
+    }
+    Ok(())
+}
+
+fn handle_stdout_error(source: std::io::Error) -> grafhome_ca::Result<()> {
+    if source.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::io("<stdout>", source))
+    }
+}
+
+fn print_plan(plan: &grafhome_ca::lifecycle::Plan) -> grafhome_ca::Result<()> {
+    outln!("{}: {}", plan.operation, plan.summary);
     for step in &plan.steps {
-        println!("- {}: {}", step.id, step.summary);
+        outln!("- {}: {}", step.id, step.summary);
         if !step.hosts.is_empty() {
-            println!("  hosts: {}", step.hosts.join(","));
+            outln!("  hosts: {}", step.hosts.join(","));
         }
         for command in &step.commands {
-            println!("  command: {command}");
+            outln!("  command: {command}");
         }
         for file in &step.files {
-            println!("  file: {file}");
+            outln!("  file: {file}");
         }
         if step.manual {
-            println!("  manual: true");
+            outln!("  manual: true");
         }
     }
+    Ok(())
 }

@@ -60,6 +60,15 @@ Render reviewed deployment files into a staging directory:
 cargo run --bin grafhome-ca -- render --out-dir /tmp/grafhome-ca-render
 ```
 
+Use `--clean` for rollout staging directories so removed or renamed generated
+files cannot linger from a previous render. It removes generated top-level
+roots, such as `hosts/`, while preserving unrelated files in the output
+directory:
+
+```sh
+cargo run --bin grafhome-ca -- render --clean --out-dir /tmp/grafhome-ca-render
+```
+
 Preview rendered files without writing:
 
 ```sh
@@ -94,6 +103,9 @@ cargo run --bin grafhome-ca -- plan init-ca
 cargo run --bin grafhome-ca -- plan host-bootstrap --host ca-host
 cargo run --bin grafhome-ca -- plan host-renew --host ca-host
 cargo run --bin grafhome-ca -- plan host-renew-all
+cargo run --bin grafhome-ca -- plan backup-ca
+cargo run --bin grafhome-ca -- plan proxy-cert
+cargo run --bin grafhome-ca -- plan verify-live --host ca-host
 cargo run --bin grafhome-ca -- plan user-login --user alice --device ca-host
 cargo run --bin grafhome-ca -- plan add-host --host new-host
 cargo run --bin grafhome-ca -- plan add-user --user new-user
@@ -116,6 +128,20 @@ cargo run --bin grafhome-ssh-login -- --dry-run --user alice
 `grafhome-ca plan init-ca`. `grafhome-ssh-login` is a placeholder for future
 user certificate issuance; without `--dry-run` it exits before invoking `step`
 or `ssh-agent`, and its dry-run mode currently validates only the CLI surface.
+
+`backup-ca`, `proxy-cert`, and `verify-live` are still plans, not live
+execution. They exist to keep rollout checklists concrete:
+
+- `backup-ca` emits CA state backup and restore-test commands. The init plan
+  includes the same backup/restore-test gate after `step-ca` activation; do not
+  bootstrap host trust until that restore test has passed.
+- `proxy-cert` emits the proxy TLS certificate issuance shape using the
+  configured `proxy_x509` provisioner. Replace `<acme-challenge-mode>` with the
+  site-selected ACME mode, such as `--standalone` or `--webroot <dir>`.
+- `verify-live` emits non-mutating checks for CA health, exported root
+  fingerprint consistency, proxy TLS against the exported root certificate,
+  OpenSSH server trust, host certificates, and SSH client known-hosts CA
+  configuration.
 
 ## Release Versioning
 
