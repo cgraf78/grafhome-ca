@@ -4,7 +4,7 @@
 //! to `/etc`, `/srv`, or any live host path directly; deployment remains a
 //! separate operator-controlled phase.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -235,6 +235,27 @@ fn materialize_test_ca_fixture_state(config: &mut Value) -> Result<()> {
 pub fn write(files: &[RenderedFile], out_dir: impl AsRef<Path>) -> Result<()> {
     let out_dir = out_dir.as_ref();
     prepare_output_root(out_dir)?;
+    write_prepared(files, out_dir)
+}
+
+/// Write rendered files after first removing stale files from the staging directory.
+pub fn write_clean(files: &[RenderedFile], out_dir: impl AsRef<Path>) -> Result<()> {
+    let out_dir = out_dir.as_ref();
+    if out_dir.exists() {
+        ensure_not_symlink(out_dir)?;
+        if !out_dir.is_dir() {
+            return Err(Error::Validation {
+                field: out_dir.display().to_string(),
+                message: "render output path must be a directory".to_owned(),
+            });
+        }
+        remove_generated_roots(files, out_dir)?;
+    }
+    prepare_output_root(out_dir)?;
+    write_prepared(files, out_dir)
+}
+
+fn write_prepared(files: &[RenderedFile], out_dir: &Path) -> Result<()> {
     for file in files {
         ensure_relative(&file.path)?;
         let target = out_dir.join(&file.path);
@@ -244,6 +265,66 @@ pub fn write(files: &[RenderedFile], out_dir: impl AsRef<Path>) -> Result<()> {
         ensure_not_symlink(&target)?;
         std::fs::write(&target, &file.content).map_err(|source| Error::io(&target, source))?;
         set_mode(&target, file.mode)?;
+    }
+    Ok(())
+}
+
+fn remove_children(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).map_err(|source| Error::io(dir, source))? {
+        let entry = entry.map_err(|source| Error::io(dir, source))?;
+        let path = entry.path();
+        remove_existing_path(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_generated_roots(files: &[RenderedFile], out_dir: &Path) -> Result<()> {
+    for root in generated_roots(files)? {
+        remove_existing_path(&out_dir.join(root))?;
+    }
+    Ok(())
+}
+
+fn generated_roots(files: &[RenderedFile]) -> Result<BTreeSet<PathBuf>> {
+    let mut roots = BTreeSet::new();
+    for file in files {
+        ensure_relative(&file.path)?;
+        let mut root = None;
+        for component in file.path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => {
+                    root = Some(PathBuf::from(part));
+                    break;
+                }
+                _ => {
+                    return Err(Error::Validation {
+                        field: file.path.display().to_string(),
+                        message: "unsupported staging path component".to_owned(),
+                    });
+                }
+            }
+        }
+        let root = root.ok_or_else(|| Error::Validation {
+            field: file.path.display().to_string(),
+            message: "rendered path must name a file under the output directory".to_owned(),
+        })?;
+        roots.insert(root);
+    }
+    Ok(roots)
+}
+
+fn remove_existing_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(Error::io(path, source)),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        remove_children(path)?;
+        std::fs::remove_dir(path).map_err(|source| Error::io(path, source))?;
+    } else {
+        std::fs::remove_file(path).map_err(|source| Error::io(path, source))?;
     }
     Ok(())
 }
@@ -921,6 +1002,33 @@ mod tests {
 
         assert!(error.contains("refusing to render through symlinked staging path"));
         assert!(!outside.path().join("auth_principals").exists());
+    }
+
+    #[test]
+    fn write_clean_removes_only_generated_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let out_dir = temp.path().join("out");
+        std::fs::create_dir_all(out_dir.join("hosts/old-host")).unwrap();
+        std::fs::write(out_dir.join("hosts/old-host/stale"), "old").unwrap();
+        std::fs::write(out_dir.join("operator-notes.txt"), "keep").unwrap();
+
+        let file = super::RenderedFile {
+            path: std::path::PathBuf::from("hosts/ca-host/etc/ssh/auth_principals/alice"),
+            mode: 0o644,
+            content: "alice\n".to_owned(),
+        };
+        super::write_clean(&[file], &out_dir).unwrap();
+
+        assert!(!out_dir.join("hosts/old-host/stale").exists());
+        assert_eq!(
+            std::fs::read_to_string(out_dir.join("operator-notes.txt")).unwrap(),
+            "keep"
+        );
+        assert!(
+            out_dir
+                .join("hosts/ca-host/etc/ssh/auth_principals/alice")
+                .exists()
+        );
     }
 
     fn referenced_sshd_files(content: &str) -> Vec<&str> {

@@ -147,6 +147,35 @@ fn render_writes_to_staging_directory() {
 }
 
 #[test]
+fn render_clean_removes_stale_staging_files() {
+    let dir = tempdir().unwrap();
+    let stale = dir.path().join("hosts/old-host/stale.txt");
+    fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    fs::write(&stale, "old").unwrap();
+    let unrelated = dir.path().join("operator-notes.txt");
+    fs::write(&unrelated, "keep").unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("render")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("--out-dir")
+        .arg(dir.path())
+        .arg("--clean")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rendered "));
+
+    assert!(!stale.exists());
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "keep");
+    assert!(
+        dir.path()
+            .join("hosts/ca-host/srv/example-ca/step/config/ca.json")
+            .exists()
+    );
+}
+
+#[test]
 fn export_public_dry_run_lists_bundle_without_live_ca_state() {
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
@@ -342,6 +371,9 @@ fn every_plan_json_command_matches_plan_schema() {
         &["host-bootstrap", "--host", "ca-host"],
         &["host-renew", "--host", "ca-host"],
         &["host-renew-all"],
+        &["backup-ca"],
+        &["verify-live", "--host", "ca-host"],
+        &["proxy-cert"],
         &["user-login", "--user", "alice", "--device", "ca-host"],
         &["add-host", "--host", "new-host"],
         &["add-user", "--user", "new-user"],
@@ -366,6 +398,55 @@ fn every_plan_json_command_matches_plan_schema() {
 
         grafhome_ca::schema::validate(&schema, &value).expect("CLI plan output matches schema");
     }
+}
+
+#[test]
+fn plan_rollout_hardening_commands_are_visible() {
+    let mut backup = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    backup
+        .arg("plan")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("backup-ca")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("restore-test"))
+        .stdout(predicate::str::contains("intermediate_ca_key"))
+        .stdout(predicate::str::contains("backup_file='<backup-file>'"))
+        .stdout(predicate::str::contains("dirname \"$backup_file\""));
+
+    let mut verify = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    verify
+        .arg("plan")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("verify-live")
+        .arg("--host")
+        .arg("proxy-host")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("step ca health"))
+        .stdout(predicate::str::contains("sshd -T"))
+        .stdout(predicate::str::contains("openssl s_client"))
+        .stdout(predicate::str::contains(
+            "-CAfile '<public-material-dir>/root_ca.crt'",
+        ))
+        .stdout(predicate::str::contains("-verify_hostname ca.example.test"));
+
+    let mut proxy = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    proxy
+        .arg("plan")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("proxy-cert")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("step ca certificate"))
+        .stdout(predicate::str::contains("<acme-challenge-mode>"))
+        .stdout(predicate::str::contains(
+            "-CAfile '<public-material-dir>/root_ca.crt'",
+        ))
+        .stdout(predicate::str::contains("-verify_hostname ca.example.test"));
 }
 
 #[test]

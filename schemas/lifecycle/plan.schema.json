@@ -11,6 +11,9 @@
         "host-bootstrap",
         "host-renew",
         "host-renew-all",
+        "backup-ca",
+        "verify-live",
+        "proxy-cert",
         "user-login",
         "add-host",
         "add-user"
@@ -35,12 +38,18 @@
             "review-secrets",
             "export-public-material",
             "activate-service",
+            "backup-ca-state",
+            "restore-test-backup",
             "install-client",
             "bootstrap-trust",
             "install-rendered-files",
             "issue-host-cert",
             "renew-host-cert",
             "issue-user-cert",
+            "proxy-cert",
+            "verify-ca-api",
+            "verify-ssh",
+            "verify-proxy-tls",
             "edit-policy",
             "bootstrap-host"
           ]
