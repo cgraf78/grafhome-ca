@@ -7,6 +7,9 @@ being stored independently.
 
 ## `config/deployment.env`
 
+This file uses literal `KEY=value` lines. It is not shell-sourced; do not quote
+values.
+
 `GRAFHOME_CA_STATE_DIR`
 : Root directory for CA-owned mutable state on the CA host.
 
@@ -24,6 +27,12 @@ being stored independently.
 
 `GRAFHOME_CA_PROXY_TLS_DIR`
 : Directory for proxy TLS files when rendered for Apache.
+
+`GRAFHOME_CA_PROXY_ACME_WEBROOT`
+: Absolute path to the webroot directory used by `step ca certificate
+  --webroot` for proxy X.509 certificate issuance and renewal. The proxy web
+  server must serve `${GRAFHOME_CA_PROXY_ACME_WEBROOT}/.well-known/acme-challenge/`
+  over HTTP for the `ca_api` DNS name without requiring authentication.
 
 `GRAFHOME_CA_STEP_CA_BIN`
 : Absolute path to the `step-ca` server binary.
@@ -47,15 +56,8 @@ being stored independently.
 `GRAFHOME_CA_SERVICE_USER`
 : Unix service account and primary service group that run the CA server.
 
-`GRAFHOME_CA_OPERATOR_GROUP`
-: Unix group allowed to perform CA operator tasks. Membership must not grant
-  direct read access to live CA private keys.
-
 `GRAFHOME_CA_APACHE_CONF_AVAILABLE`
 : Apache `conf-available` directory used by reverse-proxy templates.
-
-`GRAFHOME_CA_APACHE_SITES_AVAILABLE`
-: Apache `sites-available` directory used by reverse-proxy templates.
 
 ## Policy Terms
 

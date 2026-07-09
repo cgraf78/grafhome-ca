@@ -136,8 +136,8 @@ execution. They exist to keep rollout checklists concrete:
   includes the same backup/restore-test gate after `step-ca` activation; do not
   bootstrap host trust until that restore test has passed.
 - `proxy-cert` emits the proxy TLS certificate issuance shape using the
-  configured `proxy_x509` provisioner. Replace `<acme-challenge-mode>` with the
-  site-selected ACME mode, such as `--standalone` or `--webroot <dir>`.
+  configured `proxy_x509` provisioner and the configured
+  `GRAFHOME_CA_PROXY_ACME_WEBROOT`.
 - `verify-live` emits non-mutating checks for CA health, exported root
   fingerprint consistency, proxy TLS against the exported root certificate,
   OpenSSH server trust, host certificates, and SSH client known-hosts CA

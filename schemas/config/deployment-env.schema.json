@@ -10,15 +10,14 @@
     "GRAFHOME_CA_SSH_TRUST_DIR",
     "GRAFHOME_CA_AUTH_PRINCIPALS_DIR",
     "GRAFHOME_CA_PROXY_TLS_DIR",
+    "GRAFHOME_CA_PROXY_ACME_WEBROOT",
     "GRAFHOME_CA_STEP_CA_BIN",
     "GRAFHOME_CA_ROOT_STEP_BIN",
     "GRAFHOME_CA_HELPER_BIN",
     "GRAFHOME_CA_HOST_KEY_PATH",
     "GRAFHOME_CA_PASSWORD_FILE",
     "GRAFHOME_CA_SERVICE_USER",
-    "GRAFHOME_CA_OPERATOR_GROUP",
-    "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
-    "GRAFHOME_CA_APACHE_SITES_AVAILABLE"
+    "GRAFHOME_CA_APACHE_CONF_AVAILABLE"
   ],
   "properties": {
     "GRAFHOME_CA_STATE_DIR": { "$ref": "#/definitions/absolutePath" },
@@ -30,15 +29,14 @@
     "GRAFHOME_CA_SSH_TRUST_DIR": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_AUTH_PRINCIPALS_DIR": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_PROXY_TLS_DIR": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_PROXY_ACME_WEBROOT": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_STEP_CA_BIN": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_ROOT_STEP_BIN": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_HELPER_BIN": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_HOST_KEY_PATH": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_PASSWORD_FILE": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_SERVICE_USER": { "$ref": "#/definitions/accountName" },
-    "GRAFHOME_CA_OPERATOR_GROUP": { "$ref": "#/definitions/accountName" },
-    "GRAFHOME_CA_APACHE_CONF_AVAILABLE": { "$ref": "#/definitions/absolutePath" },
-    "GRAFHOME_CA_APACHE_SITES_AVAILABLE": { "$ref": "#/definitions/absolutePath" }
+    "GRAFHOME_CA_APACHE_CONF_AVAILABLE": { "$ref": "#/definitions/absolutePath" }
   },
   "definitions": {
     "absolutePath": {

@@ -756,6 +756,35 @@ mod tests {
     }
 
     #[test]
+    fn rendered_apache_proxy_fragment_verifies_https_origin() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let proxy = files
+            .iter()
+            .find(|file| {
+                file.path
+                    == std::path::Path::new(
+                        "hosts/proxy-host/etc/apache2/conf-available/grafhome-ca-proxy.conf",
+                    )
+            })
+            .unwrap();
+
+        assert!(proxy.content.contains("SSLProxyEngine on"));
+        assert!(proxy.content.contains("SSLProxyVerify require"));
+        assert!(proxy.content.contains("SSLProxyCheckPeerName on"));
+        assert!(
+            proxy
+                .content
+                .contains("SSLProxyCACertificateFile /etc/ssl/example-ca/root_ca.crt")
+        );
+        assert!(
+            proxy
+                .content
+                .contains("ProxyPass        / https://ca-origin.example.test:8443/")
+        );
+    }
+
+    #[test]
     fn renders_policy_backed_ca_json() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
         let files = render(&model).unwrap();

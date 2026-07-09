@@ -312,7 +312,9 @@ fn run() -> grafhome_ca::Result<()> {
             if dry_run {
                 let config_root = resolve_config_root(config_root)?;
                 let model = SiteModel::load(&config_root)?;
+                grafhome_ca::schema::validate_config_root(&config_root)?;
                 let plan = grafhome_ca::lifecycle::init_ca(&model)?;
+                grafhome_ca::schema::validate_lifecycle_plan(&plan)?;
                 print_plan(&plan)?;
                 Ok(())
             } else {

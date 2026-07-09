@@ -78,6 +78,30 @@ fn init_dry_run_prints_plan() {
 }
 
 #[test]
+fn init_dry_run_matches_init_plan_output() {
+    let dry_run = Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .arg("init-ca")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("--dry-run")
+        .output()
+        .expect("dry-run command exits");
+    assert!(dry_run.status.success());
+
+    let plan = Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .arg("plan")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("init-ca")
+        .output()
+        .expect("plan command exits");
+    assert!(plan.status.success());
+    assert_eq!(dry_run.stdout, plan.stdout);
+}
+
+#[test]
 fn ssh_login_live_issuance_is_gated() {
     let mut cmd = Command::cargo_bin("grafhome-ssh-login").expect("binary exists");
 
@@ -441,8 +465,11 @@ fn plan_rollout_hardening_commands_are_visible() {
         .arg("proxy-cert")
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "install -d -m 0755 /var/www/html/.well-known/acme-challenge",
+        ))
         .stdout(predicate::str::contains("step ca certificate"))
-        .stdout(predicate::str::contains("<acme-challenge-mode>"))
+        .stdout(predicate::str::contains("--webroot /var/www/html"))
         .stdout(predicate::str::contains(
             "-CAfile '<public-material-dir>/root_ca.crt'",
         ))

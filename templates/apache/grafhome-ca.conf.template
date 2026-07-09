@@ -1,3 +1,9 @@
 # Managed by grafhome-ca. Intended for Apache reverse proxy rollout.
+SSLProxyEngine on
+SSLProxyVerify require
+SSLProxyCheckPeerName on
+SSLProxyCheckPeerExpire on
+SSLProxyCACertificateFile ${GRAFHOME_CA_PROXY_TLS_DIR}/root_ca.crt
+
 ProxyPass        / https://${GRAFHOME_CA_ORIGIN_DNS_NAME}:${GRAFHOME_CA_ORIGIN_PORT}/
 ProxyPassReverse / https://${GRAFHOME_CA_ORIGIN_DNS_NAME}:${GRAFHOME_CA_ORIGIN_PORT}/
