@@ -771,6 +771,7 @@ mod tests {
 
         assert!(proxy.content.contains("SSLProxyEngine on"));
         assert!(proxy.content.contains("SSLProxyVerify require"));
+        assert!(proxy.content.contains("SSLProxyVerifyDepth 2"));
         assert!(proxy.content.contains("SSLProxyCheckPeerName on"));
         assert!(
             proxy

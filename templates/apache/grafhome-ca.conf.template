@@ -1,6 +1,7 @@
 # Managed by grafhome-ca. Intended for Apache reverse proxy rollout.
 SSLProxyEngine on
 SSLProxyVerify require
+SSLProxyVerifyDepth 2
 SSLProxyCheckPeerName on
 SSLProxyCheckPeerExpire on
 SSLProxyCACertificateFile ${GRAFHOME_CA_PROXY_TLS_DIR}/root_ca.crt
