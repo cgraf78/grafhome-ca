@@ -780,6 +780,11 @@ mod tests {
         assert!(
             proxy
                 .content
+                .contains("ProxyPass        /.well-known/acme-challenge/ !")
+        );
+        assert!(
+            proxy
+                .content
                 .contains("ProxyPass        / https://ca-origin.example.test:8443/")
         );
     }

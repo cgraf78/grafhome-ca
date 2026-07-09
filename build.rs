@@ -39,8 +39,6 @@ fn valid_version(value: &str) -> bool {
 }
 
 fn watch_git_head() {
-    println!("cargo:rerun-if-changed=.git");
-
     if let Some(path) = output(Command::new("git").args(["rev-parse", "--git-path", "HEAD"])) {
         println!("cargo:rerun-if-changed={path}");
     }

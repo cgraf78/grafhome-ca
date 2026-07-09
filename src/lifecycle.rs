@@ -218,13 +218,33 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
         },
         PlanStep {
             id: STEP_ACTIVATE_SERVICE.to_owned(),
-            summary: "enable step-ca only after rendered config and secrets are reviewed".to_owned(),
+            summary: "repair step-ca ownership and enable the service after review".to_owned(),
             hosts: vec![ca_origin.target.clone()],
             commands: vec![
+                format!(
+                    "chown -R {}:{} {}",
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_STATE_DIR"]),
+                ),
+                format!(
+                    "chown {}:{} {}",
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                ),
+                format!(
+                    "chmod 0600 {}",
+                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                ),
                 "systemctl daemon-reload".to_owned(),
                 "systemctl enable --now step-ca.service".to_owned(),
             ],
-            files: vec!["/etc/systemd/system/step-ca.service".to_owned()],
+            files: vec![
+                format!("{}/config/ca.json", model.deployment.ca_steppath()),
+                model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"].clone(),
+                "/etc/systemd/system/step-ca.service".to_owned(),
+            ],
             manual: true,
         },
     ];
@@ -423,6 +443,12 @@ pub fn verify_live(model: &SiteModel, host: Option<&str>) -> Result<Plan> {
             commands: vec![
                 format!("test -s {}", sh(&proxy_cert_path(model, ca_api))),
                 format!("test -s {}", sh(&proxy_key_path(model, ca_api))),
+                format!("test -s {}", sh(&proxy_root_cert_path(model))),
+                format!(
+                    "cmp -s {} {}",
+                    sh(&proxy_root_cert_path(model)),
+                    sh("<public-material-dir>/root_ca.crt")
+                ),
                 format!(
                     "openssl x509 -in {} -noout -checkend 604800",
                     sh(&proxy_cert_path(model, ca_api))
@@ -439,6 +465,7 @@ pub fn verify_live(model: &SiteModel, host: Option<&str>) -> Result<Plan> {
             files: vec![
                 proxy_cert_path(model, ca_api),
                 proxy_key_path(model, ca_api),
+                proxy_root_cert_path(model),
                 "<public-material-dir>/root_ca.crt".to_owned(),
             ],
             manual: true,
@@ -482,6 +509,7 @@ pub fn proxy_cert(model: &SiteModel) -> Result<Plan> {
                         "install -d -m 0750 {}",
                         sh(&model.deployment.values["GRAFHOME_CA_PROXY_TLS_DIR"])
                     ),
+                    install_public_material_command("root_ca.crt", &proxy_root_cert_path(model)),
                     format!("install -d -m 0755 {}", sh(&challenge_dir)),
                     format!(
                         "STEPPATH={} {} ca certificate {} {} {} --ca-url {} --provisioner {} --san {} --not-after {} --force --webroot {}",
@@ -498,7 +526,7 @@ pub fn proxy_cert(model: &SiteModel) -> Result<Plan> {
                     ),
                     format!("openssl x509 -in {} -noout -text", sh(&cert)),
                 ],
-                files: vec![cert, key],
+                files: vec![cert, key, proxy_root_cert_path(model)],
                 manual: true,
             },
             PlanStep {
@@ -842,6 +870,13 @@ fn proxy_key_path(model: &SiteModel, ca_api: &crate::policy::Endpoint) -> String
         "{}/{}.key",
         model.deployment.values["GRAFHOME_CA_PROXY_TLS_DIR"].trim_end_matches('/'),
         ca_api.dns_name
+    )
+}
+
+fn proxy_root_cert_path(model: &SiteModel) -> String {
+    format!(
+        "{}/root_ca.crt",
+        model.deployment.values["GRAFHOME_CA_PROXY_TLS_DIR"].trim_end_matches('/'),
     )
 }
 
@@ -1231,7 +1266,23 @@ mod tests {
                     .contains("/etc/apache2/conf-available/grafhome-ca-proxy.conf"))
         );
         assert!(plan.steps[4].commands[0].contains("export-public"));
-        assert!(plan.steps[5].commands[1].contains("systemctl enable --now step-ca.service"));
+        assert!(
+            plan.steps[5]
+                .commands
+                .iter()
+                .position(|command| command.contains("chown -R step-ca:step-ca /srv/example-ca"))
+                .unwrap()
+                < plan.steps[5]
+                    .commands
+                    .iter()
+                    .position(|command| command.contains("systemctl enable --now step-ca.service"))
+                    .unwrap()
+        );
+        assert!(
+            plan.steps[5]
+                .files
+                .contains(&"/srv/example-ca/step/config/ca.json".to_owned())
+        );
         assert!(plan.steps[6].commands[1].contains("tar -C /srv -cpf"));
         assert!(plan.steps[7].commands[0].contains("tar -C \"$restore_dir\" -xpf"));
         assert!(
@@ -1272,17 +1323,25 @@ mod tests {
             vec![STEP_PROXY_CERT, STEP_VERIFY_PROXY_TLS]
         );
         assert!(
-            plan.steps[0].commands[1]
+            plan.steps[0].commands[2]
                 .contains("install -d -m 0755 /var/www/html/.well-known/acme-challenge")
         );
-        assert!(plan.steps[0].commands[2].contains("step ca certificate"));
-        assert!(plan.steps[0].commands[2].contains("--provisioner grafhome-x509-ca-proxy"));
-        assert!(plan.steps[0].commands[2].contains("--webroot /var/www/html"));
-        assert!(!plan.steps[0].commands[2].contains("<acme-challenge-mode>"));
+        assert!(plan.steps[0].commands[1].contains(
+            "install -D -m 0644 '<public-material-dir>/root_ca.crt' /etc/ssl/example-ca/root_ca.crt"
+        ));
+        assert!(plan.steps[0].commands[3].contains("step ca certificate"));
+        assert!(plan.steps[0].commands[3].contains("--provisioner grafhome-x509-ca-proxy"));
+        assert!(plan.steps[0].commands[3].contains("--webroot /var/www/html"));
+        assert!(!plan.steps[0].commands[3].contains("<acme-challenge-mode>"));
         assert!(
             plan.steps[0]
                 .files
                 .contains(&"/etc/ssl/example-ca/ca.example.test.crt".to_owned())
+        );
+        assert!(
+            plan.steps[0]
+                .files
+                .contains(&"/etc/ssl/example-ca/root_ca.crt".to_owned())
         );
     }
 
@@ -1297,8 +1356,19 @@ mod tests {
             vec![STEP_VERIFY_CA_API, STEP_VERIFY_PROXY_TLS, STEP_VERIFY_SSH]
         );
         assert!(plan.steps[0].commands[0].contains("step ca health"));
-        assert!(plan.steps[1].commands[3].contains("openssl s_client"));
-        assert!(plan.steps[1].commands[3].contains("-verify_hostname ca.example.test"));
+        assert!(
+            plan.steps[1]
+                .commands
+                .contains(&"test -s /etc/ssl/example-ca/root_ca.crt".to_owned())
+        );
+        assert!(
+            plan.steps[1].commands.contains(
+                &"cmp -s /etc/ssl/example-ca/root_ca.crt '<public-material-dir>/root_ca.crt'"
+                    .to_owned()
+            )
+        );
+        assert!(plan.steps[1].commands[5].contains("openssl s_client"));
+        assert!(plan.steps[1].commands[5].contains("-verify_hostname ca.example.test"));
         assert!(
             plan.steps[2]
                 .commands
