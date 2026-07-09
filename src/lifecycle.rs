@@ -108,9 +108,13 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
     let ca_origin = required_endpoint(model, "ca_origin")?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let bootstrap = required_provisioner(model, "host_bootstrap")?;
+    let service_user = &model.deployment.values["GRAFHOME_CA_SERVICE_USER"];
+    let password_file = &model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"];
+    let password_parent = parent_dir(password_file);
     let provisioner_review_commands =
         runtime_provisioner_review_commands(model, &ca_origin.target, &bootstrap.name);
-    let install_steps = rendered_install_steps(model, &[&ca_origin.target, &ca_api.target])?;
+    let install_steps =
+        init_ca_rendered_install_steps(model, &[&ca_origin.target, &ca_api.target])?;
     let install_hosts = unique_hosts([ca_origin.target.clone(), ca_api.target.clone()]);
     let mut steps = vec![
         PlanStep {
@@ -131,15 +135,61 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
             hosts: vec![ca_origin.target.clone()],
             commands: vec![
                 format!(
-                    "install -d -m 0750 {} {}",
-                    sh(&model.deployment.ca_steppath()),
-                    sh(&parent_dir(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"])),
+                    "getent group {} || groupadd --system {}",
+                    sh(service_user),
+                    sh(service_user),
                 ),
                 format!(
-                    "umask 077; test -s {} || {} crypto rand --format ascii 48 > {}",
-                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    "if ! id -u {} >/dev/null 2>&1; then service_shell=\"$(command -v nologin || true)\"; if test -z \"$service_shell\"; then for candidate in /usr/sbin/nologin /usr/bin/nologin /sbin/nologin /bin/false /usr/bin/false; do test ! -x \"$candidate\" || {{ service_shell=\"$candidate\"; break; }}; done; fi; test -n \"$service_shell\"; useradd --system --gid {} --home-dir {} --shell \"$service_shell\" --comment {} {}; fi",
+                    sh(service_user),
+                    sh(service_user),
+                    sh(&model.deployment.values["GRAFHOME_CA_STATE_DIR"]),
+                    sh("Grafhome CA service"),
+                    sh(service_user),
+                ),
+                format!(
+                    "id {}",
+                    sh(service_user),
+                ),
+                format!(
+                    "getent group {}",
+                    sh(service_user),
+                ),
+                format!(
+                    "install -d -o {} -g {} -m 0750 {} {}",
+                    sh(service_user),
+                    sh(service_user),
+                    sh(&model.deployment.values["GRAFHOME_CA_STATE_DIR"]),
+                    sh(&model.deployment.ca_steppath()),
+                ),
+                format!(
+                    "install -d -o {} -g {} -m 0700 {}",
+                    sh(service_user),
+                    sh(service_user),
+                    sh(&password_parent),
+                ),
+                format!(
+                    "test -s {} || install -o {} -g {} -m 0600 /dev/null {}",
+                    sh(password_file),
+                    sh(service_user),
+                    sh(service_user),
+                    sh(password_file),
+                ),
+                format!(
+                    "test -s {} || {} crypto rand --format ascii 48 > {}",
+                    sh(password_file),
                     sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
-                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    sh(password_file),
+                ),
+                format!(
+                    "chown {}:{} {}",
+                    sh(service_user),
+                    sh(service_user),
+                    sh(password_file),
+                ),
+                format!(
+                    "chmod 0600 {}",
+                    sh(password_file),
                 ),
                 format!(
                     "STEPPATH={} {} ca init --ssh --deployment-type standalone --name grafhome-ca --dns {} --dns {} --address {} --with-ca-url {} --provisioner {} --password-file {} --provisioner-password-file {}",
@@ -150,29 +200,29 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
                     sh(&format!("{}:{}", ca_origin.address, ca_origin.port)),
                     sh(&ca_api.url()),
                     sh(&bootstrap.name),
-                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
-                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    sh(password_file),
+                    sh(password_file),
                 ),
                 format!(
                     "chown -R {}:{} {}",
-                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
-                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(service_user),
+                    sh(service_user),
                     sh(&model.deployment.values["GRAFHOME_CA_STATE_DIR"]),
                 ),
                 format!(
                     "chown {}:{} {}",
-                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
-                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
-                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    sh(service_user),
+                    sh(service_user),
+                    sh(password_file),
                 ),
                 format!(
                     "chmod 0600 {}",
-                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                    sh(password_file),
                 ),
             ],
             files: vec![
                 format!("{}/config/ca.json", model.deployment.ca_steppath()),
-                model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"].clone(),
+                password_file.clone(),
             ],
             manual: true,
         },
@@ -218,7 +268,7 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
         },
         PlanStep {
             id: STEP_ACTIVATE_SERVICE.to_owned(),
-            summary: "repair step-ca ownership and enable the service after review".to_owned(),
+            summary: "repair CA service ownership and enable the service after review".to_owned(),
             hosts: vec![ca_origin.target.clone()],
             commands: vec![
                 format!(
@@ -937,8 +987,27 @@ fn host_public_key_path(model: &SiteModel) -> String {
     )
 }
 
-fn rendered_install_steps(model: &SiteModel, hosts: &[&str]) -> Result<Vec<String>> {
-    rendered_install_steps_filtered(model, hosts, |_| true)
+fn init_ca_rendered_install_steps(model: &SiteModel, hosts: &[&str]) -> Result<Vec<String>> {
+    let ca_config = format!("{}/config/ca.json", model.deployment.ca_steppath());
+    let service_user = &model.deployment.values["GRAFHOME_CA_SERVICE_USER"];
+    rendered_install_steps_filtered_with(
+        model,
+        hosts,
+        |_| true,
+        |file, target| {
+            if target == ca_config {
+                return format!(
+                    "install -D -o {} -g {} -m {:04o} {} {}",
+                    sh(service_user),
+                    sh(service_user),
+                    file.mode,
+                    sh(&format!("<staging-dir>/{}", file.path.display())),
+                    sh(target)
+                );
+            }
+            rendered_install_command(file, target)
+        },
+    )
 }
 
 fn host_bootstrap_install_steps(model: &SiteModel, host: &Host) -> Result<Vec<String>> {
@@ -969,6 +1038,15 @@ fn rendered_install_steps_filtered(
     hosts: &[&str],
     keep: impl Fn(&RenderedFile) -> bool,
 ) -> Result<Vec<String>> {
+    rendered_install_steps_filtered_with(model, hosts, keep, rendered_install_command)
+}
+
+fn rendered_install_steps_filtered_with(
+    model: &SiteModel,
+    hosts: &[&str],
+    keep: impl Fn(&RenderedFile) -> bool,
+    command: impl Fn(&RenderedFile, &str) -> String,
+) -> Result<Vec<String>> {
     let mut commands = crate::render::render(model)?
         .into_iter()
         .filter(|file| keep(file))
@@ -977,7 +1055,7 @@ fn rendered_install_steps_filtered(
             if !hosts.iter().any(|expected| *expected == host) {
                 return None;
             }
-            Some(rendered_install_command(&file, &target))
+            Some(command(&file, &target))
         })
         .collect::<Vec<_>>();
     commands.sort();
@@ -1206,12 +1284,62 @@ mod tests {
         assert!(!plan.steps[0].manual);
         assert!(plan.steps[1..].iter().all(|step| step.manual));
         assert_eq!(plan.steps[1].hosts, vec!["ca-host".to_owned()]);
-        assert!(plan.steps[1].commands[0].contains("/srv/example-ca/secrets"));
-        assert!(plan.steps[1].commands[1].contains("crypto rand --format ascii 48"));
-        assert!(plan.steps[1].commands[2].contains("--dns ca.example.test"));
-        assert!(plan.steps[1].commands[2].contains("--dns ca-origin.example.test"));
-        assert!(plan.steps[1].commands[2].contains("--address 198.51.100.20:8443"));
-        assert!(plan.steps[1].commands[2].contains("--with-ca-url https://ca.example.test"));
+        assert!(
+            plan.steps[1].commands[0].contains("getent group step-ca || groupadd --system step-ca")
+        );
+        assert!(plan.steps[1].commands[1].contains(
+            "if ! id -u step-ca >/dev/null 2>&1; then service_shell=\"$(command -v nologin || true)\";"
+        ));
+        assert!(!plan.steps[1].commands[1].contains("--shell /usr/bin/nologin"));
+        assert!(!plan.steps[1].commands[1].contains("command -v false"));
+        assert!(plan.steps[1].commands[1].contains(
+            "for candidate in /usr/sbin/nologin /usr/bin/nologin /sbin/nologin /bin/false /usr/bin/false"
+        ));
+        assert!(plan.steps[1].commands[1].contains(
+            "useradd --system --gid step-ca --home-dir /srv/example-ca --shell \"$service_shell\" --comment 'Grafhome CA service' step-ca"
+        ));
+        assert!(plan.steps[1].commands[2].contains("id step-ca"));
+        assert!(plan.steps[1].commands[3].contains("getent group step-ca"));
+        assert!(plan.steps[1].commands[4].contains(
+            "install -d -o step-ca -g step-ca -m 0750 /srv/example-ca /srv/example-ca/step"
+        ));
+        assert!(
+            plan.steps[1].commands[5]
+                .contains("install -d -o step-ca -g step-ca -m 0700 /srv/example-ca/secrets")
+        );
+        assert!(plan.steps[1].commands[6].contains(
+            "install -o step-ca -g step-ca -m 0600 /dev/null /srv/example-ca/secrets/intermediate_ca_password"
+        ));
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("crypto rand --format ascii 48"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("--dns ca.example.test"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("--dns ca-origin.example.test"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("--address 198.51.100.20:8443"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("--with-ca-url https://ca.example.test"))
+        );
         assert!(
             plan.steps[1]
                 .commands
@@ -1229,6 +1357,12 @@ mod tests {
         assert!(plan.steps[1].commands.iter().any(|command| {
             command.contains("chmod 0600 /srv/example-ca/secrets/intermediate_ca_password")
         }));
+        assert!(
+            !plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("umask 077"))
+        );
         assert!(plan.steps[2].commands[0].contains("ca provisioner add grafhome-user-login"));
         assert!(
             plan.steps[2]
@@ -1256,7 +1390,9 @@ mod tests {
             plan.steps[3]
                 .commands
                 .iter()
-                .any(|command| command.contains("/srv/example-ca/step/config/ca.json"))
+                .any(|command| command.contains(
+                    "install -D -o step-ca -g step-ca -m 0640 '<staging-dir>/hosts/ca-host/srv/example-ca/step/config/ca.json' /srv/example-ca/step/config/ca.json"
+                ))
         );
         assert!(
             plan.steps[3]
@@ -1266,6 +1402,11 @@ mod tests {
                     .contains("/etc/apache2/conf-available/grafhome-ca-proxy.conf"))
         );
         assert!(plan.steps[4].commands[0].contains("export-public"));
+        assert!(
+            plan.steps[5]
+                .summary
+                .contains("repair CA service ownership")
+        );
         assert!(
             plan.steps[5]
                 .commands
@@ -1291,6 +1432,61 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("intermediate_ca_key"))
         );
+    }
+
+    #[test]
+    fn init_ca_plan_uses_configured_service_account() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.deployment.values.insert(
+            "GRAFHOME_CA_SERVICE_USER".to_owned(),
+            "grafhome-ca".to_owned(),
+        );
+        let plan = init_ca(&model).unwrap();
+
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("getent group grafhome-ca"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("useradd --system --gid grafhome-ca"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("chown -R grafhome-ca:grafhome-ca"))
+        );
+        assert!(plan.steps[3].commands.iter().any(|command| command.contains(
+            "install -D -o grafhome-ca -g grafhome-ca -m 0640"
+        )));
+        assert!(
+            plan.steps[5]
+                .commands
+                .iter()
+                .any(|command| command.contains("chown -R grafhome-ca:grafhome-ca"))
+        );
+    }
+
+    #[test]
+    fn host_bootstrap_keeps_generic_rendered_file_installs() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let plan = host_bootstrap(&model, "ca-host").unwrap();
+
+        assert!(plan.steps.iter().any(|step| step.commands.iter().any(
+            |command| command.contains(
+                "install -D -m 0640 '<staging-dir>/hosts/ca-host/srv/example-ca/step/config/ca.json' /srv/example-ca/step/config/ca.json"
+            )
+        )));
+        assert!(!plan.steps.iter().any(|step| {
+            step.commands
+                .iter()
+                .any(|command| command.contains("install -D -o step-ca -g step-ca"))
+        }));
     }
 
     #[test]
