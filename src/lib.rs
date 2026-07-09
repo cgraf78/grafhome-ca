@@ -11,6 +11,7 @@ pub mod model;
 pub mod policy;
 pub mod public_material;
 pub mod render;
+pub mod runtime_provisioners;
 pub mod schema;
 pub mod smallstep;
 pub mod version;

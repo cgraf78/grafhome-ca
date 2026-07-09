@@ -96,6 +96,19 @@ unusable fixture paths:
 cargo run --bin grafhome-ca -- materialize-test-ca-fixture > /tmp/grafhome-ca-fixture.json
 ```
 
+During initial CA bootstrap, materialize reviewed runtime JWK provisioners into
+the staged `ca.json` after `step ca init` has created the live bootstrap
+provisioner and after any additional encrypted JWK keypairs have been generated
+under a private operator directory:
+
+```sh
+cargo run --bin grafhome-ca -- materialize-runtime-provisioners \
+  --live-ca-json /srv/example-ca/step/config/ca.json \
+  --staged-ca-json /tmp/grafhome-ca-render/hosts/ca-host/srv/example-ca/step/config/ca.json \
+  --jwk-dir /srv/example-ca/secrets/provisioners \
+  --out-file /tmp/grafhome-ca-render/hosts/ca-host/srv/example-ca/step/config/ca.json
+```
+
 Generate lifecycle plans without executing any commands:
 
 ```sh
@@ -195,7 +208,9 @@ Rendered JWK provisioner entries are whole-object
 usable Step provisioners; rollout code must replace each marker with the
 complete Smallstep-generated JWK provisioner object, including the public `key`,
 `encryptedKey`, and policy-derived claims, during an operator-reviewed
-deployment step.
+deployment step. Use `materialize-runtime-provisioners` for that deployment
+step; it copies the bootstrap JWK object from the live `step ca init` output and
+loads any additional encrypted JWK keypairs from the private `--jwk-dir`.
 
 `materialize-test-ca-fixture` is not deployable CA state. It rewrites CA key,
 database, SSH CA key, and bind-address fields to fixture-only values, uses
