@@ -26,7 +26,9 @@ values.
 : Directory used by `AuthorizedPrincipalsFile` snippets.
 
 `GRAFHOME_CA_PROXY_TLS_DIR`
-: Directory for proxy TLS files when rendered for Apache.
+: Directory for proxy TLS files when rendered for Apache. Proxy certificate
+  plans install the exported `root_ca.crt` here so Apache can verify the HTTPS
+  CA origin before proxying.
 
 `GRAFHOME_CA_PROXY_ACME_WEBROOT`
 : Absolute path to the webroot directory used by `step ca certificate
@@ -51,7 +53,9 @@ values.
 
 `GRAFHOME_CA_PASSWORD_FILE`
 : Absolute path to the root-readable `step-ca` key password file. The file path
-  is non-secret; the password file content must never be committed.
+  is non-secret; the password file content must never be committed. This path
+  must be inside `GRAFHOME_CA_STATE_DIR` so the `step-ca` service user can
+  traverse the parent directories after the lifecycle plan repairs ownership.
 
 `GRAFHOME_CA_SERVICE_USER`
 : Unix service account and primary service group that run the CA server.

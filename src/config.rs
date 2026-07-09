@@ -5,7 +5,7 @@
 //! authoritative place to compute them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
@@ -126,7 +126,6 @@ impl Deployment {
                 message: "derived values must not be stored independently".to_owned(),
             });
         }
-
         for (key, value) in &self.values {
             if key == "GRAFHOME_CA_USER_STEPPATH" {
                 if value.starts_with('/') {
@@ -151,7 +150,39 @@ impl Deployment {
                 });
             }
         }
+        self.validate_password_file_location()?;
 
+        Ok(())
+    }
+
+    fn validate_password_file_location(&self) -> Result<()> {
+        let state_dir = Path::new(&self.values["GRAFHOME_CA_STATE_DIR"]);
+        let password_file = Path::new(&self.values["GRAFHOME_CA_PASSWORD_FILE"]);
+        if state_dir.parent().is_none() {
+            return Err(Error::Validation {
+                field: format!("{}:GRAFHOME_CA_STATE_DIR", self.path.display()),
+                message: "state directory must not be the filesystem root".to_owned(),
+            });
+        }
+        if state_dir
+            .components()
+            .any(|component| component == Component::ParentDir)
+            || password_file
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(Error::Validation {
+                field: format!("{}:GRAFHOME_CA_PASSWORD_FILE", self.path.display()),
+                message: "state and password paths must not contain parent directory components"
+                    .to_owned(),
+            });
+        }
+        if password_file == state_dir || !password_file.starts_with(state_dir) {
+            return Err(Error::Validation {
+                field: format!("{}:GRAFHOME_CA_PASSWORD_FILE", self.path.display()),
+                message: "password file must be inside GRAFHOME_CA_STATE_DIR".to_owned(),
+            });
+        }
         Ok(())
     }
 }
@@ -205,5 +236,80 @@ mod tests {
 
         let error = Deployment::load(&path).unwrap_err().to_string();
         assert!(error.contains("must not be shell-quoted"));
+    }
+
+    #[test]
+    fn rejects_password_file_outside_state_dir() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deployment.env");
+        let mut text = String::new();
+        for key in REQUIRED_KEYS {
+            let value = if *key == "GRAFHOME_CA_STATE_DIR" {
+                "/srv/example-ca"
+            } else if *key == "GRAFHOME_CA_PASSWORD_FILE" {
+                "/srv/secrets/intermediate_ca_password"
+            } else if *key == "GRAFHOME_CA_USER_STEPPATH" {
+                ".config/grafhome/step"
+            } else if *key == "GRAFHOME_CA_SERVICE_USER" {
+                "step-ca"
+            } else {
+                "/tmp/grafhome-ca"
+            };
+            text.push_str(&format!("{key}={value}\n"));
+        }
+        fs::write(&path, text).unwrap();
+
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("password file must be inside GRAFHOME_CA_STATE_DIR"));
+    }
+
+    #[test]
+    fn rejects_parent_components_in_password_location() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deployment.env");
+        let mut text = String::new();
+        for key in REQUIRED_KEYS {
+            let value = if *key == "GRAFHOME_CA_STATE_DIR" {
+                "/srv/example-ca"
+            } else if *key == "GRAFHOME_CA_PASSWORD_FILE" {
+                "/srv/example-ca/../secrets/intermediate_ca_password"
+            } else if *key == "GRAFHOME_CA_USER_STEPPATH" {
+                ".config/grafhome/step"
+            } else if *key == "GRAFHOME_CA_SERVICE_USER" {
+                "step-ca"
+            } else {
+                "/tmp/grafhome-ca"
+            };
+            text.push_str(&format!("{key}={value}\n"));
+        }
+        fs::write(&path, text).unwrap();
+
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("must not contain parent directory components"));
+    }
+
+    #[test]
+    fn rejects_root_state_dir() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deployment.env");
+        let mut text = String::new();
+        for key in REQUIRED_KEYS {
+            let value = if *key == "GRAFHOME_CA_STATE_DIR" {
+                "/"
+            } else if *key == "GRAFHOME_CA_PASSWORD_FILE" {
+                "/srv/example-ca/secrets/intermediate_ca_password"
+            } else if *key == "GRAFHOME_CA_USER_STEPPATH" {
+                ".config/grafhome/step"
+            } else if *key == "GRAFHOME_CA_SERVICE_USER" {
+                "step-ca"
+            } else {
+                "/tmp/grafhome-ca"
+            };
+            text.push_str(&format!("{key}={value}\n"));
+        }
+        fs::write(&path, text).unwrap();
+
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("state directory must not be the filesystem root"));
     }
 }

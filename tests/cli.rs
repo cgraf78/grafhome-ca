@@ -259,6 +259,13 @@ fn export_public_writes_trust_bundle_and_manifest() {
         .replace(
             "GRAFHOME_CA_ROOT_STEP_BIN=/root/.local/bin/step",
             &format!("GRAFHOME_CA_ROOT_STEP_BIN={}", step_bin.display()),
+        )
+        .replace(
+            "GRAFHOME_CA_PASSWORD_FILE=/srv/example-ca/secrets/intermediate_ca_password",
+            &format!(
+                "GRAFHOME_CA_PASSWORD_FILE={}",
+                ca_state.join("secrets/intermediate_ca_password").display()
+            ),
         );
     fs::write(config_root.join("config/deployment.env"), deployment).unwrap();
 
@@ -451,6 +458,12 @@ fn plan_rollout_hardening_commands_are_visible() {
         .success()
         .stdout(predicate::str::contains("step ca health"))
         .stdout(predicate::str::contains("sshd -T"))
+        .stdout(predicate::str::contains(
+            "test -s /etc/ssl/example-ca/root_ca.crt",
+        ))
+        .stdout(predicate::str::contains(
+            "cmp -s /etc/ssl/example-ca/root_ca.crt '<public-material-dir>/root_ca.crt'",
+        ))
         .stdout(predicate::str::contains("openssl s_client"))
         .stdout(predicate::str::contains(
             "-CAfile '<public-material-dir>/root_ca.crt'",
@@ -465,6 +478,9 @@ fn plan_rollout_hardening_commands_are_visible() {
         .arg("proxy-cert")
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "install -D -m 0644 '<public-material-dir>/root_ca.crt' /etc/ssl/example-ca/root_ca.crt",
+        ))
         .stdout(predicate::str::contains(
             "install -d -m 0755 /var/www/html/.well-known/acme-challenge",
         ))

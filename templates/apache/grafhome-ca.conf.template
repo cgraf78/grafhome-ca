@@ -5,5 +5,6 @@ SSLProxyCheckPeerName on
 SSLProxyCheckPeerExpire on
 SSLProxyCACertificateFile ${GRAFHOME_CA_PROXY_TLS_DIR}/root_ca.crt
 
+ProxyPass        /.well-known/acme-challenge/ !
 ProxyPass        / https://${GRAFHOME_CA_ORIGIN_DNS_NAME}:${GRAFHOME_CA_ORIGIN_PORT}/
 ProxyPassReverse / https://${GRAFHOME_CA_ORIGIN_DNS_NAME}:${GRAFHOME_CA_ORIGIN_PORT}/
