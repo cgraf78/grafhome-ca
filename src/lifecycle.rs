@@ -228,7 +228,7 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
         },
         PlanStep {
             id: STEP_REVIEW_SECRETS.to_owned(),
-            summary: "replace runtime provisioner placeholders with complete Smallstep-generated provisioner objects"
+            summary: "materialize runtime JWK provisioners into the staged CA config without using the live admin API"
                 .to_owned(),
             hosts: vec![ca_origin.target.clone()],
             commands: provisioner_review_commands,
@@ -1120,8 +1120,16 @@ fn runtime_provisioner_review_commands(
     let ca_config = format!("{}/config/ca.json", model.deployment.ca_steppath());
     let staged_ca_config = staged_ca_config_path(model, ca_host);
     let password_file = &model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"];
+    let service_user = &model.deployment.values["GRAFHOME_CA_SERVICE_USER"];
+    let provisioner_dir = runtime_provisioner_secret_dir(password_file);
+    let helper_bin = &model.deployment.values["GRAFHOME_CA_HELPER_BIN"];
     let step_bin = &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"];
-    let mut commands = Vec::new();
+    let mut commands = vec![format!(
+        "install -d -o {} -g {} -m 0700 {}",
+        sh(service_user),
+        sh(service_user),
+        sh(&provisioner_dir),
+    )];
 
     for provisioner in model
         .policy
@@ -1130,16 +1138,48 @@ fn runtime_provisioner_review_commands(
         .filter(|entry| entry.status == "active" && entry.r#type == "JWK")
         .filter(|entry| entry.name != bootstrap_provisioner)
     {
+        let public_jwk = format!("{}/{}.pub.json", provisioner_dir, provisioner.name);
+        let private_jwk = format!("{}/{}.priv.json", provisioner_dir, provisioner.name);
         commands.push(format!(
-            "STEPPATH={} {} ca provisioner add {} --type JWK --create --ca-config {} --password-file {}",
+            "if test ! -s {} || test ! -s {}; then rm -f {} {}; STEPPATH={} {} crypto jwk create {} {} --password-file {}; fi",
+            sh(&public_jwk),
+            sh(&private_jwk),
+            sh(&public_jwk),
+            sh(&private_jwk),
             sh(&model.deployment.ca_steppath()),
             sh(step_bin),
-            sh(&provisioner.name),
-            sh(&ca_config),
+            sh(&public_jwk),
+            sh(&private_jwk),
             sh(password_file)
+        ));
+        commands.push(format!(
+            "chown {}:{} {} {}",
+            sh(service_user),
+            sh(service_user),
+            sh(&public_jwk),
+            sh(&private_jwk)
+        ));
+        commands.push(format!(
+            "chmod 0600 {} {}",
+            sh(&public_jwk),
+            sh(&private_jwk)
         ));
     }
 
+    commands.push(format!(
+        "{} materialize-runtime-provisioners --config-root {} --live-ca-json {} --staged-ca-json {} --jwk-dir {} --out-file {}",
+        sh(helper_bin),
+        sh_display(&model.config_root),
+        sh(&ca_config),
+        sh(&staged_ca_config),
+        sh(&provisioner_dir),
+        sh(&staged_ca_config)
+    ));
+    commands.push(format!(
+        "jq -e {} {} >/dev/null",
+        sh("[.. | strings | select(startswith(\"RUNTIME_SECRET_PLACEHOLDER:\"))] | length == 0"),
+        sh(&staged_ca_config)
+    ));
     for provisioner in model
         .policy
         .provisioners
@@ -1147,11 +1187,12 @@ fn runtime_provisioner_review_commands(
         .filter(|entry| entry.status == "active" && entry.r#type == "JWK")
     {
         commands.push(format!(
-            "copy authority.provisioners entry named {} from {} into {} at \"{}\"",
-            sh(&provisioner.name),
-            sh(&ca_config),
-            sh(&staged_ca_config),
-            crate::render::provisioner_placeholder(&provisioner.name)
+            "jq -e {} {} >/dev/null",
+            sh(&format!(
+                "([.authority.provisioners[] | select(.name == \"{}\" and .type == \"JWK\")] | length) == 1",
+                provisioner.name
+            )),
+            sh(&staged_ca_config)
         ));
     }
 
@@ -1171,6 +1212,13 @@ fn parent_dir(path: &str) -> String {
         .parent()
         .map(|parent| parent.display().to_string())
         .unwrap_or_else(|| ".".to_owned())
+}
+
+fn runtime_provisioner_secret_dir(password_file: &str) -> String {
+    std::path::Path::new(&parent_dir(password_file))
+        .join("provisioners")
+        .display()
+        .to_string()
 }
 
 fn sh_display(path: &std::path::Path) -> String {
@@ -1363,22 +1411,39 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("umask 077"))
         );
-        assert!(plan.steps[2].commands[0].contains("ca provisioner add grafhome-user-login"));
         assert!(
             plan.steps[2]
                 .commands
                 .iter()
-                .any(|command| command.contains(
-                    "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_HOST_BOOTSTRAP_JSON"
-                ))
+                .any(|command| command.contains("crypto jwk create")
+                    && command.contains("grafhome-user-login.pub.json")
+                    && command.contains("grafhome-user-login.priv.json"))
         );
         assert!(
             plan.steps[2]
                 .commands
                 .iter()
-                .any(|command| command.contains(
-                    "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_LOGIN_JSON"
-                ))
+                .any(|command| command.contains("materialize-runtime-provisioners"))
+        );
+        assert!(
+            !plan.steps[2]
+                .commands
+                .iter()
+                .any(|command| command.contains("ca provisioner add"))
+        );
+        assert!(
+            plan.steps[2]
+                .commands
+                .iter()
+                .any(|command| command.contains("grafhome-host-bootstrap")
+                    && command.contains("type == \"JWK\""))
+        );
+        assert!(
+            plan.steps[2]
+                .commands
+                .iter()
+                .any(|command| command.contains("grafhome-user-login")
+                    && command.contains("type == \"JWK\""))
         );
         assert!(
             !plan.steps[2]

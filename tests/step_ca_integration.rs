@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -49,40 +48,6 @@ fn rendered_config_can_start_throwaway_step_ca() {
         .arg(&password)
         .arg("--provisioner-password-file")
         .arg(&password));
-    run(Command::new("step")
-        .env("STEPPATH", &steppath)
-        .arg("ca")
-        .arg("provisioner")
-        .arg("add")
-        .arg("grafhome-user-login")
-        .arg("--type")
-        .arg("JWK")
-        .arg("--create")
-        .arg("--ca-config")
-        .arg(steppath.join("config/ca.json"))
-        .arg("--password-file")
-        .arg(&password));
-    run(Command::new("step")
-        .env("STEPPATH", &steppath)
-        .arg("ca")
-        .arg("provisioner")
-        .arg("add")
-        .arg("grafhome-host-renew")
-        .arg("--type")
-        .arg("SSHPOP")
-        .arg("--ca-config")
-        .arg(steppath.join("config/ca.json")));
-    run(Command::new("step")
-        .env("STEPPATH", &steppath)
-        .arg("ca")
-        .arg("provisioner")
-        .arg("add")
-        .arg("grafhome-x509-ca-proxy")
-        .arg("--type")
-        .arg("ACME")
-        .arg("--ca-config")
-        .arg(steppath.join("config/ca.json")));
-
     let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/site-config");
     let mut model = grafhome_ca::model::SiteModel::load(config_root).unwrap();
     model.deployment.values.insert(
@@ -98,15 +63,6 @@ fn rendered_config_can_start_throwaway_step_ca() {
         .iter()
         .find(|file| file.path.ends_with("step/config/ca.json"))
         .unwrap();
-    let generated: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(steppath.join("config/ca.json")).unwrap())
-            .unwrap();
-    let generated_provisioners = generated["authority"]["provisioners"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|item| (item["name"].as_str().unwrap().to_owned(), item.clone()))
-        .collect::<BTreeMap<_, _>>();
     let mut config: serde_json::Value = serde_json::from_str(&ca_json.content).unwrap();
     rewrite_state_dir(
         &mut config,
@@ -118,7 +74,30 @@ fn rendered_config_can_start_throwaway_step_ca() {
         .as_array_mut()
         .unwrap()
         .push(serde_json::json!("127.0.0.1"));
-    materialize_runtime_provisioners(&mut config, &generated_provisioners, &model);
+    let staged_ca_json = temp.path().join("staged-ca.json");
+    std::fs::write(
+        &staged_ca_json,
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let jwk_dir = temp.path().join("provisioners");
+    std::fs::create_dir(&jwk_dir).unwrap();
+    run(Command::new("step")
+        .arg("crypto")
+        .arg("jwk")
+        .arg("create")
+        .arg(jwk_dir.join("grafhome-user-login.pub.json"))
+        .arg(jwk_dir.join("grafhome-user-login.priv.json"))
+        .arg("--password-file")
+        .arg(&password));
+    let materialized = grafhome_ca::runtime_provisioners::materialize(
+        &model,
+        steppath.join("config/ca.json"),
+        &staged_ca_json,
+        &jwk_dir,
+    )
+    .unwrap();
+    let config: serde_json::Value = serde_json::from_str(&materialized).unwrap();
     std::fs::create_dir_all(temp.path().join("step/valuedb")).unwrap();
 
     let config_path = steppath.join("config/rendered-ca.json");
@@ -189,32 +168,6 @@ fn rewrite_state_dir(value: &mut serde_json::Value, from: &str, to: &str) {
             }
         }
         _ => {}
-    }
-}
-
-fn materialize_runtime_provisioners(
-    config: &mut serde_json::Value,
-    generated: &BTreeMap<String, serde_json::Value>,
-    model: &grafhome_ca::model::SiteModel,
-) {
-    let provisioners = config["authority"]["provisioners"].as_array_mut().unwrap();
-    for item in provisioners {
-        let Some(placeholder) = item.as_str() else {
-            continue;
-        };
-        let name = match placeholder {
-            "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_HOST_BOOTSTRAP_JSON" => {
-                "grafhome-host-bootstrap"
-            }
-            "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_LOGIN_JSON" => {
-                "grafhome-user-login"
-            }
-            other => panic!("unexpected runtime placeholder {other}"),
-        };
-        let mut replacement = generated.get(name).unwrap().clone();
-        replacement["claims"] = grafhome_ca::render::active_provisioner_claims(model, name)
-            .expect("active policy provisioner claims render");
-        *item = replacement;
     }
 }
 
@@ -334,4 +287,33 @@ fn exercise_public_export_and_host_certificate_lifecycle(
         .arg("--force")
         .arg(&host_cert)
         .arg(&host_key));
+
+    let user_key = temp.join("id_ed25519");
+    run(Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(&user_key));
+    let user_public_key = temp.join("id_ed25519.pub");
+    let user_cert = temp.join("id_ed25519-cert.pub");
+    run(Command::new("step")
+        .env("STEPPATH", &client_steppath)
+        .arg("ssh")
+        .arg("certificate")
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--provisioner")
+        .arg("grafhome-user-login")
+        .arg("--provisioner-password-file")
+        .arg(password)
+        .arg("--sign")
+        .arg("--principal")
+        .arg("alice")
+        .arg("--not-after")
+        .arg("1h")
+        .arg("alice")
+        .arg(&user_public_key));
+    assert!(user_cert.exists());
 }

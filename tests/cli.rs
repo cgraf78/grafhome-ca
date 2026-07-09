@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -327,6 +329,99 @@ fn materialize_test_ca_fixture_emits_parseable_placeholder_free_json() {
     for provisioner in provisioners {
         assert!(provisioner.get("encryptedKey").is_none());
     }
+}
+
+#[test]
+fn materialize_runtime_provisioners_writes_placeholder_free_ca_json() {
+    let dir = tempdir().unwrap();
+    let staging = dir.path().join("staging");
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .arg("render")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("--out-dir")
+        .arg(&staging)
+        .assert()
+        .success();
+    let staged_ca_json = staging.join("hosts/ca-host/srv/example-ca/step/config/ca.json");
+    let live_ca_json = dir.path().join("live-ca.json");
+    fs::write(
+        &live_ca_json,
+        r#"{
+          "authority": {
+            "provisioners": [
+              {
+                "type": "JWK",
+                "name": "grafhome-host-bootstrap",
+                "key": {"kid": "bootstrap-kid"},
+                "encryptedKey": "encrypted-bootstrap",
+                "claims": {"enableSSHCA": true}
+              }
+            ]
+          }
+        }"#,
+    )
+    .unwrap();
+    let jwk_dir = dir.path().join("provisioners");
+    fs::create_dir(&jwk_dir).unwrap();
+    fs::write(
+        jwk_dir.join("grafhome-user-login.pub.json"),
+        r#"{"kid":"user-login-kid","kty":"EC"}"#,
+    )
+    .unwrap();
+    fs::write(
+        jwk_dir.join("grafhome-user-login.priv.json"),
+        "{\n  \"protected\": \"encrypted-user-login\"\n}\n",
+    )
+    .unwrap();
+    let out_file = dir.path().join("materialized-ca.json");
+
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .arg("materialize-runtime-provisioners")
+        .arg("--config-root")
+        .arg(example_config_root())
+        .arg("--live-ca-json")
+        .arg(&live_ca_json)
+        .arg("--staged-ca-json")
+        .arg(&staged_ca_json)
+        .arg("--jwk-dir")
+        .arg(&jwk_dir)
+        .arg("--out-file")
+        .arg(&out_file)
+        .assert()
+        .success();
+
+    let text = fs::read_to_string(out_file).unwrap();
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(dir.path().join("materialized-ca.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let provisioners = value["authority"]["provisioners"].as_array().unwrap();
+
+    assert!(!text.contains("RUNTIME_SECRET_PLACEHOLDER"));
+    assert!(provisioners.iter().any(|item| {
+        item["name"] == "grafhome-host-bootstrap"
+            && item["encryptedKey"] == "encrypted-bootstrap"
+            && item["claims"]["defaultHostSSHCertDuration"] == "720h"
+    }));
+    assert!(provisioners.iter().any(|item| {
+        item["name"] == "grafhome-user-login"
+            && item["key"]["kid"] == "user-login-kid"
+            && item["claims"]["defaultUserSSHCertDuration"] == "16h"
+    }));
+    assert!(
+        provisioners
+            .iter()
+            .any(|item| item["name"] == "grafhome-host-renew")
+    );
 }
 
 #[test]

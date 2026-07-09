@@ -96,6 +96,10 @@ values.
   replaces them with complete Smallstep-generated provisioner objects containing
   both the public `key` and encrypted private-key material. Non-secret
   provisioner types that do not require generated key material render directly.
+  The supported first-bootstrap path is `materialize-runtime-provisioners`: it
+  copies the bootstrap JWK from the live `step ca init` output, loads additional
+  encrypted JWK files from a private operator directory, and reapplies
+  policy-derived claims before the staged `ca.json` is installed.
 
 `GRAFHOME_CA_HOST_CERT_PATH`
 : Template variable derived from `GRAFHOME_CA_HOST_KEY_PATH`. It is not stored

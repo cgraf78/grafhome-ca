@@ -1,6 +1,10 @@
 //! Grafhome CA repository and lifecycle CLI.
 
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -78,6 +82,24 @@ enum Command {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
+    },
+    /// Materialize runtime JWK provisioners into a rendered CA config.
+    MaterializeRuntimeProvisioners {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Live Smallstep ca.json created by `step ca init`.
+        #[arg(long, value_name = "FILE")]
+        live_ca_json: PathBuf,
+        /// Staged rendered ca.json containing runtime placeholders.
+        #[arg(long, value_name = "FILE")]
+        staged_ca_json: PathBuf,
+        /// Directory containing encrypted JWK files named <provisioner>.pub.json and <provisioner>.priv.json.
+        #[arg(long, value_name = "DIR")]
+        jwk_dir: PathBuf,
+        /// Write materialized ca.json to this file with owner-only permissions.
+        #[arg(long, value_name = "FILE")]
+        out_file: PathBuf,
     },
     /// Produce a structured lifecycle plan without executing it.
     Plan {
@@ -266,6 +288,25 @@ fn run() -> grafhome_ca::Result<()> {
             );
             Ok(())
         }
+        Command::MaterializeRuntimeProvisioners {
+            config_root,
+            live_ca_json,
+            staged_ca_json,
+            jwk_dir,
+            out_file,
+        } => {
+            let config_root = resolve_config_root(config_root)?;
+            let model = SiteModel::load(&config_root)?;
+            grafhome_ca::schema::validate_config_root(&config_root)?;
+            let text = grafhome_ca::runtime_provisioners::materialize(
+                &model,
+                &live_ca_json,
+                &staged_ca_json,
+                &jwk_dir,
+            )?;
+            write_secret_file(&out_file, text.as_bytes())?;
+            Ok(())
+        }
         Command::Plan {
             config_root,
             json,
@@ -353,6 +394,26 @@ fn handle_stdout_error(source: std::io::Error) -> grafhome_ca::Result<()> {
     } else {
         Err(grafhome_ca::Error::io("<stdout>", source))
     }
+}
+
+fn write_secret_file(path: &PathBuf, content: &[u8]) -> grafhome_ca::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    file.write_all(content)
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    file.sync_all()
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    Ok(())
 }
 
 fn print_plan(plan: &grafhome_ca::lifecycle::Plan) -> grafhome_ca::Result<()> {
