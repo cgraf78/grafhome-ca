@@ -18,15 +18,14 @@ const REQUIRED_KEYS: &[&str] = &[
     "GRAFHOME_CA_SSH_TRUST_DIR",
     "GRAFHOME_CA_AUTH_PRINCIPALS_DIR",
     "GRAFHOME_CA_PROXY_TLS_DIR",
+    "GRAFHOME_CA_PROXY_ACME_WEBROOT",
     "GRAFHOME_CA_STEP_CA_BIN",
     "GRAFHOME_CA_ROOT_STEP_BIN",
     "GRAFHOME_CA_HELPER_BIN",
     "GRAFHOME_CA_HOST_KEY_PATH",
     "GRAFHOME_CA_PASSWORD_FILE",
     "GRAFHOME_CA_SERVICE_USER",
-    "GRAFHOME_CA_OPERATOR_GROUP",
     "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
-    "GRAFHOME_CA_APACHE_SITES_AVAILABLE",
 ];
 
 /// Parsed deployment environment.
@@ -65,6 +64,14 @@ impl Deployment {
                     path: path.to_path_buf(),
                     line,
                     message: "key and value must both be non-empty".to_owned(),
+                });
+            }
+            if value.contains('"') || value.contains('\'') {
+                return Err(Error::Parse {
+                    path: path.to_path_buf(),
+                    line,
+                    message: "deployment.env values are literal and must not be shell-quoted"
+                        .to_owned(),
                 });
             }
             if values.insert(key.to_owned(), value.to_owned()).is_some() {
@@ -134,7 +141,8 @@ impl Deployment {
                 || key.ends_with("_PATH")
                 || key.ends_with("_AVAILABLE")
                 || key == "GRAFHOME_CA_STATE_DIR"
-                || key == "GRAFHOME_CA_SERVER_STEPPATH")
+                || key == "GRAFHOME_CA_SERVER_STEPPATH"
+                || key == "GRAFHOME_CA_PROXY_ACME_WEBROOT")
                 && !value.starts_with('/')
             {
                 return Err(Error::Validation {
@@ -176,5 +184,26 @@ mod tests {
 
         let error = Deployment::load(&path).unwrap_err().to_string();
         assert!(error.contains("GRAFHOME_CA_STEPPATH"));
+    }
+
+    #[test]
+    fn rejects_shell_quoted_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deployment.env");
+        let mut text = String::new();
+        for key in REQUIRED_KEYS {
+            let value = if *key == "GRAFHOME_CA_USER_STEPPATH" {
+                ".config/grafhome/step"
+            } else if *key == "GRAFHOME_CA_SERVICE_USER" {
+                "\"step-ca\""
+            } else {
+                "/tmp/grafhome-ca"
+            };
+            text.push_str(&format!("{key}={value}\n"));
+        }
+        fs::write(&path, text).unwrap();
+
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("must not be shell-quoted"));
     }
 }

@@ -153,6 +153,22 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
                     sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
                     sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
                 ),
+                format!(
+                    "chown -R {}:{} {}",
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_STATE_DIR"]),
+                ),
+                format!(
+                    "chown {}:{} {}",
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_SERVICE_USER"]),
+                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                ),
+                format!(
+                    "chmod 0600 {}",
+                    sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+                ),
             ],
             files: vec![
                 format!("{}/config/ca.json", model.deployment.ca_steppath()),
@@ -445,6 +461,10 @@ pub fn proxy_cert(model: &SiteModel) -> Result<Plan> {
     let provisioner = required_provisioner(model, "proxy_x509")?;
     let cert = proxy_cert_path(model, ca_api);
     let key = proxy_key_path(model, ca_api);
+    let challenge_dir = PathBuf::from(&model.deployment.values["GRAFHOME_CA_PROXY_ACME_WEBROOT"])
+        .join(".well-known/acme-challenge")
+        .display()
+        .to_string();
     Ok(Plan {
         operation: OP_PROXY_CERT.to_owned(),
         summary: format!(
@@ -462,8 +482,9 @@ pub fn proxy_cert(model: &SiteModel) -> Result<Plan> {
                         "install -d -m 0750 {}",
                         sh(&model.deployment.values["GRAFHOME_CA_PROXY_TLS_DIR"])
                     ),
+                    format!("install -d -m 0755 {}", sh(&challenge_dir)),
                     format!(
-                        "STEPPATH={} {} ca certificate {} {} {} --ca-url {} --provisioner {} --san {} --not-after {} --force <acme-challenge-mode>",
+                        "STEPPATH={} {} ca certificate {} {} {} --ca-url {} --provisioner {} --san {} --not-after {} --force --webroot {}",
                         sh(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
                         sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
                         sh(&ca_api.dns_name),
@@ -472,7 +493,8 @@ pub fn proxy_cert(model: &SiteModel) -> Result<Plan> {
                         sh(&ca_origin.url()),
                         sh(&provisioner.name),
                         sh(&ca_api.dns_name),
-                        sh(&provisioner.default_ttl)
+                        sh(&provisioner.default_ttl),
+                        sh(&model.deployment.values["GRAFHOME_CA_PROXY_ACME_WEBROOT"])
                     ),
                     format!("openssl x509 -in {} -noout -text", sh(&cert)),
                 ],
@@ -1155,6 +1177,23 @@ mod tests {
         assert!(plan.steps[1].commands[2].contains("--dns ca-origin.example.test"));
         assert!(plan.steps[1].commands[2].contains("--address 198.51.100.20:8443"));
         assert!(plan.steps[1].commands[2].contains("--with-ca-url https://ca.example.test"));
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains("chown -R step-ca:step-ca /srv/example-ca"))
+        );
+        assert!(
+            plan.steps[1]
+                .commands
+                .iter()
+                .any(|command| command.contains(
+                    "chown step-ca:step-ca /srv/example-ca/secrets/intermediate_ca_password"
+                ))
+        );
+        assert!(plan.steps[1].commands.iter().any(|command| {
+            command.contains("chmod 0600 /srv/example-ca/secrets/intermediate_ca_password")
+        }));
         assert!(plan.steps[2].commands[0].contains("ca provisioner add grafhome-user-login"));
         assert!(
             plan.steps[2]
@@ -1223,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_proxy_cert_with_acme_challenge_placeholder() {
+    fn plans_proxy_cert_with_configured_acme_webroot() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
         let plan = proxy_cert(&model).unwrap();
 
@@ -1232,9 +1271,14 @@ mod tests {
             step_ids(&plan),
             vec![STEP_PROXY_CERT, STEP_VERIFY_PROXY_TLS]
         );
-        assert!(plan.steps[0].commands[1].contains("step ca certificate"));
-        assert!(plan.steps[0].commands[1].contains("--provisioner grafhome-x509-ca-proxy"));
-        assert!(plan.steps[0].commands[1].contains("<acme-challenge-mode>"));
+        assert!(
+            plan.steps[0].commands[1]
+                .contains("install -d -m 0755 /var/www/html/.well-known/acme-challenge")
+        );
+        assert!(plan.steps[0].commands[2].contains("step ca certificate"));
+        assert!(plan.steps[0].commands[2].contains("--provisioner grafhome-x509-ca-proxy"));
+        assert!(plan.steps[0].commands[2].contains("--webroot /var/www/html"));
+        assert!(!plan.steps[0].commands[2].contains("<acme-challenge-mode>"));
         assert!(
             plan.steps[0]
                 .files

@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::{fs, path::Path};
 
 fn output(command: &mut Command) -> Option<String> {
     let output = command.output().ok()?;
@@ -37,9 +38,51 @@ fn valid_version(value: &str) -> bool {
         && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn watch_git_head() {
+    println!("cargo:rerun-if-changed=.git");
+
+    if let Some(path) = output(Command::new("git").args(["rev-parse", "--git-path", "HEAD"])) {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    if let Some(reference) = output(Command::new("git").args(["symbolic-ref", "-q", "HEAD"])) {
+        if let Some(path) =
+            output(Command::new("git").args(["rev-parse", "--git-path", &reference]))
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+        return;
+    }
+
+    let git_path = Path::new(".git");
+    let head_path = if git_path.is_dir() {
+        git_path.join("HEAD")
+    } else {
+        let Ok(git_file) = fs::read_to_string(git_path) else {
+            return;
+        };
+        let Some(path) = git_file.trim().strip_prefix("gitdir: ") else {
+            return;
+        };
+        Path::new(path).join("HEAD")
+    };
+
+    println!("cargo:rerun-if-changed={}", head_path.display());
+    let Ok(head) = fs::read_to_string(&head_path) else {
+        return;
+    };
+    if let Some(reference) = head.trim().strip_prefix("ref: ") {
+        let ref_path = head_path
+            .parent()
+            .unwrap_or_else(|| Path::new(".git"))
+            .join(reference);
+        println!("cargo:rerun-if-changed={}", ref_path.display());
+    }
+}
+
 fn commit() -> String {
     println!("cargo:rerun-if-env-changed=GRAFHOME_CA_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    watch_git_head();
 
     std::env::var("GRAFHOME_CA_BUILD_COMMIT")
         .ok()

@@ -52,8 +52,8 @@ The planner includes live-verification and proxy-certificate operations, but
 they remain reviewable command plans. They do not mutate live hosts until an
 operator runs them during the separate rollout phase. Proxy certificate plans
 model Smallstep ACME issuance through the configured `proxy_x509` provisioner
-and leave the ACME challenge mode as an explicit site decision because DNS and
-Apache routing differ by deployment.
+and use the configured `GRAFHOME_CA_PROXY_ACME_WEBROOT` for HTTP-01 challenge
+serving. DNS and Apache routing still belong to private site configuration.
 
 Rendered files are staging artifacts, not an imperative deploy. They must
 either contain complete non-secret support files, such as empty revocation
