@@ -10,6 +10,12 @@ being stored independently.
 This file uses literal `KEY=value` lines. It is not shell-sourced; do not quote
 values.
 
+Most values are target-host runtime paths. Keys whose names include `ROOT` or
+refer to the `grafhome-ca` helper are command-runner paths for root/admin
+rollout steps, because live initialization, reconciliation, renewal, and export
+plans run with root privileges on the target host. On shdeps-managed hosts where
+root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
+
 `GRAFHOME_CA_STATE_DIR`
 : Root directory for CA-owned mutable state on the CA host.
 
@@ -43,7 +49,9 @@ values.
 : Absolute path to the root-owned `step` client binary.
 
 `GRAFHOME_CA_HELPER_BIN`
-: Absolute path where the `grafhome-ca` helper is installed.
+: Absolute path where the root-run `grafhome-ca` helper is installed. For
+  shdeps-managed hosts where root also uses dotfiles, this is normally
+  `/root/.local/bin/grafhome-ca`.
 
 `GRAFHOME_CA_HOST_KEY_PATH`
 : Absolute path to the SSH host private key used by host certificate renewal.
