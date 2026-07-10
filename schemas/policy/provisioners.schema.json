@@ -16,7 +16,7 @@
       "notes"
     ],
     "properties": {
-      "role": { "enum": ["host_bootstrap", "host_renew", "user_login", "proxy_x509"] },
+      "role": { "enum": ["host_bootstrap", "host_renew", "user_enrollment", "proxy_x509"] },
       "name": { "$ref": "#/definitions/name" },
       "type": { "enum": ["JWK", "SSHPOP", "ACME", "OIDC", "X5C"] },
       "default_ttl": { "$ref": "#/definitions/ttl" },

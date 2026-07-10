@@ -45,7 +45,6 @@ tar -xzf "$archive" -C "$smoke"
 # cover policy/schema behavior; this catches packaging mistakes such as a
 # missing executable bit, omitted schema/templates, or archive name drift.
 test -x "$smoke/bin/grafhome-ca"
-test -x "$smoke/bin/grafhome-ssh-login"
 test -f "$smoke/.grafhome-ca-install.json"
 test -d "$smoke/schemas"
 test -d "$smoke/templates"
@@ -53,4 +52,3 @@ test -d "$smoke/examples"
 
 "$smoke/bin/grafhome-ca" version
 "$smoke/bin/grafhome-ca" help >/dev/null
-"$smoke/bin/grafhome-ssh-login" --version

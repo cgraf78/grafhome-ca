@@ -140,4 +140,4 @@ network details in policy files.
 
 `default_ttl`, `max_ttl`, and `cert_ttl`
 : Step duration strings rendered into `ca.json` or lifecycle commands. Use
-  Go-style `s`, `m`, or `h` units such as `16h` or `720h`; do not use `d`.
+  Go-style `s`, `m`, or `h` units such as `24h`, `168h`, or `720h`; do not use `d`.

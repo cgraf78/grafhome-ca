@@ -101,6 +101,31 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         out_file: PathBuf,
     },
+    /// Add a constrained user/device JWK provisioner to a Smallstep CA config.
+    #[command(hide = true)]
+    AddUserDeviceProvisioner {
+        /// Existing Smallstep ca.json.
+        #[arg(long, value_name = "FILE")]
+        ca_json: PathBuf,
+        /// Public JWK generated on the enrolled user device.
+        #[arg(long, value_name = "FILE")]
+        public_key: PathBuf,
+        /// Provisioner name to add.
+        #[arg(long)]
+        name: String,
+        /// SSH certificate template file on the CA origin.
+        #[arg(long, value_name = "FILE")]
+        ssh_template: String,
+        /// Default user SSH certificate lifetime.
+        #[arg(long)]
+        default_ttl: String,
+        /// Maximum user SSH certificate lifetime.
+        #[arg(long)]
+        max_ttl: String,
+        /// Write updated ca.json to this file with owner-only permissions.
+        #[arg(long, value_name = "FILE")]
+        out_file: PathBuf,
+    },
     /// Produce a structured lifecycle plan without executing it.
     Plan {
         /// Site config root containing config/ and policy/.
@@ -151,14 +176,56 @@ enum PlanCommand {
     },
     /// Plan proxy X.509 certificate issuance or renewal.
     ProxyCert,
-    /// Plan user certificate issuance.
-    UserLogin {
+    /// Plan creation of a short-lived host enrollment token.
+    CreateHostToken {
+        /// Host policy name.
+        #[arg(long)]
+        host: String,
+        /// Enrollment token lifetime.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// SSH host certificate lifetime.
+        #[arg(long)]
+        cert_ttl: Option<String>,
+    },
+    /// Plan host enrollment using a short-lived token.
+    EnrollHost {
+        /// Host policy name.
+        #[arg(long)]
+        host: String,
+    },
+    /// Plan creation of a short-lived user enrollment token.
+    CreateUserToken {
         /// User policy name.
         #[arg(long)]
         user: String,
-        /// Client device policy name. Required when the user has multiple active devices.
+        /// Client host policy name.
         #[arg(long)]
-        device: Option<String>,
+        host: String,
+        /// Enrollment token lifetime.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// SSH user certificate lifetime.
+        #[arg(long)]
+        cert_ttl: Option<String>,
+    },
+    /// Plan user enrollment using a short-lived token.
+    EnrollUser {
+        /// User policy name.
+        #[arg(long)]
+        user: String,
+        /// Client host policy name.
+        #[arg(long)]
+        host: String,
+    },
+    /// Plan local user certificate refresh before SSH.
+    SshEnsure {
+        /// User policy name.
+        #[arg(long)]
+        user: String,
+        /// Client host policy name. Required when the user has multiple active client hosts.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Plan policy edits for a new host.
     AddHost {
@@ -307,6 +374,26 @@ fn run() -> grafhome_ca::Result<()> {
             write_secret_file(&out_file, text.as_bytes())?;
             Ok(())
         }
+        Command::AddUserDeviceProvisioner {
+            ca_json,
+            public_key,
+            name,
+            ssh_template,
+            default_ttl,
+            max_ttl,
+            out_file,
+        } => {
+            let text = grafhome_ca::runtime_provisioners::add_user_device(
+                &ca_json,
+                &public_key,
+                &name,
+                &ssh_template,
+                &default_ttl,
+                &max_ttl,
+            )?;
+            write_secret_file(&out_file, text.as_bytes())?;
+            Ok(())
+        }
         Command::Plan {
             config_root,
             json,
@@ -329,8 +416,36 @@ fn run() -> grafhome_ca::Result<()> {
                     grafhome_ca::lifecycle::verify_live(&model, host.as_deref())?
                 }
                 PlanCommand::ProxyCert => grafhome_ca::lifecycle::proxy_cert(&model)?,
-                PlanCommand::UserLogin { user, device } => {
-                    grafhome_ca::lifecycle::user_login(&model, &user, device.as_deref())?
+                PlanCommand::CreateHostToken {
+                    host,
+                    ttl,
+                    cert_ttl,
+                } => grafhome_ca::lifecycle::create_host_token(
+                    &model,
+                    &host,
+                    ttl.as_deref(),
+                    cert_ttl.as_deref(),
+                )?,
+                PlanCommand::EnrollHost { host } => {
+                    grafhome_ca::lifecycle::enroll_host(&model, &host)?
+                }
+                PlanCommand::CreateUserToken {
+                    user,
+                    host,
+                    ttl,
+                    cert_ttl,
+                } => grafhome_ca::lifecycle::create_user_token(
+                    &model,
+                    &user,
+                    &host,
+                    ttl.as_deref(),
+                    cert_ttl.as_deref(),
+                )?,
+                PlanCommand::EnrollUser { user, host } => {
+                    grafhome_ca::lifecycle::enroll_user(&model, &user, &host)?
+                }
+                PlanCommand::SshEnsure { user, host } => {
+                    grafhome_ca::lifecycle::ssh_ensure(&model, &user, host.as_deref())?
                 }
                 PlanCommand::AddHost { host } => grafhome_ca::lifecycle::add_host(&model, &host)?,
                 PlanCommand::AddUser { user } => grafhome_ca::lifecycle::add_user(&model, &user)?,

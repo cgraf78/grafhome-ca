@@ -242,7 +242,11 @@ mod tests {
             lifecycle::backup_ca(&model).unwrap(),
             lifecycle::verify_live(&model, Some("ca-host")).unwrap(),
             lifecycle::proxy_cert(&model).unwrap(),
-            lifecycle::user_login(&model, "alice", Some("ca-host")).unwrap(),
+            lifecycle::create_host_token(&model, "ca-host", None, None).unwrap(),
+            lifecycle::enroll_host(&model, "ca-host").unwrap(),
+            lifecycle::create_user_token(&model, "alice", "ca-host", None, None).unwrap(),
+            lifecycle::enroll_user(&model, "alice", "ca-host").unwrap(),
+            lifecycle::ssh_ensure(&model, "alice", Some("ca-host")).unwrap(),
             lifecycle::add_host(&model, "new-host").unwrap(),
             lifecycle::add_user(&model, "new-user").unwrap(),
         ];

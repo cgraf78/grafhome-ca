@@ -456,7 +456,7 @@ fn provisioner_claims(provisioner: &Provisioner) -> Result<Value> {
             "maxHostSSHCertDuration": provisioner.max_ttl,
             "enableSSHCA": true
         }),
-        "user_login" => json!({
+        "user_enrollment" => json!({
             "defaultUserSSHCertDuration": provisioner.default_ttl,
             "maxUserSSHCertDuration": provisioner.max_ttl,
             "enableSSHCA": true
@@ -811,7 +811,7 @@ mod tests {
         assert!(ca_json.content.contains("\"ca.example.test\""));
         assert!(ca_json.content.contains("\"ca-origin.example.test\""));
         assert!(ca_json.content.contains(
-            "\"RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_LOGIN_JSON\""
+            "\"RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_ENROLLMENT_JSON\""
         ));
         assert!(ca_json.content.contains("\"type\": \"SSHPOP\""));
         assert!(!ca_json.content.contains("${GRAFHOME_CA_"));
@@ -924,7 +924,7 @@ mod tests {
             jwk_placeholders,
             vec![
                 "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_HOST_BOOTSTRAP_JSON",
-                "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_LOGIN_JSON"
+                "RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_ENROLLMENT_JSON"
             ]
         );
         assert!(
@@ -947,9 +947,9 @@ mod tests {
             .iter()
             .find(|item| item["name"] == "grafhome-host-bootstrap")
             .unwrap();
-        let user_login = provisioners
+        let user_enrollment = provisioners
             .iter()
-            .find(|item| item["name"] == "grafhome-user-login")
+            .find(|item| item["name"] == "grafhome-user-enrollment")
             .unwrap();
 
         assert!(!ca_json.contains("RUNTIME_SECRET_PLACEHOLDER"));
@@ -972,8 +972,11 @@ mod tests {
             assert!(provisioner.get("encryptedKey").is_none());
         }
         assert_eq!(host_bootstrap["claims"]["enableSSHCA"], true);
-        assert_eq!(user_login["claims"]["defaultUserSSHCertDuration"], "16h");
-        assert_eq!(user_login["claims"]["maxUserSSHCertDuration"], "16h");
+        assert_eq!(
+            user_enrollment["claims"]["defaultUserSSHCertDuration"],
+            "24h"
+        );
+        assert_eq!(user_enrollment["claims"]["maxUserSSHCertDuration"], "168h");
     }
 
     #[test]
