@@ -119,6 +119,11 @@ case "$1 $2" in
     printf 'bootstrapped\n'
     ;;
   "ca health")
+    if [ "${FAKE_STEP_HEALTH_FAIL_ONCE:-}" = "1" ] && [ ! -e "$FAKE_LOG.health_failed" ]; then
+      touch "$FAKE_LOG.health_failed"
+      printf 'simulated health failure\n' >&2
+      exit 44
+    fi
     printf 'ok\n'
     ;;
   "ssh certificate")
@@ -1021,7 +1026,13 @@ fn enroll_user_reads_token_and_password_from_stdin_without_persisting_password()
         .stderr(predicate::str::contains("user provisioner password: "))
         .stdout(predicate::str::contains("user cert:"))
         .stdout(predicate::str::contains(
-            "authorize renewal with: grafhome-ca authorize-user",
+            "authorize renewal on the CA with:",
+        ))
+        .stdout(predicate::str::contains(
+            "grafhome-ca authorize-user --user alice --host ca-host <<'GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY'",
+        ))
+        .stdout(predicate::str::contains(
+            "GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY",
         ));
 
     let key = home.join(".ssh/alice_ca_host_ed25519");
@@ -1118,6 +1129,42 @@ fn authorize_user_reads_public_key_from_stdin_and_restarts_step_ca() {
     assert!(log.contains("systemctl args=restart step-ca.service"));
     assert!(log.contains("systemctl args=is-active step-ca.service"));
     assert!(log.contains("ca health"));
+}
+
+#[cfg(unix)]
+#[test]
+fn authorize_user_retries_transient_health_failure_after_restart() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("authorize-user")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_STEP_HEALTH_FAIL_ONCE", "1")
+        .write_stdin("{\n  \"kid\": \"device-kid\",\n  \"kty\": \"EC\"\n}\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "authorized provisioner: grafhome-user-alice-ca-host",
+        ));
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(log.matches("ca health").count(), 3);
+    let ca_config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
+    assert_eq!(
+        ca_config["authority"]["provisioners"][0]["name"],
+        "grafhome-user-alice-ca-host"
+    );
 }
 
 #[cfg(unix)]
