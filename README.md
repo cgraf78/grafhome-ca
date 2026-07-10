@@ -148,22 +148,25 @@ cargo run --bin grafhome-ca -- enroll-host --host ca-host
 
 # User client account. `bootstrap-client` reads the root fingerprint from stdin.
 # `enroll-user` reads two stdin lines: the enrollment token, then the
-# user-owned refresh password.
+# user-owned refresh password. It prints a pasteable `authorize-user` command
+# containing the public renewal JWK for the CA operator.
 cargo run --bin grafhome-ca -- bootstrap-client
 cargo run --bin grafhome-ca -- enroll-user --user alice --host ca-host
 cargo run --bin grafhome-ca -- ssh-ensure --user alice --host ca-host
 
-# CA origin/operator host after user enrollment creates a public JWK.
-# The public JWK is read from stdin by default so it can be piped over SSH.
-cargo run --bin grafhome-ca -- authorize-user --user alice --host ca-host \
-  < ~/.config/grafhome-ca/users/alice/hosts/ca-host/provisioner.pub.json
+# CA origin/operator host. Paste the `authorize-user` here-doc printed by
+# `enroll-user`; the renewal JWK is public and does not require SSH access from
+# the new client to the CA host.
+grafhome-ca authorize-user --user alice --host ca-host <<'GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY'
+{"kty":"OKP","kid":"example-public-key"}
+GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY
 ```
 
 Enrollment secrets default to stdin so tokens and user-owned passwords do not
 need to appear in shell history. `enroll-host` reads one line containing the
 host token. `enroll-user` reads the user token first and the refresh password
-second. `ssh-ensure` reads the refresh password. `authorize-user` reads
-the user/client-host public JWK. File overrides exist for automation:
+second. `ssh-ensure` reads the refresh password. `authorize-user` reads the
+user/client-host public JWK from stdin by default. File overrides exist for automation:
 `--token-file`, `--password-file`, `--fingerprint-file`, and `--public-key`.
 Smallstep accepts signing tokens only as command arguments, so executor errors
 redact token values but process listings can briefly show the child `step`

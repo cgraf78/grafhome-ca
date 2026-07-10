@@ -7,12 +7,16 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{ClientDevice, Endpoint, Host, Provisioner, User};
 
 const USER_STEP_BIN: &str = "step";
+const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
+const CA_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const CA_HEALTH_CONSECUTIVE_SUCCESSES: usize = 2;
 
 macro_rules! outln {
     ($($arg:tt)*) => {
@@ -805,6 +809,60 @@ fn run_status(command: &mut ProcessCommand) -> grafhome_ca::Result<()> {
     run_status_redacted(command, &[])
 }
 
+fn run_status_with_retries(
+    label: &str,
+    attempts: usize,
+    delay: Duration,
+    consecutive_successes_required: usize,
+    mut build_command: impl FnMut() -> ProcessCommand,
+) -> grafhome_ca::Result<()> {
+    if attempts == 0 {
+        return Err(grafhome_ca::Error::Validation {
+            field: "command".to_owned(),
+            message: format!("{label} was configured with zero attempts"),
+        });
+    }
+    if consecutive_successes_required == 0 {
+        return Err(grafhome_ca::Error::Validation {
+            field: "command".to_owned(),
+            message: format!("{label} was configured with zero required successes"),
+        });
+    }
+    let mut last_error = None;
+    let mut consecutive_successes = 0;
+    for attempt in 1..=attempts {
+        match run_status(&mut build_command()) {
+            Ok(()) => {
+                consecutive_successes += 1;
+                if consecutive_successes == consecutive_successes_required {
+                    return Ok(());
+                }
+                if attempt < attempts {
+                    std::thread::sleep(delay);
+                }
+            }
+            Err(error) => {
+                consecutive_successes = 0;
+                last_error = Some(error.to_string());
+                if attempt < attempts {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(grafhome_ca::Error::Validation {
+        field: "command".to_owned(),
+        message: format!(
+            "{label} did not succeed after {attempts} attempts; last error: {}",
+            last_error.unwrap_or_else(|| {
+                format!(
+                    "only {consecutive_successes} consecutive successful check(s), expected {consecutive_successes_required}"
+                )
+            })
+        ),
+    })
+}
+
 fn run_status_redacted(
     command: &mut ProcessCommand,
     redactions: &[&str],
@@ -1400,12 +1458,16 @@ fn enroll_user(
     }
     outln!("user cert: {}", cert.display());
     outln!("user refresh public key: {}", public_jwk.display());
+    let public_jwk_text = std::fs::read_to_string(&public_jwk)
+        .map_err(|source| grafhome_ca::Error::io(&public_jwk, source))?;
+    outln!("authorize renewal on the CA with:");
     outln!(
-        "authorize renewal with: grafhome-ca authorize-user --user {} --host {} < {}",
+        "grafhome-ca authorize-user --user {} --host {} <<'GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY'",
         user.user,
-        device.device,
-        public_jwk.display()
+        device.device
     );
+    outln!("{}", public_jwk_text.trim_end());
+    outln!("GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY");
     Ok(())
 }
 
@@ -1458,14 +1520,22 @@ fn install_ca_json_with_rollback(
         install_ca_json_permissions(model, ca_json)?;
         run_status(process("systemctl").arg("restart").arg("step-ca.service"))?;
         run_status(process("systemctl").arg("is-active").arg("step-ca.service"))?;
-        run_status(
-            process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
-                .arg("ca")
-                .arg("health")
-                .arg("--ca-url")
-                .arg(&ca_url)
-                .arg("--root")
-                .arg(ca_root_cert_path(model)),
+        run_status_with_retries(
+            "step ca health",
+            CA_HEALTH_RETRY_ATTEMPTS,
+            CA_HEALTH_RETRY_DELAY,
+            CA_HEALTH_CONSECUTIVE_SUCCESSES,
+            || {
+                let mut command = process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]);
+                command
+                    .arg("ca")
+                    .arg("health")
+                    .arg("--ca-url")
+                    .arg(&ca_url)
+                    .arg("--root")
+                    .arg(ca_root_cert_path(model));
+                command
+            },
         )
     };
     if let Err(error) = activate() {
