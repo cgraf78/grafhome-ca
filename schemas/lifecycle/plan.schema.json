@@ -59,7 +59,7 @@
             "create-user-token",
             "consume-user-token",
             "create-user-provisioner-key",
-            "register-user-provisioner",
+            "authorize-user-provisioner",
             "ensure-user-cert"
           ]
         },

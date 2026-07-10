@@ -134,6 +134,41 @@ Plans can also be emitted as JSON for tests, scripts, or future executors:
 cargo run --bin grafhome-ca -- plan --json enroll-user --user alice --host ca-host
 ```
 
+Run the enrollment executor commands after reviewing the corresponding plans:
+
+```sh
+# CA origin/operator host.
+cargo run --bin grafhome-ca -- ca-fingerprint
+cargo run --bin grafhome-ca -- create-host-token --host ca-host
+cargo run --bin grafhome-ca -- create-user-token --user alice --host ca-host
+
+# SSH server host root account. Reads the host enrollment token from stdin.
+cargo run --bin grafhome-ca -- bootstrap-host-trust
+cargo run --bin grafhome-ca -- enroll-host --host ca-host
+
+# User client account. `bootstrap-client` reads the root fingerprint from stdin.
+# `enroll-user` reads two stdin lines: the enrollment token, then the
+# user-owned refresh password.
+cargo run --bin grafhome-ca -- bootstrap-client
+cargo run --bin grafhome-ca -- enroll-user --user alice --host ca-host
+cargo run --bin grafhome-ca -- ssh-ensure --user alice --host ca-host
+
+# CA origin/operator host after user enrollment creates a public JWK.
+# The public JWK is read from stdin by default so it can be piped over SSH.
+cargo run --bin grafhome-ca -- authorize-user --user alice --host ca-host \
+  < ~/.config/grafhome-ca/users/alice/hosts/ca-host/provisioner.pub.json
+```
+
+Enrollment secrets default to stdin so tokens and user-owned passwords do not
+need to appear in shell history. `enroll-host` reads one line containing the
+host token. `enroll-user` reads the user token first and the refresh password
+second. `ssh-ensure` reads the refresh password. `authorize-user` reads
+the user/client-host public JWK. File overrides exist for automation:
+`--token-file`, `--password-file`, `--fingerprint-file`, and `--public-key`.
+Smallstep accepts signing tokens only as command arguments, so executor errors
+redact token values but process listings can briefly show the child `step`
+command while certificate signing is running.
+
 Guarded live-operation stubs:
 
 ```sh

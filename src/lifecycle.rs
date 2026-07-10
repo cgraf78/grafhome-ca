@@ -88,8 +88,8 @@ pub const STEP_CREATE_USER_TOKEN: &str = "create-user-token";
 pub const STEP_CONSUME_USER_TOKEN: &str = "consume-user-token";
 /// Create local user provisioner key step key.
 pub const STEP_CREATE_USER_PROVISIONER_KEY: &str = "create-user-provisioner-key";
-/// Register constrained user provisioner step key.
-pub const STEP_REGISTER_USER_PROVISIONER: &str = "register-user-provisioner";
+/// Authorize constrained user provisioner step key.
+pub const STEP_REGISTER_USER_PROVISIONER: &str = "authorize-user-provisioner";
 /// Ensure local user certificate step key.
 pub const STEP_ENSURE_USER_CERT: &str = "ensure-user-cert";
 
@@ -373,8 +373,8 @@ pub fn host_bootstrap(model: &SiteModel, host: &str) -> Result<Plan> {
             summary: "create and consume a short-lived host enrollment token before enabling HostCertificate".to_owned(),
             hosts: unique_hosts([host.host.clone(), ca_origin.target.clone()]),
             commands: vec![
-                format!("grafhome-ca plan create-host-token --host {}", sh(&host.host)),
-                format!("grafhome-ca plan enroll-host --host {}", sh(&host.host)),
+                format!("grafhome-ca create-host-token --host {}", sh(&host.host)),
+                format!("grafhome-ca enroll-host --host {}", sh(&host.host)),
             ],
             files: vec![host_public_key_path(model), host_cert_path(model)],
             manual: true,
@@ -754,16 +754,9 @@ pub fn enroll_user(model: &SiteModel, user: &str, host: &str) -> Result<Plan> {
     let device = required_user_device(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let ca_origin = required_endpoint(model, "ca_origin")?;
-    let provisioner_name = user_device_provisioner_name(&user.user, &device.device);
     let material_dir = user_device_material_dir(&user.user, &device.device);
     let public_jwk = format!("{material_dir}/provisioner.pub.json");
     let private_jwk = format!("{material_dir}/provisioner.priv.json");
-    let copied_public_jwk = "<user-provisioner-public-jwk>";
-    let template_file = format!(
-        "{}/templates/ssh/{}.tpl",
-        model.deployment.ca_steppath(),
-        provisioner_name
-    );
 
     Ok(Plan {
         operation: OP_ENROLL_USER.to_owned(),
@@ -814,26 +807,17 @@ pub fn enroll_user(model: &SiteModel, user: &str, host: &str) -> Result<Plan> {
             },
             PlanStep {
                 id: STEP_REGISTER_USER_PROVISIONER.to_owned(),
-                summary: "copy the public JWK to the CA origin, then allow only this user/device JWK to issue this user's principal".to_owned(),
+                summary: "authorize this user/client-host public JWK on the CA origin for future cert refreshes".to_owned(),
                 hosts: unique_hosts([device.device.clone(), ca_origin.target.clone()]),
-                commands: vec![
-                    format!(
-                        "scp {} {}:{}",
-                        sh_home(&public_jwk),
-                        sh(&ca_origin.target),
-                        sh(copied_public_jwk)
-                    ),
-                    format!("install -d -m 0750 {}", sh(&parent_dir(&template_file))),
-                    write_user_ssh_template_command(&template_file, &user.principal),
-                    register_user_device_provisioner_command(
-                        model,
-                        &provisioner_name,
-                        copied_public_jwk,
-                        &template_file,
-                    ),
-                    "systemctl restart step-ca.service".to_owned(),
-                ],
-                files: vec![copied_public_jwk.to_owned(), template_file],
+                commands: vec![format!(
+                    "ssh {} {} authorize-user --user {} --host {} < {}",
+                    sh(&ca_origin.target),
+                    sh(&model.deployment.values["GRAFHOME_CA_HELPER_BIN"]),
+                    sh(&user.user),
+                    sh(&device.device),
+                    sh_home(&public_jwk)
+                )],
+                files: vec![public_jwk.clone()],
                 manual: true,
             },
         ],
@@ -962,12 +946,12 @@ pub fn add_user(model: &SiteModel, user: &str) -> Result<Plan> {
                 hosts: Vec::new(),
                 commands: vec![
                     format!(
-                        "grafhome-ca plan create-user-token --user {} --host {}",
+                        "grafhome-ca create-user-token --user {} --host {}",
                         sh(user),
                         sh("<client-host>")
                     ),
                     format!(
-                        "grafhome-ca plan enroll-user --user {} --host {}",
+                        "grafhome-ca enroll-user --user {} --host {}",
                         sh(user),
                         sh("<client-host>")
                     ),
@@ -1300,37 +1284,6 @@ fn user_refresh_command(
         sh_home(&user_public_key_path(&device.key_name)),
         sh(ca_url),
         sh_home(&user_root_cert_path(model))
-    )
-}
-
-fn register_user_device_provisioner_command(
-    model: &SiteModel,
-    provisioner: &str,
-    public_jwk: &str,
-    template_file: &str,
-) -> String {
-    let user_enrollment =
-        required_provisioner(model, "user_enrollment").expect("validated user_enrollment");
-    let ca_config = format!("{}/config/ca.json", model.deployment.ca_steppath());
-    format!(
-        "{} add-user-device-provisioner --ca-json {} --public-key {} --name {} --ssh-template {} --default-ttl {} --max-ttl {} --out-file {}",
-        sh(&model.deployment.values["GRAFHOME_CA_HELPER_BIN"]),
-        sh(&ca_config),
-        sh(public_jwk),
-        sh(provisioner),
-        sh(template_file),
-        sh(&user_enrollment.default_ttl),
-        sh(&user_enrollment.max_ttl),
-        sh(&ca_config)
-    )
-}
-
-fn write_user_ssh_template_command(path: &str, principal: &str) -> String {
-    let principal_json = serde_json::to_string(principal).expect("principal string serializes");
-    format!(
-        "cat > {} <<'EOF'\n{{\n  \"type\": \"user\",\n  \"keyId\": {{{{ toJson .KeyID }}}},\n  \"principals\": [{}],\n  \"criticalOptions\": {{{{ toJson .CriticalOptions }}}},\n  \"extensions\": {{{{ toJson .Extensions }}}}\n}}\nEOF",
-        sh(path),
-        principal_json
     )
 }
 
@@ -2111,8 +2064,8 @@ mod tests {
         assert_eq!(
             plan.steps[2].commands,
             vec![
-                "grafhome-ca plan create-host-token --host proxy-host",
-                "grafhome-ca plan enroll-host --host proxy-host"
+                "grafhome-ca create-host-token --host proxy-host",
+                "grafhome-ca enroll-host --host proxy-host"
             ]
         );
         assert!(
@@ -2318,21 +2271,16 @@ mod tests {
                 "$HOME/.config/grafhome-ca/users/alice/hosts/ca-host/provisioner.pub.json"
             )
         );
-        assert!(plan.steps[2].commands[0].contains("scp"));
+        assert!(
+            plan.steps[2].commands[0]
+                .contains("ssh ca-host /root/.local/bin/grafhome-ca authorize-user")
+        );
+        assert!(plan.steps[2].commands[0].contains("--user alice --host ca-host"));
         assert!(
             plan.steps[2].commands[0].contains(
                 "$HOME/.config/grafhome-ca/users/alice/hosts/ca-host/provisioner.pub.json"
             )
         );
-        assert!(plan.steps[2].commands[2].contains("\"principals\": [\"alice\"]"));
-        assert!(
-            plan.steps[2].commands[3].contains(
-                "add-user-device-provisioner --ca-json /srv/example-ca/step/config/ca.json"
-            )
-        );
-        assert!(plan.steps[2].commands[3].contains("--name grafhome-user-alice-ca-host"));
-        assert!(plan.steps[2].commands[3].contains("--default-ttl 24h"));
-        assert!(plan.steps[2].commands[3].contains("--ssh-template"));
     }
 
     #[test]
@@ -2423,8 +2371,8 @@ mod tests {
         assert_eq!(
             plan.steps[1].commands,
             vec![
-                "grafhome-ca plan create-user-token --user new-user --host '<client-host>'",
-                "grafhome-ca plan enroll-user --user new-user --host '<client-host>'"
+                "grafhome-ca create-user-token --user new-user --host '<client-host>'",
+                "grafhome-ca enroll-user --user new-user --host '<client-host>'"
             ]
         );
     }

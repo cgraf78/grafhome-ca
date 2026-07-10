@@ -1,6 +1,7 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -22,6 +23,187 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
             fs::copy(&source, &target).unwrap();
         }
     }
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, content: &str) {
+    fs::write(path, content).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn prepend_path(dir: &Path) -> String {
+    let old = std::env::var_os("PATH")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{}:{old}", dir.display())
+}
+
+#[cfg(unix)]
+struct ExecFixture {
+    config_root: PathBuf,
+    fake_bin: PathBuf,
+    log: PathBuf,
+    host_key: PathBuf,
+}
+
+#[cfg(unix)]
+fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
+    let dir = tempdir().unwrap();
+    let config_root = dir.path().join("grafhome-ca");
+    let fake_bin = dir.path().join("bin");
+    let state = dir.path().join("state");
+    let server_step = dir.path().join("server-step");
+    let host_key = dir.path().join("ssh_host_ed25519_key");
+    let password = state.join("secrets/intermediate_ca_password");
+    let log = dir.path().join("calls.log");
+
+    copy_dir(&example_config_root(), &config_root);
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(state.join("step/certs")).unwrap();
+    fs::create_dir_all(password.parent().unwrap()).unwrap();
+    fs::write(state.join("step/certs/root_ca.crt"), "root\n").unwrap();
+    fs::write(&password, "ca-password\n").unwrap();
+    fs::write(&host_key, "host-private\n").unwrap();
+    fs::write(format!("{}.pub", host_key.display()), "host-public\n").unwrap();
+
+    let deployment = fs::read_to_string(config_root.join("config/deployment.env")).unwrap();
+    let deployment = deployment
+        .replace(
+            "GRAFHOME_CA_STATE_DIR=/srv/example-ca",
+            &format!("GRAFHOME_CA_STATE_DIR={}", state.display()),
+        )
+        .replace(
+            "GRAFHOME_CA_SERVER_STEPPATH=/etc/step/grafhome",
+            &format!("GRAFHOME_CA_SERVER_STEPPATH={}", server_step.display()),
+        )
+        .replace(
+            "GRAFHOME_CA_ROOT_STEP_BIN=/root/.local/bin/step",
+            &format!(
+                "GRAFHOME_CA_ROOT_STEP_BIN={}",
+                fake_bin.join("step").display()
+            ),
+        )
+        .replace(
+            "GRAFHOME_CA_HELPER_BIN=/root/.local/bin/grafhome-ca",
+            &format!(
+                "GRAFHOME_CA_HELPER_BIN={}",
+                fake_bin.join("grafhome-ca").display()
+            ),
+        )
+        .replace(
+            "GRAFHOME_CA_HOST_KEY_PATH=/etc/ssh/ssh_host_ed25519_key",
+            &format!("GRAFHOME_CA_HOST_KEY_PATH={}", host_key.display()),
+        )
+        .replace(
+            "GRAFHOME_CA_PASSWORD_FILE=/srv/example-ca/secrets/intermediate_ca_password",
+            &format!("GRAFHOME_CA_PASSWORD_FILE={}", password.display()),
+        );
+    fs::write(config_root.join("config/deployment.env"), deployment).unwrap();
+
+    write_executable(
+        &fake_bin.join("step"),
+        r#"#!/bin/sh
+set -eu
+printf 'step STEPPATH=%s args=%s\n' "${STEPPATH:-}" "$*" >> "$FAKE_LOG"
+case "$1 $2" in
+  "certificate fingerprint")
+    printf 'fingerprint-from-fake-step\n'
+    ;;
+  "ca token")
+    printf 'token-for-%s\n' "$3"
+    ;;
+  "ca bootstrap")
+    mkdir -p "$STEPPATH/certs" "$STEPPATH/config"
+    printf 'root\n' > "$STEPPATH/certs/root_ca.crt"
+    printf 'bootstrapped\n'
+    ;;
+  "ca health")
+    printf 'ok\n'
+    ;;
+  "ssh certificate")
+    if [ "${FAKE_STEP_FAIL:-}" = "ssh-certificate" ]; then
+      printf 'simulated failure token=%s\n' "$8" >&2
+      exit 42
+    fi
+    pub="$4"
+    cert="${pub%.pub}-cert.pub"
+    printf 'cert\n' > "$cert"
+    printf 'signed %s\n' "$cert"
+    ;;
+  "crypto jwk")
+    pub="$4"
+    priv="$5"
+    printf '{"kty":"OKP","crv":"Ed25519","x":"public"}\n' > "$pub"
+    printf '{"kty":"OKP","crv":"Ed25519","x":"public","d":"private"}\n' > "$priv"
+    printf 'jwk\n'
+    ;;
+esac
+"#,
+    );
+    write_executable(
+        &fake_bin.join("ssh-keygen"),
+        r#"#!/bin/sh
+set -eu
+printf 'ssh-keygen args=%s\n' "$*" >> "$FAKE_LOG"
+if [ "$1" = "-t" ]; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-f" ]; then out="$arg"; fi
+    prev="$arg"
+  done
+  printf 'private\n' > "$out"
+  printf 'public\n' > "$out.pub"
+elif [ "$1" = "-L" ]; then
+  test -s "$3"
+  printf 'inspect %s\n' "$3"
+fi
+"#,
+    );
+    write_executable(
+        &fake_bin.join("sshd"),
+        r#"#!/bin/sh
+set -eu
+printf 'sshd args=%s\n' "$*" >> "$FAKE_LOG"
+"#,
+    );
+    write_executable(
+        &fake_bin.join("systemctl"),
+        r#"#!/bin/sh
+set -eu
+printf 'systemctl args=%s\n' "$*" >> "$FAKE_LOG"
+if [ "${FAKE_SYSTEMCTL_RESTART_FAIL_ONCE:-}" = "1" ] && [ "$1" = "restart" ] && [ ! -e "$FAKE_LOG.restart_failed" ]; then
+  touch "$FAKE_LOG.restart_failed"
+  exit 43
+fi
+if [ "$1" = "is-active" ]; then printf 'active\n'; fi
+"#,
+    );
+    write_executable(
+        &fake_bin.join("chown"),
+        r#"#!/bin/sh
+set -eu
+printf 'chown args=%s\n' "$*" >> "$FAKE_LOG"
+"#,
+    );
+    write_executable(
+        &fake_bin.join("chmod"),
+        r#"#!/bin/sh
+set -eu
+printf 'chmod args=%s\n' "$*" >> "$FAKE_LOG"
+"#,
+    );
+
+    (
+        dir,
+        ExecFixture {
+            config_root,
+            fake_bin,
+            log,
+            host_key,
+        },
+    )
 }
 
 #[test]
@@ -484,7 +666,9 @@ fn plan_user_enrollment_commands_can_emit_json() {
         .stdout(predicate::str::contains("step ssh certificate"))
         .stdout(predicate::str::contains("--sign"))
         .stdout(predicate::str::contains("crypto jwk create"))
-        .stdout(predicate::str::contains("grafhome-user-alice-ca-host"))
+        .stdout(predicate::str::contains(
+            "authorize-user --user alice --host ca-host",
+        ))
         .stdout(predicate::str::contains("alice_ca_host_ed25519.pub"));
 }
 
@@ -662,4 +846,339 @@ fn plan_unknown_host_fails_before_any_execution() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown host"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ca_fingerprint_executes_step_and_prints_fingerprint() {
+    let (_dir, fixture) = exec_fixture();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("ca-fingerprint")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout("fingerprint-from-fake-step\n");
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("certificate fingerprint"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_client_reads_fingerprint_from_stdin() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("bootstrap-client")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin("trusted-fingerprint\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("trusted root fingerprint: "))
+        .stdout(predicate::str::contains("bootstrapped"))
+        .stdout(predicate::str::contains("ok"));
+
+    assert!(
+        home.join(".config/grafhome/step/certs/root_ca.crt")
+            .exists()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ca bootstrap"));
+    assert!(log.contains("--fingerprint trusted-fingerprint"));
+    assert!(log.contains("ca health"));
+}
+
+#[cfg(unix)]
+#[test]
+fn create_host_token_executes_step_and_prints_token() {
+    let (_dir, fixture) = exec_fixture();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("create-host-token")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--host")
+        .arg("proxy-host")
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout("token-for-proxy-host\n");
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ca token proxy-host --ssh --host"));
+    assert!(log.contains("--principal proxy-host"));
+    assert!(log.contains("--principal ca.example.test"));
+    assert!(log.contains("--not-after 15m"));
+    assert!(log.contains("--cert-not-after 168h"));
+}
+
+#[cfg(unix)]
+#[test]
+fn create_host_token_rejects_malformed_ttl_before_step_runs() {
+    let (_dir, fixture) = exec_fixture();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("create-host-token")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--host")
+        .arg("proxy-host")
+        .arg("--ttl")
+        .arg(".")
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "duration must use Smallstep units",
+        ));
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_host_reads_token_from_stdin_and_reloads_ssh() {
+    let (_dir, fixture) = exec_fixture();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("enroll-host")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--host")
+        .arg("proxy-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin("host-token\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("host enrollment token: "))
+        .stdout(predicate::str::contains("signed"))
+        .stdout(predicate::str::contains("inspect"));
+
+    assert!(PathBuf::from(format!("{}-cert.pub", fixture.host_key.display())).exists());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ssh certificate proxy-host"));
+    assert!(log.contains("--token host-token"));
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("systemctl args=reload ssh"));
+}
+
+#[cfg(unix)]
+#[test]
+fn create_user_token_executes_step_and_prints_token() {
+    let (_dir, fixture) = exec_fixture();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("create-user-token")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout("token-for-alice\n");
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ca token alice --ssh --principal alice"));
+    assert!(log.contains("--provisioner grafhome-user-enrollment"));
+    assert!(log.contains("--cert-not-after 24h"));
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_user_reads_token_and_password_from_stdin_without_persisting_password() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("enroll-user")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin("user-token\nuser-owned-password\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("user enrollment token: "))
+        .stderr(predicate::str::contains("user provisioner password: "))
+        .stdout(predicate::str::contains("user cert:"))
+        .stdout(predicate::str::contains(
+            "authorize renewal with: grafhome-ca authorize-user",
+        ));
+
+    let key = home.join(".ssh/alice_ca_host_ed25519");
+    let cert = home.join(".ssh/alice_ca_host_ed25519-cert.pub");
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    assert!(key.exists());
+    assert!(cert.exists());
+    assert!(material.join("provisioner.pub.json").exists());
+    assert!(material.join("provisioner.priv.json").exists());
+    assert!(fs::read_dir(&material).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("password")
+    }));
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("--token user-token"));
+    assert!(log.contains("crypto jwk create"));
+    assert!(!log.contains("user-owned-password"));
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_host_redacts_token_from_failed_step_error() {
+    let (_dir, fixture) = exec_fixture();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("enroll-host")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--host")
+        .arg("proxy-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_STEP_FAIL", "ssh-certificate")
+        .write_stdin("sensitive-host-token\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("[REDACTED]"))
+        .stderr(predicate::str::contains("sensitive-host-token").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn authorize_user_reads_public_key_from_stdin_and_restarts_step_ca() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("authorize-user")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin("{\n  \"kid\": \"device-kid\",\n  \"kty\": \"EC\"\n}\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("public JWK: "))
+        .stdout(predicate::str::contains("backup ca.json:"))
+        .stdout(predicate::str::contains(
+            "authorized provisioner: grafhome-user-alice-ca-host",
+        ));
+
+    let ca_config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
+    let provisioner = &ca_config["authority"]["provisioners"][0];
+    assert_eq!(provisioner["name"], "grafhome-user-alice-ca-host");
+    assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
+    assert!(
+        provisioner["options"]["ssh"]["template"]
+            .as_str()
+            .unwrap()
+            .contains(r#""principals": ["alice"]"#)
+    );
+    assert!(
+        ca_json
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("templates/ssh/grafhome-user-alice-ca-host.tpl")
+            .exists()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("chown args=step-ca:step-ca"));
+    assert!(log.contains("chmod args=0640"));
+    assert!(log.contains("systemctl args=restart step-ca.service"));
+    assert!(log.contains("systemctl args=is-active step-ca.service"));
+    assert!(log.contains("ca health"));
+}
+
+#[cfg(unix)]
+#[test]
+fn authorize_user_rolls_back_ca_json_if_restart_fails() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    let original = r#"{"authority":{"provisioners":[]}}"#;
+    fs::write(&ca_json, original).unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("authorize-user")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
+        .write_stdin("{\n  \"kid\": \"device-kid\",\n  \"kty\": \"EC\"\n}\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("restored previous ca.json"));
+
+    assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_ensure_reads_password_from_stdin_and_refreshes_cert() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    fs::create_dir_all(&material).unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/alice_ca_host_ed25519.pub"), "public\n").unwrap();
+    fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.arg("ssh-ensure")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin("user-owned-password\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("user provisioner password: "))
+        .stdout(predicate::str::contains("signed"))
+        .stdout(predicate::str::contains("inspect"));
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("--issuer grafhome-user-alice-ca-host"));
+    assert!(log.contains("ssh certificate alice"));
+    assert!(!log.contains("user-owned-password"));
 }
