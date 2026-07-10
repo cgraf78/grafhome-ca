@@ -17,7 +17,7 @@ use crate::model::SiteModel;
 use crate::policy::Provisioner;
 
 const USER_DEVICE_X509_DENY_TEMPLATE: &str =
-    r#"{{ fail "x509 issuance disabled for Grafhome user/device provisioner" }}"#;
+    r#"{{ fail "x509 issuance disabled for Grafhome user/client-host provisioner" }}"#;
 
 /// Replace rendered JWK placeholders with runtime-generated provisioner objects.
 pub fn materialize(
