@@ -16,6 +16,9 @@ use crate::error::{Error, Result};
 use crate::model::SiteModel;
 use crate::policy::Provisioner;
 
+const USER_DEVICE_X509_DENY_TEMPLATE: &str =
+    r#"{{ fail "x509 issuance disabled for Grafhome user/device provisioner" }}"#;
+
 /// Replace rendered JWK placeholders with runtime-generated provisioner objects.
 pub fn materialize(
     model: &SiteModel,
@@ -81,6 +84,63 @@ pub fn materialize(
     })
 }
 
+/// Add one constrained per-user/per-host JWK provisioner to an existing CA config.
+pub fn add_user_device(
+    ca_json: impl AsRef<Path>,
+    public_key: impl AsRef<Path>,
+    name: &str,
+    template_file: &str,
+    default_ttl: &str,
+    max_ttl: &str,
+) -> Result<String> {
+    let ca_json = ca_json.as_ref();
+    let public_key = public_key.as_ref();
+    let mut config = read_json(ca_json)?;
+    let key = read_public_jwk(public_key)?;
+    let template = read_text(Path::new(template_file))?;
+    let provisioners = config
+        .pointer_mut("/authority/provisioners")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: "expected provisioners array".to_owned(),
+        })?;
+
+    if provisioners
+        .iter()
+        .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
+    {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("provisioner {name} already exists"),
+        });
+    }
+
+    provisioners.push(json!({
+        "type": "JWK",
+        "name": name,
+        "key": key,
+        "claims": {
+            "defaultUserSSHCertDuration": default_ttl,
+            "maxUserSSHCertDuration": max_ttl,
+            "enableSSHCA": true,
+        },
+        "options": {
+            "x509": {
+                "template": USER_DEVICE_X509_DENY_TEMPLATE,
+            },
+            "ssh": {
+                "template": template,
+            },
+        },
+    }));
+
+    serde_json::to_string_pretty(&config).map_err(|source| Error::Json {
+        path: ca_json.to_path_buf(),
+        source,
+    })
+}
+
 fn read_json(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path).map_err(|source| Error::io(path, source))?;
     serde_json::from_str(&text).map_err(|source| Error::Json {
@@ -91,6 +151,21 @@ fn read_json(path: &Path) -> Result<Value> {
 
 fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|source| Error::io(path, source))
+}
+
+fn read_public_jwk(path: &Path) -> Result<Value> {
+    let key = read_json(path)?;
+    let object = key.as_object().ok_or_else(|| Error::Validation {
+        field: path.display().to_string(),
+        message: "public JWK must be a JSON object".to_owned(),
+    })?;
+    if object.contains_key("d") {
+        return Err(Error::Validation {
+            field: path.display().to_string(),
+            message: "public JWK must not contain private key material".to_owned(),
+        });
+    }
+    Ok(key)
 }
 
 fn active_jwk_provisioners(model: &SiteModel) -> Vec<&Provisioner> {
@@ -214,13 +289,13 @@ mod tests {
         let jwk_dir = dir.path().join("provisioners");
         fs::create_dir(&jwk_dir).unwrap();
         fs::write(
-            jwk_dir.join("grafhome-user-login.pub.json"),
-            r#"{"kid":"user-login-kid","kty":"EC"}"#,
+            jwk_dir.join("grafhome-user-enrollment.pub.json"),
+            r#"{"kid":"user-enrollment-kid","kty":"EC"}"#,
         )
         .unwrap();
         fs::write(
-            jwk_dir.join("grafhome-user-login.priv.json"),
-            "{\n  \"protected\": \"encrypted-user-login\"\n}\n",
+            jwk_dir.join("grafhome-user-enrollment.priv.json"),
+            "{\n  \"protected\": \"encrypted-user-enrollment\"\n}\n",
         )
         .unwrap();
 
@@ -235,19 +310,22 @@ mod tests {
             .unwrap();
         assert_eq!(bootstrap["key"]["kid"], "bootstrap-kid");
         assert_eq!(bootstrap["encryptedKey"], "encrypted-bootstrap");
-        assert_eq!(bootstrap["claims"]["defaultHostSSHCertDuration"], "720h");
-        let user_login = provisioners
+        assert_eq!(bootstrap["claims"]["defaultHostSSHCertDuration"], "168h");
+        let user_enrollment = provisioners
             .iter()
-            .find(|item| item["name"] == "grafhome-user-login")
+            .find(|item| item["name"] == "grafhome-user-enrollment")
             .unwrap();
-        assert_eq!(user_login["key"]["kid"], "user-login-kid");
+        assert_eq!(user_enrollment["key"]["kid"], "user-enrollment-kid");
         assert!(
-            user_login["encryptedKey"]
+            user_enrollment["encryptedKey"]
                 .as_str()
                 .unwrap()
-                .contains("encrypted-user-login")
+                .contains("encrypted-user-enrollment")
         );
-        assert_eq!(user_login["claims"]["defaultUserSSHCertDuration"], "16h");
+        assert_eq!(
+            user_enrollment["claims"]["defaultUserSSHCertDuration"],
+            "24h"
+        );
         assert!(
             provisioners
                 .iter()
@@ -258,6 +336,72 @@ mod tests {
                 .iter()
                 .any(|item| item["name"] == "grafhome-x509-ca-proxy")
         );
+    }
+
+    #[test]
+    fn adds_user_device_provisioner_without_host_ssh_claims() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"device-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
+
+        let text = add_user_device(
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+            "24h",
+            "168h",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let provisioner = &value["authority"]["provisioners"][0];
+
+        assert_eq!(provisioner["name"], "grafhome-user-alice-ca-host");
+        assert_eq!(provisioner["key"]["kid"], "device-kid");
+        assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
+        assert_eq!(provisioner["claims"]["maxUserSSHCertDuration"], "168h");
+        assert_eq!(provisioner["claims"]["enableSSHCA"], true);
+        assert!(provisioner["claims"]["defaultHostSSHCertDuration"].is_null());
+        assert!(provisioner["claims"]["maxHostSSHCertDuration"].is_null());
+        assert_eq!(
+            provisioner["options"]["x509"]["template"],
+            USER_DEVICE_X509_DENY_TEMPLATE
+        );
+        assert_eq!(
+            provisioner["options"]["ssh"]["template"],
+            r#"{"type":"user","principals":["alice"]}"#
+        );
+    }
+
+    #[test]
+    fn rejects_private_jwk_for_user_device_public_key() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(
+            &public_key,
+            r#"{"kid":"device-kid","kty":"EC","d":"secret"}"#,
+        )
+        .unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
+
+        let error = add_user_device(
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+            "24h",
+            "168h",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must not contain private key"));
     }
 
     #[test]
@@ -286,6 +430,10 @@ mod tests {
 
         let error = materialize(&model, &live_path, &staged_path, &jwk_dir).unwrap_err();
 
-        assert!(error.to_string().contains("grafhome-user-login.pub.json"));
+        assert!(
+            error
+                .to_string()
+                .contains("grafhome-user-enrollment.pub.json")
+        );
     }
 }

@@ -114,12 +114,16 @@ Generate lifecycle plans without executing any commands:
 ```sh
 cargo run --bin grafhome-ca -- plan init-ca
 cargo run --bin grafhome-ca -- plan host-bootstrap --host ca-host
+cargo run --bin grafhome-ca -- plan create-host-token --host ca-host
+cargo run --bin grafhome-ca -- plan enroll-host --host ca-host
 cargo run --bin grafhome-ca -- plan host-renew --host ca-host
 cargo run --bin grafhome-ca -- plan host-renew-all
 cargo run --bin grafhome-ca -- plan backup-ca
 cargo run --bin grafhome-ca -- plan proxy-cert
 cargo run --bin grafhome-ca -- plan verify-live --host ca-host
-cargo run --bin grafhome-ca -- plan user-login --user alice --device ca-host
+cargo run --bin grafhome-ca -- plan create-user-token --user alice --host ca-host
+cargo run --bin grafhome-ca -- plan enroll-user --user alice --host ca-host
+cargo run --bin grafhome-ca -- plan ssh-ensure --user alice --host ca-host
 cargo run --bin grafhome-ca -- plan add-host --host new-host
 cargo run --bin grafhome-ca -- plan add-user --user new-user
 ```
@@ -127,20 +131,21 @@ cargo run --bin grafhome-ca -- plan add-user --user new-user
 Plans can also be emitted as JSON for tests, scripts, or future executors:
 
 ```sh
-cargo run --bin grafhome-ca -- plan --json user-login --user alice --device ca-host
+cargo run --bin grafhome-ca -- plan --json enroll-user --user alice --host ca-host
 ```
 
 Guarded live-operation stubs:
 
 ```sh
 cargo run --bin grafhome-ca -- init-ca --dry-run
-cargo run --bin grafhome-ssh-login -- --dry-run --user alice
 ```
 
 `grafhome-ca init-ca --dry-run` prints the same reviewed initialization plan as
-`grafhome-ca plan init-ca`. `grafhome-ssh-login` is a placeholder for future
-user certificate issuance; without `--dry-run` it exits before invoking `step`
-or `ssh-agent`, and its dry-run mode currently validates only the CLI surface.
+`grafhome-ca plan init-ca`.
+
+This release replaces the old direct `user-login` flow. Site policy should use
+the `user_enrollment` provisioner role and point users at that provisioner name;
+the examples use `grafhome-user-enrollment`.
 
 `backup-ca`, `proxy-cert`, and `verify-live` are still plans, not live
 execution. They exist to keep rollout checklists concrete:
@@ -220,9 +225,9 @@ credentials. Runtime rollout must still replace the placeholders in rendered
 deployment files with operator-generated Smallstep provisioner objects.
 
 Lifecycle plans use quoted angle-bracket placeholders for operator-provided
-runtime inputs, such as `<public-material-dir>`,
-`<host-bootstrap-provisioner-password-file>`, and
-`<user-login-provisioner-password-file>`. Replace those with private local paths
-or automation-provided files during rollout; they are not public repo inputs and
-must not contain or expose CA passwords, provisioner secrets, or topology-bearing
-real export bundles.
+runtime inputs, such as `<public-material-dir>`, `<host-enrollment-token>`,
+`<user-enrollment-token>`, `<user-provisioner-public-jwk>`, and
+`<user-owned-password-file>`. Replace those with private local values or
+automation-provided files during rollout; they are not public repo inputs and
+must not contain or expose CA passwords, provisioner secrets, tokens, or
+topology-bearing real export bundles.

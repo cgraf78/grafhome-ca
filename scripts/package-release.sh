@@ -51,7 +51,6 @@ GRAFHOME_CA_BUILD_COMMIT="$commit" GRAFHOME_CA_BUILD_VERSION="$tag" \
 
 mkdir -p "$staging/bin"
 install -m 0755 "target/${target}/release/grafhome-ca" "$staging/bin/grafhome-ca"
-install -m 0755 "target/${target}/release/grafhome-ssh-login" "$staging/bin/grafhome-ssh-login"
 install -m 0644 README.md "$staging/README.md"
 install -m 0644 LICENSE "$staging/LICENSE"
 

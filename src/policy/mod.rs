@@ -362,6 +362,11 @@ impl Policy {
         let users = unique_values("policy/users.tsv", &self.tables.users, "user")?;
         let provisioners =
             unique_values("policy/provisioners.tsv", &self.tables.provisioners, "name")?;
+        let provisioner_roles = self
+            .provisioners
+            .iter()
+            .map(|provisioner| (provisioner.name.as_str(), provisioner.role.as_str()))
+            .collect::<BTreeMap<_, _>>();
         let principals = unique_key_map(
             "policy/principals.tsv",
             &self.tables.principals,
@@ -404,6 +409,12 @@ impl Policy {
                 value(user, "provisioner"),
                 provisioners.iter(),
             )?;
+            if provisioner_roles.get(value(user, "provisioner")) != Some(&"user_enrollment") {
+                return Err(Error::Validation {
+                    field: format!("policy/users.tsv:{name}.provisioner"),
+                    message: "user provisioner must use role user_enrollment".to_owned(),
+                });
+            }
             if value(user, "root_ssh") == "yes" {
                 return Err(Error::Validation {
                     field: format!("policy/users.tsv:{name}.root_ssh"),
@@ -934,11 +945,25 @@ mod tests {
         let users = policy_dir.join("users.tsv");
         let text = fs::read_to_string(&users)
             .unwrap()
-            .replace("grafhome-user-login", "missing-provisioner");
+            .replace("grafhome-user-enrollment", "missing-provisioner");
         fs::write(&users, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
         assert!(error.contains("unknown provisioner missing-provisioner"));
+    }
+
+    #[test]
+    fn rejects_user_provisioner_with_wrong_role() {
+        let (dir, policy_dir) = copy_policy();
+
+        let users = policy_dir.join("users.tsv");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .replace("grafhome-user-enrollment", "grafhome-host-bootstrap");
+        fs::write(&users, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("user provisioner must use role user_enrollment"));
     }
 
     #[test]
@@ -973,7 +998,7 @@ mod tests {
         let provisioners = policy_dir.join("provisioners.tsv");
         let text = fs::read_to_string(&provisioners)
             .unwrap()
-            .replace("720h\t720h", "30d\t720h");
+            .replace("168h\t720h", "30d\t720h");
         fs::write(&provisioners, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();

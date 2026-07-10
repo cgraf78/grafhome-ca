@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::policy::Host;
+use crate::policy::{ClientDevice, Host, User};
 use crate::render::RenderedFile;
 use crate::{
     error::{Error, Result},
@@ -23,8 +23,6 @@ pub const OP_HOST_BOOTSTRAP: &str = "host-bootstrap";
 pub const OP_HOST_RENEW: &str = "host-renew";
 /// Fleet host certificate renewal operation key.
 pub const OP_HOST_RENEW_ALL: &str = "host-renew-all";
-/// User certificate issuance operation key.
-pub const OP_USER_LOGIN: &str = "user-login";
 /// CA state backup and restore-test operation key.
 pub const OP_BACKUP_CA: &str = "backup-ca";
 /// Live rollout verification operation key.
@@ -35,6 +33,16 @@ pub const OP_PROXY_CERT: &str = "proxy-cert";
 pub const OP_ADD_HOST: &str = "add-host";
 /// New user policy workflow operation key.
 pub const OP_ADD_USER: &str = "add-user";
+/// Create a short-lived host enrollment token operation key.
+pub const OP_CREATE_HOST_TOKEN: &str = "create-host-token";
+/// Consume a host enrollment token operation key.
+pub const OP_ENROLL_HOST: &str = "enroll-host";
+/// Create a short-lived user enrollment token operation key.
+pub const OP_CREATE_USER_TOKEN: &str = "create-user-token";
+/// Consume a user enrollment token operation key.
+pub const OP_ENROLL_USER: &str = "enroll-user";
+/// Ensure a user SSH certificate exists operation key.
+pub const OP_SSH_ENSURE: &str = "ssh-ensure";
 
 /// Render deployment files step key.
 pub const STEP_RENDER: &str = "render";
@@ -56,12 +64,8 @@ pub const STEP_INSTALL_CLIENT: &str = "install-client";
 pub const STEP_BOOTSTRAP_TRUST: &str = "bootstrap-trust";
 /// Install rendered host files step key.
 pub const STEP_INSTALL_RENDERED_FILES: &str = "install-rendered-files";
-/// Issue the first SSH host certificate step key.
-pub const STEP_ISSUE_HOST_CERT: &str = "issue-host-cert";
 /// Renew one SSH host certificate step key.
 pub const STEP_RENEW_HOST_CERT: &str = "renew-host-cert";
-/// Issue one SSH user certificate step key.
-pub const STEP_ISSUE_USER_CERT: &str = "issue-user-cert";
 /// Issue or renew proxy X.509 certificate step key.
 pub const STEP_PROXY_CERT: &str = "proxy-cert";
 /// Verify live CA API step key.
@@ -74,6 +78,24 @@ pub const STEP_VERIFY_PROXY_TLS: &str = "verify-proxy-tls";
 pub const STEP_EDIT_POLICY: &str = "edit-policy";
 /// Follow up with host bootstrap step key.
 pub const STEP_BOOTSTRAP_HOST: &str = "bootstrap-host";
+/// Create host enrollment token step key.
+pub const STEP_CREATE_HOST_TOKEN: &str = "create-host-token";
+/// Consume host enrollment token step key.
+pub const STEP_CONSUME_HOST_TOKEN: &str = "consume-host-token";
+/// Create user enrollment token step key.
+pub const STEP_CREATE_USER_TOKEN: &str = "create-user-token";
+/// Consume user enrollment token step key.
+pub const STEP_CONSUME_USER_TOKEN: &str = "consume-user-token";
+/// Create local user provisioner key step key.
+pub const STEP_CREATE_USER_PROVISIONER_KEY: &str = "create-user-provisioner-key";
+/// Register constrained user provisioner step key.
+pub const STEP_REGISTER_USER_PROVISIONER: &str = "register-user-provisioner";
+/// Ensure local user certificate step key.
+pub const STEP_ENSURE_USER_CERT: &str = "ensure-user-cert";
+
+/// Default enrollment token lifetime.
+pub const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
+const USER_STEP_BIN: &str = "step";
 
 /// A lifecycle plan for one operator action.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -313,7 +335,8 @@ pub fn init_ca(model: &SiteModel) -> Result<Plan> {
 pub fn host_bootstrap(model: &SiteModel, host: &str) -> Result<Plan> {
     let host = required_host(model, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
-    let bootstrap = required_provisioner(model, "host_bootstrap")?;
+    let ca_origin = required_endpoint(model, "ca_origin")?;
+    let _bootstrap = required_provisioner(model, "host_bootstrap")?;
     let mut steps = vec![
         PlanStep {
             id: STEP_INSTALL_CLIENT.to_owned(),
@@ -346,22 +369,22 @@ pub fn host_bootstrap(model: &SiteModel, host: &str) -> Result<Plan> {
     ];
     if host.ssh_server == "yes" {
         steps.push(PlanStep {
-            id: STEP_ISSUE_HOST_CERT.to_owned(),
-            summary: "issue the initial SSH host certificate before enabling HostCertificate"
-                .to_owned(),
-            hosts: vec![host.host.clone()],
-            commands: vec![host_certificate_command(
-                model,
-                host,
-                &ca_api.url(),
-                &bootstrap.name,
-                &bootstrap.default_ttl,
-            )],
+            id: STEP_CREATE_HOST_TOKEN.to_owned(),
+            summary: "create and consume a short-lived host enrollment token before enabling HostCertificate".to_owned(),
+            hosts: unique_hosts([host.host.clone(), ca_origin.target.clone()]),
+            commands: vec![
+                format!("grafhome-ca plan create-host-token --host {}", sh(&host.host)),
+                format!("grafhome-ca plan enroll-host --host {}", sh(&host.host)),
+            ],
             files: vec![host_public_key_path(model), host_cert_path(model)],
             manual: true,
         });
     }
-    let install_commands = host_bootstrap_install_steps(model, host)?;
+    let mut install_commands = host_bootstrap_install_steps(model, host)?;
+    if host.ssh_server == "yes" {
+        install_commands.push("sshd -t".to_owned());
+        install_commands.push("systemctl reload ssh || systemctl reload sshd".to_owned());
+    }
     steps.push(PlanStep {
         id: STEP_INSTALL_RENDERED_FILES.to_owned(),
         summary: "install reviewed host-specific SSH config and public trust files".to_owned(),
@@ -599,56 +622,263 @@ pub fn proxy_cert(model: &SiteModel) -> Result<Plan> {
     })
 }
 
-/// Plan user certificate issuance without executing it.
-pub fn user_login(model: &SiteModel, user: &str, device: Option<&str>) -> Result<Plan> {
-    let user = model.policy.user(user).ok_or_else(|| Error::Validation {
-        field: format!("policy/users.tsv:{user}"),
-        message: "unknown user".to_owned(),
-    })?;
-    if user.status != "active" {
+/// Plan creation of a short-lived host enrollment token.
+pub fn create_host_token(
+    model: &SiteModel,
+    host: &str,
+    token_ttl: Option<&str>,
+    cert_ttl: Option<&str>,
+) -> Result<Plan> {
+    let host = required_host(model, host)?;
+    if host.ssh_server != "yes" {
         return Err(Error::Validation {
-            field: format!("policy/users.tsv:{}.status", user.user),
-            message: "user must be active for certificate issuance".to_owned(),
+            field: format!("policy/hosts.tsv:{}.ssh_server", host.host),
+            message: "host enrollment requires ssh_server=yes".to_owned(),
+        });
+    }
+    let ca_origin = required_endpoint(model, "ca_origin")?;
+    let ca_api = required_endpoint(model, "ca_api")?;
+    let bootstrap = required_provisioner(model, "host_bootstrap")?;
+    let token_ttl = checked_ttl(
+        "create-host-token.ttl",
+        token_ttl.unwrap_or(DEFAULT_ENROLLMENT_TOKEN_TTL),
+    )?;
+    let cert_ttl = checked_ttl(
+        "create-host-token.cert_ttl",
+        cert_ttl.unwrap_or(&bootstrap.default_ttl),
+    )?;
+
+    Ok(Plan {
+        operation: OP_CREATE_HOST_TOKEN.to_owned(),
+        summary: format!("create a short-lived host enrollment token for {}", host.host),
+        steps: vec![PlanStep {
+            id: STEP_CREATE_HOST_TOKEN.to_owned(),
+            summary: "run on the CA origin as the CA operator; copy only the printed token to the target host".to_owned(),
+            hosts: vec![ca_origin.target.clone()],
+            commands: vec![host_token_command(
+                model,
+                host,
+                &bootstrap.name,
+                &ca_api.url(),
+                token_ttl,
+                cert_ttl,
+            )],
+            files: vec![
+                model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"].clone(),
+                format!("{}/certs/root_ca.crt", model.deployment.ca_steppath()),
+            ],
+            manual: true,
+        }],
+    })
+}
+
+/// Plan consumption of a host enrollment token on the target host.
+pub fn enroll_host(model: &SiteModel, host: &str) -> Result<Plan> {
+    let host = required_host(model, host)?;
+    if host.ssh_server != "yes" {
+        return Err(Error::Validation {
+            field: format!("policy/hosts.tsv:{}.ssh_server", host.host),
+            message: "host enrollment requires ssh_server=yes".to_owned(),
         });
     }
     let ca_api = required_endpoint(model, "ca_api")?;
-    let devices = select_user_login_devices(model, &user.user, device)?;
-    let user_steppath = format!(
-        "$HOME/{}",
-        model.deployment.values["GRAFHOME_CA_USER_STEPPATH"]
-    );
-    let commands = devices
-        .iter()
-        .map(|device| {
-            let public_key = user_public_key_path(&device.key_name);
-            format!(
-                "STEPPATH={} step ssh certificate --ca-url {} --provisioner {} --provisioner-password-file {} --sign --principal {} --not-after {} {} {}",
-                user_steppath,
-                sh(&ca_api.url()),
-                sh(&user.provisioner),
-                sh("<user-login-provisioner-password-file>"),
-                sh(&user.principal),
-                sh(&user.cert_ttl),
-                sh(&user.principal),
-                public_key
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut files = Vec::new();
-    for device in devices {
-        files.push(user_public_key_path(&device.key_name));
-        files.push(user_cert_path(&device.key_name));
-    }
     Ok(Plan {
-        operation: OP_USER_LOGIN.to_owned(),
-        summary: format!("issue short-lived SSH user certificate for {}", user.user),
+        operation: OP_ENROLL_HOST.to_owned(),
+        summary: format!("enroll {} with a host SSH certificate", host.host),
         steps: vec![PlanStep {
-            id: STEP_ISSUE_USER_CERT.to_owned(),
-            summary: "request a fresh user SSH certificate for an existing local key".to_owned(),
-            hosts: Vec::new(),
-            commands,
-            files,
+            id: STEP_CONSUME_HOST_TOKEN.to_owned(),
+            summary: "run on the target host as root with the short-lived host enrollment token"
+                .to_owned(),
+            hosts: vec![host.host.clone()],
+            commands: vec![
+                host_enroll_command(model, host, &ca_api.url()),
+                "sshd -t".to_owned(),
+                "systemctl reload ssh || systemctl reload sshd".to_owned(),
+            ],
+            files: vec![host_public_key_path(model), host_cert_path(model)],
             manual: true,
+        }],
+    })
+}
+
+/// Plan creation of a short-lived user enrollment token.
+pub fn create_user_token(
+    model: &SiteModel,
+    user: &str,
+    host: &str,
+    token_ttl: Option<&str>,
+    cert_ttl: Option<&str>,
+) -> Result<Plan> {
+    let user = active_user(model, user)?;
+    let device = required_user_device(model, &user.user, host)?;
+    let ca_origin = required_endpoint(model, "ca_origin")?;
+    let ca_api = required_endpoint(model, "ca_api")?;
+    let token_ttl = checked_ttl(
+        "create-user-token.ttl",
+        token_ttl.unwrap_or(DEFAULT_ENROLLMENT_TOKEN_TTL),
+    )?;
+    let cert_ttl = checked_ttl(
+        "create-user-token.cert_ttl",
+        cert_ttl.unwrap_or(&user.cert_ttl),
+    )?;
+
+    Ok(Plan {
+        operation: OP_CREATE_USER_TOKEN.to_owned(),
+        summary: format!(
+            "create a short-lived user enrollment token for {} on {}",
+            user.user, device.device
+        ),
+        steps: vec![PlanStep {
+            id: STEP_CREATE_USER_TOKEN.to_owned(),
+            summary: "run on the CA origin as the CA operator; copy only the printed token to the user device".to_owned(),
+            hosts: vec![ca_origin.target.clone()],
+            commands: vec![user_token_command(
+                model,
+                user,
+                &ca_api.url(),
+                token_ttl,
+                cert_ttl,
+            )],
+            files: vec![
+                model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"].clone(),
+                format!("{}/certs/root_ca.crt", model.deployment.ca_steppath()),
+            ],
+            manual: true,
+        }],
+    })
+}
+
+/// Plan first-time user enrollment on a client host.
+pub fn enroll_user(model: &SiteModel, user: &str, host: &str) -> Result<Plan> {
+    let user = active_user(model, user)?;
+    let device = required_user_device(model, &user.user, host)?;
+    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_origin = required_endpoint(model, "ca_origin")?;
+    let provisioner_name = user_device_provisioner_name(&user.user, &device.device);
+    let material_dir = user_device_material_dir(&user.user, &device.device);
+    let public_jwk = format!("{material_dir}/provisioner.pub.json");
+    let private_jwk = format!("{material_dir}/provisioner.priv.json");
+    let copied_public_jwk = "<user-provisioner-public-jwk>";
+    let template_file = format!(
+        "{}/templates/ssh/{}.tpl",
+        model.deployment.ca_steppath(),
+        provisioner_name
+    );
+
+    Ok(Plan {
+        operation: OP_ENROLL_USER.to_owned(),
+        summary: format!("enroll {} for user SSH certificates on {}", user.user, device.device),
+        steps: vec![
+            PlanStep {
+                id: STEP_CONSUME_USER_TOKEN.to_owned(),
+                summary: "run on the user device to issue the initial cert from the enrollment token".to_owned(),
+                hosts: vec![device.device.clone()],
+                commands: vec![
+                    format!(
+                        "install -d -m 0700 {}",
+                        sh_home(&user_key_dir(&device.key_name))
+                    ),
+                    format!(
+                        "test -s {} || ssh-keygen -t ed25519 -N '' -f {}",
+                        sh_home(&user_private_key_path(&device.key_name)),
+                        sh_home(&user_private_key_path(&device.key_name))
+                    ),
+                    user_enroll_command(model, user, device, &ca_api.url()),
+                ],
+                files: vec![
+                    user_private_key_path(&device.key_name),
+                    user_public_key_path(&device.key_name),
+                    user_cert_path(&device.key_name),
+                ],
+                manual: true,
+            },
+            PlanStep {
+                id: STEP_CREATE_USER_PROVISIONER_KEY.to_owned(),
+                summary: "create a user-owned encrypted JWK for future cert refreshes".to_owned(),
+                hosts: vec![device.device.clone()],
+                commands: vec![
+                    format!("install -d -m 0700 {}", sh_home(&material_dir)),
+                    format!(
+                        "test -s {} || {} crypto jwk create {} {} --password-file {}",
+                        sh_home(&private_jwk),
+                        USER_STEP_BIN,
+                        sh_home(&public_jwk),
+                        sh_home(&private_jwk),
+                        sh("<user-owned-password-file>")
+                    ),
+                    format!("chmod 0600 {}", sh_home(&private_jwk)),
+                    format!("chmod 0644 {}", sh_home(&public_jwk)),
+                ],
+                files: vec![public_jwk.clone(), private_jwk.clone()],
+                manual: true,
+            },
+            PlanStep {
+                id: STEP_REGISTER_USER_PROVISIONER.to_owned(),
+                summary: "copy the public JWK to the CA origin, then allow only this user/device JWK to issue this user's principal".to_owned(),
+                hosts: unique_hosts([device.device.clone(), ca_origin.target.clone()]),
+                commands: vec![
+                    format!(
+                        "scp {} {}:{}",
+                        sh_home(&public_jwk),
+                        sh(&ca_origin.target),
+                        sh(copied_public_jwk)
+                    ),
+                    format!("install -d -m 0750 {}", sh(&parent_dir(&template_file))),
+                    write_user_ssh_template_command(&template_file, &user.principal),
+                    register_user_device_provisioner_command(
+                        model,
+                        &provisioner_name,
+                        copied_public_jwk,
+                        &template_file,
+                    ),
+                    "systemctl restart step-ca.service".to_owned(),
+                ],
+                files: vec![copied_public_jwk.to_owned(), template_file],
+                manual: true,
+            },
+        ],
+    })
+}
+
+/// Plan local user SSH cert refresh before an SSH connection.
+pub fn ssh_ensure(model: &SiteModel, user: &str, host: Option<&str>) -> Result<Plan> {
+    let user = active_user(model, user)?;
+    let device = match host {
+        Some(host) => required_user_device(model, &user.user, host)?,
+        None => select_single_user_device(model, &user.user)?,
+    };
+    let ca_api = required_endpoint(model, "ca_api")?;
+    let provisioner_name = user_device_provisioner_name(&user.user, &device.device);
+    let private_jwk = format!(
+        "{}/provisioner.priv.json",
+        user_device_material_dir(&user.user, &device.device)
+    );
+
+    Ok(Plan {
+        operation: OP_SSH_ENSURE.to_owned(),
+        summary: format!(
+            "ensure {} has a fresh SSH certificate on {}",
+            user.user, device.device
+        ),
+        steps: vec![PlanStep {
+            id: STEP_ENSURE_USER_CERT.to_owned(),
+            summary: "run locally from ssh Match exec or ds before opening the SSH connection"
+                .to_owned(),
+            hosts: vec![device.device.clone()],
+            commands: vec![user_refresh_command(
+                model,
+                user,
+                device,
+                &ca_api.url(),
+                &provisioner_name,
+                &private_jwk,
+            )],
+            files: vec![
+                private_jwk,
+                user_public_key_path(&device.key_name),
+                user_cert_path(&device.key_name),
+            ],
+            manual: false,
         }],
     })
 }
@@ -726,14 +956,22 @@ pub fn add_user(model: &SiteModel, user: &str) -> Result<Plan> {
                 manual: true,
             },
             PlanStep {
-                id: STEP_ISSUE_USER_CERT.to_owned(),
-                summary: "issue a user cert after policy is merged and reviewed".to_owned(),
+                id: STEP_CREATE_USER_TOKEN.to_owned(),
+                summary: "create an enrollment token, then enroll the user's client host"
+                    .to_owned(),
                 hosts: Vec::new(),
-                commands: vec![format!(
-                    "grafhome-ca plan user-login --user {} --device {}",
-                    sh(user),
-                    sh("<device>")
-                )],
+                commands: vec![
+                    format!(
+                        "grafhome-ca plan create-user-token --user {} --host {}",
+                        sh(user),
+                        sh("<client-host>")
+                    ),
+                    format!(
+                        "grafhome-ca plan enroll-user --user {} --host {}",
+                        sh(user),
+                        sh("<client-host>")
+                    ),
+                ],
                 files: vec![],
                 manual: true,
             },
@@ -749,34 +987,49 @@ fn renewable_hosts(model: &SiteModel) -> impl Iterator<Item = &Host> {
         .filter(|host| host.ssh_server == "yes" && host.renewal_owner != "none")
 }
 
-fn select_user_login_devices<'a>(
+fn active_user<'a>(model: &'a SiteModel, user: &str) -> Result<&'a User> {
+    let user = model.policy.user(user).ok_or_else(|| Error::Validation {
+        field: format!("policy/users.tsv:{user}"),
+        message: "unknown user".to_owned(),
+    })?;
+    if user.status != "active" {
+        return Err(Error::Validation {
+            field: format!("policy/users.tsv:{}.status", user.user),
+            message: "user must be active for certificate enrollment".to_owned(),
+        });
+    }
+    Ok(user)
+}
+
+fn required_user_device<'a>(
     model: &'a SiteModel,
     user: &str,
-    device: Option<&str>,
-) -> Result<Vec<&'a crate::policy::ClientDevice>> {
+    host: &str,
+) -> Result<&'a ClientDevice> {
+    model
+        .policy
+        .active_client_devices_for_user(user)
+        .find(|device| device.device == host)
+        .ok_or_else(|| Error::Validation {
+            field: format!("policy/client-devices.tsv:{host}"),
+            message: format!("no active client host {host} for user {user}"),
+        })
+}
+
+fn select_single_user_device<'a>(model: &'a SiteModel, user: &str) -> Result<&'a ClientDevice> {
     let devices = model
         .policy
         .active_client_devices_for_user(user)
         .collect::<Vec<_>>();
-    if let Some(device) = device {
-        return devices
-            .into_iter()
-            .find(|entry| entry.device == device)
-            .map(|entry| vec![entry])
-            .ok_or_else(|| Error::Validation {
-                field: format!("policy/client-devices.tsv:{device}"),
-                message: format!("no active client device {device} for user {user}"),
-            });
-    }
     match devices.len() {
         0 => Err(Error::Validation {
             field: format!("policy/client-devices.tsv:{user}"),
-            message: "user has no active client devices".to_owned(),
+            message: "user has no active client hosts".to_owned(),
         }),
-        1 => Ok(devices),
+        1 => Ok(devices[0]),
         _ => Err(Error::Validation {
             field: format!("policy/client-devices.tsv:{user}"),
-            message: "multiple active client devices; pass --device".to_owned(),
+            message: "multiple active client hosts; pass --host".to_owned(),
         }),
     }
 }
@@ -930,6 +1183,43 @@ fn proxy_root_cert_path(model: &SiteModel) -> String {
     )
 }
 
+fn host_token_command(
+    model: &SiteModel,
+    host: &Host,
+    provisioner: &str,
+    ca_url: &str,
+    token_ttl: &str,
+    cert_ttl: &str,
+) -> String {
+    let principal_args = host_principal_args(host);
+    format!(
+        "STEPPATH={} {} ca token {} --ssh --host {} --not-after {} --cert-not-after {} --provisioner {} --provisioner-password-file {} --ca-url {} --root {}",
+        sh(&model.deployment.ca_steppath()),
+        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+        sh(&host.host),
+        principal_args,
+        sh(token_ttl),
+        sh(cert_ttl),
+        sh(provisioner),
+        sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+        sh(ca_url),
+        sh(&ca_root_cert_path(model))
+    )
+}
+
+fn host_enroll_command(model: &SiteModel, host: &Host, ca_url: &str) -> String {
+    format!(
+        "STEPPATH={} {} ssh certificate {} {} --host --sign --token {} --ca-url {} --root {} --force",
+        sh(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
+        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+        sh(&host.host),
+        sh(&host_public_key_path(model)),
+        sh("<host-enrollment-token>"),
+        sh(ca_url),
+        sh(&server_root_cert_path(model))
+    )
+}
+
 fn host_renew_command(model: &SiteModel, ca_url: &str, provisioner: &str) -> String {
     let host_key = &model.deployment.values["GRAFHOME_CA_HOST_KEY_PATH"];
     let host_cert = host_cert_path(model);
@@ -944,33 +1234,114 @@ fn host_renew_command(model: &SiteModel, ca_url: &str, provisioner: &str) -> Str
     )
 }
 
-fn host_certificate_command(
+fn user_token_command(
     model: &SiteModel,
-    host: &Host,
+    user: &User,
+    ca_url: &str,
+    token_ttl: &str,
+    cert_ttl: &str,
+) -> String {
+    format!(
+        "STEPPATH={} {} ca token {} --ssh --principal {} --not-after {} --cert-not-after {} --provisioner {} --provisioner-password-file {} --ca-url {} --root {}",
+        sh(&model.deployment.ca_steppath()),
+        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
+        sh(&user.principal),
+        sh(&user.principal),
+        sh(token_ttl),
+        sh(cert_ttl),
+        sh(&user.provisioner),
+        sh(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]),
+        sh(ca_url),
+        sh(&ca_root_cert_path(model))
+    )
+}
+
+fn user_enroll_command(
+    model: &SiteModel,
+    user: &User,
+    device: &ClientDevice,
+    ca_url: &str,
+) -> String {
+    format!(
+        "STEPPATH={} {} ssh certificate {} {} --sign --token {} --ca-url {} --root {} --force --no-agent",
+        sh_home(&user_steppath(model)),
+        USER_STEP_BIN,
+        sh(&user.principal),
+        sh_home(&user_public_key_path(&device.key_name)),
+        sh("<user-enrollment-token>"),
+        sh(ca_url),
+        sh_home(&user_root_cert_path(model))
+    )
+}
+
+fn user_refresh_command(
+    model: &SiteModel,
+    user: &User,
+    device: &ClientDevice,
     ca_url: &str,
     provisioner: &str,
-    ttl: &str,
+    private_jwk: &str,
 ) -> String {
-    let principal_args = host
-        .principals
+    format!(
+        "TOKEN=\"$(STEPPATH={} {} ca token {} --ssh --principal {} --not-after 5m --cert-not-after {} --issuer {} --key {} --password-file {} --ca-url {} --root {})\"; STEPPATH={} {} ssh certificate {} {} --sign --token \"$TOKEN\" --ca-url {} --root {} --force --no-agent",
+        sh_home(&user_steppath(model)),
+        USER_STEP_BIN,
+        sh(&user.principal),
+        sh(&user.principal),
+        sh(&user.cert_ttl),
+        sh(provisioner),
+        sh_home(private_jwk),
+        sh("<user-owned-password-file>"),
+        sh(ca_url),
+        sh_home(&user_root_cert_path(model)),
+        sh_home(&user_steppath(model)),
+        USER_STEP_BIN,
+        sh(&user.principal),
+        sh_home(&user_public_key_path(&device.key_name)),
+        sh(ca_url),
+        sh_home(&user_root_cert_path(model))
+    )
+}
+
+fn register_user_device_provisioner_command(
+    model: &SiteModel,
+    provisioner: &str,
+    public_jwk: &str,
+    template_file: &str,
+) -> String {
+    let user_enrollment =
+        required_provisioner(model, "user_enrollment").expect("validated user_enrollment");
+    let ca_config = format!("{}/config/ca.json", model.deployment.ca_steppath());
+    format!(
+        "{} add-user-device-provisioner --ca-json {} --public-key {} --name {} --ssh-template {} --default-ttl {} --max-ttl {} --out-file {}",
+        sh(&model.deployment.values["GRAFHOME_CA_HELPER_BIN"]),
+        sh(&ca_config),
+        sh(public_jwk),
+        sh(provisioner),
+        sh(template_file),
+        sh(&user_enrollment.default_ttl),
+        sh(&user_enrollment.max_ttl),
+        sh(&ca_config)
+    )
+}
+
+fn write_user_ssh_template_command(path: &str, principal: &str) -> String {
+    let principal_json = serde_json::to_string(principal).expect("principal string serializes");
+    format!(
+        "cat > {} <<'EOF'\n{{\n  \"type\": \"user\",\n  \"keyId\": {{{{ toJson .KeyID }}}},\n  \"principals\": [{}],\n  \"criticalOptions\": {{{{ toJson .CriticalOptions }}}},\n  \"extensions\": {{{{ toJson .Extensions }}}}\n}}\nEOF",
+        sh(path),
+        principal_json
+    )
+}
+
+fn host_principal_args(host: &Host) -> String {
+    host.principals
         .split(',')
         .map(str::trim)
         .filter(|principal| !principal.is_empty())
         .map(|principal| format!("--principal {}", sh(principal)))
         .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "STEPPATH={} {} ssh certificate --ca-url {} --provisioner {} --provisioner-password-file {} --host --sign --force {} --not-after {} {} {}",
-        sh(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
-        sh(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]),
-        sh(ca_url),
-        sh(provisioner),
-        sh("<host-bootstrap-provisioner-password-file>"),
-        principal_args,
-        sh(ttl),
-        sh(&host.host),
-        sh(&host_public_key_path(model))
-    )
+        .join(" ")
 }
 
 fn host_cert_path(model: &SiteModel) -> String {
@@ -984,6 +1355,28 @@ fn host_public_key_path(model: &SiteModel) -> String {
     format!(
         "{}.pub",
         model.deployment.values["GRAFHOME_CA_HOST_KEY_PATH"]
+    )
+}
+
+fn ca_root_cert_path(model: &SiteModel) -> String {
+    format!("{}/certs/root_ca.crt", model.deployment.ca_steppath())
+}
+
+fn server_root_cert_path(model: &SiteModel) -> String {
+    format!(
+        "{}/certs/root_ca.crt",
+        model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]
+    )
+}
+
+fn user_root_cert_path(model: &SiteModel) -> String {
+    format!("{}/certs/root_ca.crt", user_steppath(model))
+}
+
+fn user_steppath(model: &SiteModel) -> String {
+    format!(
+        "$HOME/{}",
+        model.deployment.values["GRAFHOME_CA_USER_STEPPATH"]
     )
 }
 
@@ -1238,6 +1631,13 @@ fn sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn sh_home(value: &str) -> String {
+    let Some(rest) = value.strip_prefix("$HOME/") else {
+        return sh(value);
+    };
+    format!("$HOME/{}", sh(rest))
+}
+
 fn unique_hosts<const N: usize>(hosts: [String; N]) -> Vec<String> {
     let mut hosts = hosts.into_iter().collect::<Vec<_>>();
     hosts.sort();
@@ -1249,8 +1649,39 @@ fn user_public_key_path(key_name: &str) -> String {
     format!("$HOME/.ssh/{key_name}.pub")
 }
 
+fn user_private_key_path(key_name: &str) -> String {
+    format!("$HOME/.ssh/{key_name}")
+}
+
 fn user_cert_path(key_name: &str) -> String {
     format!("$HOME/.ssh/{key_name}-cert.pub")
+}
+
+fn user_key_dir(key_name: &str) -> String {
+    let key = user_private_key_path(key_name);
+    parent_dir(&key)
+}
+
+fn user_device_material_dir(user: &str, host: &str) -> String {
+    format!("$HOME/.config/grafhome-ca/users/{user}/hosts/{host}")
+}
+
+fn user_device_provisioner_name(user: &str, host: &str) -> String {
+    format!("grafhome-user-{user}-{host}")
+}
+
+fn checked_ttl<'a>(field: &str, ttl: &'a str) -> Result<&'a str> {
+    if ttl.is_empty()
+        || !ttl
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'.' | b'h' | b'm' | b's'))
+    {
+        return Err(Error::Validation {
+            field: field.to_owned(),
+            message: "duration must use Smallstep units such as 15m, 24h, or 168h".to_owned(),
+        });
+    }
+    Ok(ttl)
 }
 
 fn reject_root_user_arg(user: &str) -> Result<()> {
@@ -1299,15 +1730,18 @@ fn required_provisioner<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        OP_ADD_HOST, OP_ADD_USER, OP_BACKUP_CA, OP_HOST_BOOTSTRAP, OP_HOST_RENEW,
-        OP_HOST_RENEW_ALL, OP_INIT_CA, OP_PROXY_CERT, OP_USER_LOGIN, OP_VERIFY_LIVE,
-        STEP_ACTIVATE_SERVICE, STEP_BACKUP_CA_STATE, STEP_BOOTSTRAP_HOST, STEP_BOOTSTRAP_TRUST,
-        STEP_EDIT_POLICY, STEP_EXPORT_PUBLIC_MATERIAL, STEP_INITIALIZE_SMALLSTEP_STATE,
-        STEP_INSTALL_CLIENT, STEP_INSTALL_RENDERED_FILES, STEP_ISSUE_HOST_CERT,
-        STEP_ISSUE_USER_CERT, STEP_PROXY_CERT, STEP_RENDER, STEP_RENEW_HOST_CERT,
-        STEP_RESTORE_TEST_BACKUP, STEP_REVIEW_SECRETS, STEP_VERIFY_CA_API, STEP_VERIFY_PROXY_TLS,
-        STEP_VERIFY_SSH, add_host, add_user, backup_ca, host_bootstrap, host_renew, host_renew_all,
-        init_ca, proxy_cert, renewable_hosts, sh, user_login, verify_live,
+        OP_ADD_HOST, OP_ADD_USER, OP_BACKUP_CA, OP_CREATE_HOST_TOKEN, OP_CREATE_USER_TOKEN,
+        OP_ENROLL_HOST, OP_ENROLL_USER, OP_HOST_BOOTSTRAP, OP_HOST_RENEW, OP_HOST_RENEW_ALL,
+        OP_INIT_CA, OP_PROXY_CERT, OP_SSH_ENSURE, OP_VERIFY_LIVE, STEP_ACTIVATE_SERVICE,
+        STEP_BACKUP_CA_STATE, STEP_BOOTSTRAP_HOST, STEP_BOOTSTRAP_TRUST, STEP_CONSUME_HOST_TOKEN,
+        STEP_CONSUME_USER_TOKEN, STEP_CREATE_HOST_TOKEN, STEP_CREATE_USER_PROVISIONER_KEY,
+        STEP_CREATE_USER_TOKEN, STEP_EDIT_POLICY, STEP_ENSURE_USER_CERT,
+        STEP_EXPORT_PUBLIC_MATERIAL, STEP_INITIALIZE_SMALLSTEP_STATE, STEP_INSTALL_CLIENT,
+        STEP_INSTALL_RENDERED_FILES, STEP_PROXY_CERT, STEP_REGISTER_USER_PROVISIONER, STEP_RENDER,
+        STEP_RENEW_HOST_CERT, STEP_RESTORE_TEST_BACKUP, STEP_REVIEW_SECRETS, STEP_VERIFY_CA_API,
+        STEP_VERIFY_PROXY_TLS, STEP_VERIFY_SSH, add_host, add_user, backup_ca, create_host_token,
+        create_user_token, enroll_host, enroll_user, host_bootstrap, host_renew, host_renew_all,
+        init_ca, proxy_cert, renewable_hosts, sh, ssh_ensure, verify_live,
     };
 
     #[test]
@@ -1416,8 +1850,8 @@ mod tests {
                 .commands
                 .iter()
                 .any(|command| command.contains("crypto jwk create")
-                    && command.contains("grafhome-user-login.pub.json")
-                    && command.contains("grafhome-user-login.priv.json"))
+                    && command.contains("grafhome-user-enrollment.pub.json")
+                    && command.contains("grafhome-user-enrollment.priv.json"))
         );
         assert!(
             plan.steps[2]
@@ -1442,7 +1876,7 @@ mod tests {
             plan.steps[2]
                 .commands
                 .iter()
-                .any(|command| command.contains("grafhome-user-login")
+                .any(|command| command.contains("grafhome-user-enrollment")
                     && command.contains("type == \"JWK\""))
         );
         assert!(
@@ -1655,15 +2089,17 @@ mod tests {
             vec![
                 STEP_INSTALL_CLIENT,
                 STEP_BOOTSTRAP_TRUST,
-                STEP_ISSUE_HOST_CERT,
+                STEP_CREATE_HOST_TOKEN,
                 STEP_INSTALL_RENDERED_FILES
             ]
         );
-        assert!(
-            plan.steps
-                .iter()
-                .all(|step| step.hosts == vec!["proxy-host".to_owned()])
+        assert_eq!(plan.steps[0].hosts, vec!["proxy-host".to_owned()]);
+        assert_eq!(plan.steps[1].hosts, vec!["proxy-host".to_owned()]);
+        assert_eq!(
+            plan.steps[2].hosts,
+            vec!["ca-host".to_owned(), "proxy-host".to_owned()]
         );
+        assert_eq!(plan.steps[3].hosts, vec!["proxy-host".to_owned()]);
         assert!(!plan.steps[0].manual);
         assert!(plan.steps[1].manual);
         assert!(plan.steps[1].commands[0].contains("ca bootstrap"));
@@ -1672,16 +2108,13 @@ mod tests {
             plan.steps[1].commands[0].contains("$(cat '<public-material-dir>/root_fingerprint')")
         );
         assert!(plan.steps[1].commands[0].contains("STEPPATH=/etc/step/grafhome"));
-        assert!(plan.steps[2].commands[0].contains("step ssh certificate"));
-        assert!(plan.steps[2].commands[0].contains("--host"));
-        assert!(
-            plan.steps[2].commands[0].contains(
-                "--provisioner-password-file '<host-bootstrap-provisioner-password-file>'"
-            )
+        assert_eq!(
+            plan.steps[2].commands,
+            vec![
+                "grafhome-ca plan create-host-token --host proxy-host",
+                "grafhome-ca plan enroll-host --host proxy-host"
+            ]
         );
-        assert!(plan.steps[2].commands[0].contains("--principal proxy-host"));
-        assert!(plan.steps[2].commands[0].contains("--principal ca.example.test"));
-        assert!(plan.steps[2].commands[0].contains("/etc/ssh/ssh_host_ed25519_key.pub"));
         assert!(
             plan.steps[2]
                 .files
@@ -1706,6 +2139,18 @@ mod tests {
                 .commands
                 .iter()
                 .any(|command| command.contains("/etc/ssh/sshd_config.d/grafhome-ca.conf"))
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command == "sshd -t")
+        );
+        assert!(
+            plan.steps[3]
+                .commands
+                .iter()
+                .any(|command| command == "systemctl reload ssh || systemctl reload sshd")
         );
         assert!(
             !plan.steps[3]
@@ -1783,55 +2228,130 @@ mod tests {
     }
 
     #[test]
-    fn plans_user_login_without_running_step() {
+    fn plans_host_token_creation_with_short_lived_token_and_configured_cert_ttl() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let plan = user_login(&model, "alice", Some("ca-host")).unwrap();
+        let plan = create_host_token(&model, "proxy-host", None, Some("168h")).unwrap();
 
-        assert_eq!(plan.operation, OP_USER_LOGIN);
-        assert_eq!(step_ids(&plan), vec![STEP_ISSUE_USER_CERT]);
-        assert!(plan.steps[0].hosts.is_empty());
+        assert_eq!(plan.operation, OP_CREATE_HOST_TOKEN);
+        assert_eq!(step_ids(&plan), vec![STEP_CREATE_HOST_TOKEN]);
+        assert_eq!(plan.steps[0].hosts, vec!["ca-host".to_owned()]);
         assert!(plan.steps[0].manual);
-        assert!(plan.steps[0].commands[0].contains("step ssh certificate"));
-        assert!(plan.steps[0].commands[0].contains("--sign"));
-        assert!(plan.steps[0].commands[0].contains("--provisioner grafhome-user-login"));
-        assert!(
-            plan.steps[0].commands[0]
-                .contains("--provisioner-password-file '<user-login-provisioner-password-file>'")
-        );
-        assert!(plan.steps[0].commands[0].contains("STEPPATH=$HOME/.config/grafhome/step"));
-        assert!(
-            plan.steps[0]
-                .commands
-                .iter()
-                .any(|command| command.contains("$HOME/.ssh/alice_ca_host_ed25519.pub"))
-        );
-        assert!(
-            plan.steps[0]
-                .files
-                .contains(&"$HOME/.ssh/alice_ca_host_ed25519-cert.pub".to_owned())
-        );
+        assert!(plan.steps[0].commands[0].contains("step ca token proxy-host"));
+        assert!(plan.steps[0].commands[0].contains("--ssh --host"));
+        assert!(plan.steps[0].commands[0].contains("--principal proxy-host"));
+        assert!(plan.steps[0].commands[0].contains("--not-after 15m"));
+        assert!(plan.steps[0].commands[0].contains("--cert-not-after 168h"));
+        assert!(plan.steps[0].commands[0].contains(
+            "--provisioner-password-file /srv/example-ca/secrets/intermediate_ca_password"
+        ));
     }
 
     #[test]
-    fn user_login_plan_requires_device_for_multi_device_users() {
+    fn plans_host_enrollment_without_provisioner_password_on_target() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let error = user_login(&model, "alice", None).unwrap_err().to_string();
+        let plan = enroll_host(&model, "proxy-host").unwrap();
 
-        assert!(error.contains("multiple active client devices"));
+        assert_eq!(plan.operation, OP_ENROLL_HOST);
+        assert_eq!(step_ids(&plan), vec![STEP_CONSUME_HOST_TOKEN]);
+        assert_eq!(plan.steps[0].hosts, vec!["proxy-host".to_owned()]);
+        assert!(plan.steps[0].commands[0].contains("step ssh certificate proxy-host"));
+        assert!(plan.steps[0].commands[0].contains("--token '<host-enrollment-token>'"));
+        assert!(!plan.steps[0].commands[0].contains("--provisioner-password-file"));
+        assert!(plan.steps[0].commands[1].contains("sshd -t"));
     }
 
     #[test]
-    fn user_login_plan_rejects_unknown_device() {
+    fn plans_user_token_creation_for_client_host() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let error = user_login(&model, "alice", Some("missing"))
+        let plan = create_user_token(&model, "alice", "ca-host", None, Some("24h")).unwrap();
+
+        assert_eq!(plan.operation, OP_CREATE_USER_TOKEN);
+        assert_eq!(step_ids(&plan), vec![STEP_CREATE_USER_TOKEN]);
+        assert_eq!(plan.steps[0].hosts, vec!["ca-host".to_owned()]);
+        assert!(plan.steps[0].commands[0].contains("step ca token alice"));
+        assert!(plan.steps[0].commands[0].contains("--principal alice"));
+        assert!(plan.steps[0].commands[0].contains("--not-after 15m"));
+        assert!(plan.steps[0].commands[0].contains("--cert-not-after 24h"));
+        assert!(plan.steps[0].commands[0].contains("--provisioner grafhome-user-enrollment"));
+    }
+
+    #[test]
+    fn token_creation_reports_missing_ca_api_endpoint() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model
+            .policy
+            .endpoints
+            .retain(|endpoint| endpoint.role != "ca_api");
+
+        let host_error = create_host_token(&model, "ca-host", None, None)
+            .unwrap_err()
+            .to_string();
+        let user_error = create_user_token(&model, "alice", "ca-host", None, None)
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("no active client device missing"));
+        assert!(host_error.contains("missing required endpoint"));
+        assert!(host_error.contains("ca_api"));
+        assert!(user_error.contains("missing required endpoint"));
+        assert!(user_error.contains("ca_api"));
     }
 
     #[test]
-    fn user_login_plan_rejects_disabled_user() {
+    fn plans_user_enrollment_with_constrained_device_jwk() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let plan = enroll_user(&model, "alice", "ca-host").unwrap();
+
+        assert_eq!(plan.operation, OP_ENROLL_USER);
+        assert_eq!(
+            step_ids(&plan),
+            vec![
+                STEP_CONSUME_USER_TOKEN,
+                STEP_CREATE_USER_PROVISIONER_KEY,
+                STEP_REGISTER_USER_PROVISIONER
+            ]
+        );
+        assert!(plan.steps[0].commands[2].contains("step ssh certificate alice"));
+        assert!(plan.steps[0].commands[2].contains("--token '<user-enrollment-token>'"));
+        assert!(plan.steps[1].commands[1].contains("crypto jwk create"));
+        assert!(
+            plan.steps[1].commands[1].contains(
+                "$HOME/.config/grafhome-ca/users/alice/hosts/ca-host/provisioner.pub.json"
+            )
+        );
+        assert!(plan.steps[2].commands[0].contains("scp"));
+        assert!(
+            plan.steps[2].commands[0].contains(
+                "$HOME/.config/grafhome-ca/users/alice/hosts/ca-host/provisioner.pub.json"
+            )
+        );
+        assert!(plan.steps[2].commands[2].contains("\"principals\": [\"alice\"]"));
+        assert!(
+            plan.steps[2].commands[3].contains(
+                "add-user-device-provisioner --ca-json /srv/example-ca/step/config/ca.json"
+            )
+        );
+        assert!(plan.steps[2].commands[3].contains("--name grafhome-user-alice-ca-host"));
+        assert!(plan.steps[2].commands[3].contains("--default-ttl 24h"));
+        assert!(plan.steps[2].commands[3].contains("--ssh-template"));
+    }
+
+    #[test]
+    fn plans_ssh_ensure_as_non_manual_local_reissue() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let plan = ssh_ensure(&model, "alice", Some("ca-host")).unwrap();
+
+        assert_eq!(plan.operation, OP_SSH_ENSURE);
+        assert_eq!(step_ids(&plan), vec![STEP_ENSURE_USER_CERT]);
+        assert!(!plan.steps[0].manual);
+        assert_eq!(plan.steps[0].hosts, vec!["ca-host".to_owned()]);
+        assert!(plan.steps[0].commands[0].contains("ca token alice"));
+        assert!(plan.steps[0].commands[0].contains("--issuer grafhome-user-alice-ca-host"));
+        assert!(plan.steps[0].commands[0].contains("--cert-not-after 24h"));
+        assert!(plan.steps[0].commands[0].contains("step ssh certificate alice"));
+    }
+
+    #[test]
+    fn user_enrollment_plan_rejects_disabled_user() {
         let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
         model
             .policy
@@ -1840,7 +2360,7 @@ mod tests {
             .find(|user| user.user == "alice")
             .unwrap()
             .status = "disabled".to_owned();
-        let error = user_login(&model, "alice", Some("ca-host"))
+        let error = create_user_token(&model, "alice", "ca-host", None, None)
             .unwrap_err()
             .to_string();
 
@@ -1891,7 +2411,7 @@ mod tests {
         assert_eq!(plan.operation, OP_ADD_USER);
         assert_eq!(
             step_ids(&plan),
-            vec![STEP_EDIT_POLICY, STEP_ISSUE_USER_CERT]
+            vec![STEP_EDIT_POLICY, STEP_CREATE_USER_TOKEN]
         );
         assert!(plan.steps[0].files.contains(&"policy/users.tsv".to_owned()));
         assert!(
@@ -1902,7 +2422,10 @@ mod tests {
         assert!(plan.steps[1].hosts.is_empty());
         assert_eq!(
             plan.steps[1].commands,
-            vec!["grafhome-ca plan user-login --user new-user --device '<device>'"]
+            vec![
+                "grafhome-ca plan create-user-token --user new-user --host '<client-host>'",
+                "grafhome-ca plan enroll-user --user new-user --host '<client-host>'"
+            ]
         );
     }
 

@@ -86,8 +86,8 @@ fn rendered_config_can_start_throwaway_step_ca() {
         .arg("crypto")
         .arg("jwk")
         .arg("create")
-        .arg(jwk_dir.join("grafhome-user-login.pub.json"))
-        .arg(jwk_dir.join("grafhome-user-login.priv.json"))
+        .arg(jwk_dir.join("grafhome-user-enrollment.pub.json"))
+        .arg(jwk_dir.join("grafhome-user-enrollment.priv.json"))
         .arg("--password-file")
         .arg(&password));
     let materialized = grafhome_ca::runtime_provisioners::materialize(
@@ -102,6 +102,7 @@ fn rendered_config_can_start_throwaway_step_ca() {
 
     let config_path = steppath.join("config/rendered-ca.json");
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    add_test_user_device_provisioner(temp.path(), &config_path, &password);
     let child = Command::new("step-ca")
         .arg(&config_path)
         .arg("--password-file")
@@ -253,27 +254,46 @@ fn exercise_public_export_and_host_certificate_lifecycle(
         .arg(&host_key));
     let host_public_key = temp.join("ssh_host_ed25519_key.pub");
     let host_cert = temp.join("ssh_host_ed25519_key-cert.pub");
+    let host_token = token(
+        Command::new("step")
+            .env("STEPPATH", temp.join("step"))
+            .arg("ca")
+            .arg("token")
+            .arg("edge-host")
+            .arg("--ssh")
+            .arg("--host")
+            .arg("--principal")
+            .arg("edge-host")
+            .arg("--principal")
+            .arg("edge-host.example.test")
+            .arg("--not-after")
+            .arg("15m")
+            .arg("--cert-not-after")
+            .arg("168h")
+            .arg("--provisioner")
+            .arg("grafhome-host-bootstrap")
+            .arg("--provisioner-password-file")
+            .arg(password)
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt")),
+    );
     run(Command::new("step")
         .env("STEPPATH", &client_steppath)
         .arg("ssh")
         .arg("certificate")
-        .arg("--ca-url")
-        .arg(format!("https://{address}"))
-        .arg("--provisioner")
-        .arg("grafhome-host-bootstrap")
-        .arg("--provisioner-password-file")
-        .arg(password)
+        .arg("edge-host")
+        .arg(&host_public_key)
         .arg("--host")
         .arg("--sign")
-        .arg("--force")
-        .arg("--principal")
-        .arg("edge-host")
-        .arg("--principal")
-        .arg("edge-host.example.test")
-        .arg("--not-after")
-        .arg("720h")
-        .arg("edge-host")
-        .arg(&host_public_key));
+        .arg("--token")
+        .arg(host_token.trim())
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--root")
+        .arg(temp.join("step/certs/root_ca.crt"))
+        .arg("--force"));
     assert!(host_cert.exists());
 
     run(Command::new("step")
@@ -298,22 +318,258 @@ fn exercise_public_export_and_host_certificate_lifecycle(
         .arg(&user_key));
     let user_public_key = temp.join("id_ed25519.pub");
     let user_cert = temp.join("id_ed25519-cert.pub");
+    let user_enrollment_token = token(
+        Command::new("step")
+            .env("STEPPATH", temp.join("step"))
+            .arg("ca")
+            .arg("token")
+            .arg("alice")
+            .arg("--ssh")
+            .arg("--principal")
+            .arg("alice")
+            .arg("--not-after")
+            .arg("15m")
+            .arg("--cert-not-after")
+            .arg("24h")
+            .arg("--provisioner")
+            .arg("grafhome-user-enrollment")
+            .arg("--provisioner-password-file")
+            .arg(password)
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt")),
+    );
     run(Command::new("step")
         .env("STEPPATH", &client_steppath)
         .arg("ssh")
         .arg("certificate")
+        .arg("alice")
+        .arg(&user_public_key)
+        .arg("--sign")
+        .arg("--token")
+        .arg(user_enrollment_token.trim())
         .arg("--ca-url")
         .arg(format!("https://{address}"))
-        .arg("--provisioner")
-        .arg("grafhome-user-login")
-        .arg("--provisioner-password-file")
-        .arg(password)
-        .arg("--sign")
-        .arg("--principal")
-        .arg("alice")
-        .arg("--not-after")
-        .arg("1h")
-        .arg("alice")
-        .arg(&user_public_key));
+        .arg("--root")
+        .arg(temp.join("step/certs/root_ca.crt"))
+        .arg("--force")
+        .arg("--no-agent"));
     assert!(user_cert.exists());
+
+    let user_refresh_token = token(
+        Command::new("step")
+            .env("STEPPATH", &client_steppath)
+            .arg("ca")
+            .arg("token")
+            .arg("alice")
+            .arg("--ssh")
+            .arg("--principal")
+            .arg("alice")
+            .arg("--not-after")
+            .arg("5m")
+            .arg("--cert-not-after")
+            .arg("24h")
+            .arg("--issuer")
+            .arg("grafhome-user-alice-ca-host")
+            .arg("--key")
+            .arg(temp.join("alice-ca-host.priv.json"))
+            .arg("--password-file")
+            .arg(password)
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt")),
+    );
+    run(Command::new("step")
+        .env("STEPPATH", &client_steppath)
+        .arg("ssh")
+        .arg("certificate")
+        .arg("alice")
+        .arg(&user_public_key)
+        .arg("--sign")
+        .arg("--token")
+        .arg(user_refresh_token.trim())
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--root")
+        .arg(temp.join("step/certs/root_ca.crt"))
+        .arg("--force")
+        .arg("--no-agent"));
+    assert!(user_cert.exists());
+
+    let x509_token = token(
+        Command::new("step")
+            .env("STEPPATH", &client_steppath)
+            .arg("ca")
+            .arg("token")
+            .arg("attacker.example")
+            .arg("--issuer")
+            .arg("grafhome-user-alice-ca-host")
+            .arg("--key")
+            .arg(temp.join("alice-ca-host.priv.json"))
+            .arg("--password-file")
+            .arg(password)
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt")),
+    );
+    run_fails(
+        Command::new("step")
+            .env("STEPPATH", &client_steppath)
+            .arg("ca")
+            .arg("certificate")
+            .arg("attacker.example")
+            .arg(temp.join("attacker.crt"))
+            .arg(temp.join("attacker.key"))
+            .arg("--token")
+            .arg(x509_token.trim())
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt"))
+            .arg("--force"),
+    );
+
+    let user_host_token = token(
+        Command::new("step")
+            .env("STEPPATH", &client_steppath)
+            .arg("ca")
+            .arg("token")
+            .arg("user-owned-host")
+            .arg("--ssh")
+            .arg("--host")
+            .arg("--principal")
+            .arg("user-owned-host")
+            .arg("--not-after")
+            .arg("5m")
+            .arg("--cert-not-after")
+            .arg("24h")
+            .arg("--issuer")
+            .arg("grafhome-user-alice-ca-host")
+            .arg("--key")
+            .arg(temp.join("alice-ca-host.priv.json"))
+            .arg("--password-file")
+            .arg(password)
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt")),
+    );
+    let user_owned_host_key = temp.join("user-owned-host");
+    run(Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(&user_owned_host_key));
+    let user_owned_host_cert = temp.join("user-owned-host-cert.pub");
+    run(Command::new("step")
+        .env("STEPPATH", &client_steppath)
+        .arg("ssh")
+        .arg("certificate")
+        .arg("user-owned-host")
+        .arg(user_owned_host_key.with_extension("pub"))
+        .arg("--host")
+        .arg("--sign")
+        .arg("--token")
+        .arg(user_host_token.trim())
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--root")
+        .arg(temp.join("step/certs/root_ca.crt"))
+        .arg("--force"));
+    let cert_details = stdout(
+        Command::new("ssh-keygen")
+            .arg("-L")
+            .arg("-f")
+            .arg(&user_owned_host_cert),
+    );
+    assert!(cert_details.contains("Type: ssh-ed25519-cert-v01@openssh.com user certificate"));
+    assert!(cert_details.contains("Principals:"));
+    assert!(cert_details.contains("alice"));
+    assert!(!cert_details.contains("host certificate"));
+}
+
+fn add_test_user_device_provisioner(
+    temp: &std::path::Path,
+    config_path: &std::path::Path,
+    password: &std::path::Path,
+) {
+    let public_jwk = temp.join("alice-ca-host.pub.json");
+    let private_jwk = temp.join("alice-ca-host.priv.json");
+    run(Command::new("step")
+        .arg("crypto")
+        .arg("jwk")
+        .arg("create")
+        .arg(&public_jwk)
+        .arg(&private_jwk)
+        .arg("--password-file")
+        .arg(password));
+    let template = temp.join("alice-ca-host.tpl");
+    std::fs::write(
+        &template,
+        r#"{
+  "type": "user",
+  "keyId": {{ toJson .KeyID }},
+  "principals": ["alice"],
+  "criticalOptions": {{ toJson .CriticalOptions }},
+  "extensions": {{ toJson .Extensions }}
+}
+"#,
+    )
+    .unwrap();
+    let text = grafhome_ca::runtime_provisioners::add_user_device(
+        config_path,
+        &public_jwk,
+        "grafhome-user-alice-ca-host",
+        template.to_str().unwrap(),
+        "24h",
+        "168h",
+    )
+    .unwrap();
+    let config: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let provisioner = config["authority"]["provisioners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "grafhome-user-alice-ca-host")
+        .unwrap();
+    assert!(provisioner["claims"]["defaultHostSSHCertDuration"].is_null());
+    assert!(provisioner["claims"]["maxHostSSHCertDuration"].is_null());
+    std::fs::write(config_path, text).unwrap();
+}
+
+fn token(command: &mut Command) -> String {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "token command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn stdout(command: &mut Command) -> String {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn run_fails(command: &mut Command) {
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

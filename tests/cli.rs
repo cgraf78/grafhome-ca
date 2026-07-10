@@ -104,19 +104,6 @@ fn init_dry_run_matches_init_plan_output() {
 }
 
 #[test]
-fn ssh_login_live_issuance_is_gated() {
-    let mut cmd = Command::cargo_bin("grafhome-ssh-login").expect("binary exists");
-
-    cmd.arg("--user")
-        .arg("alice")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "live certificate issuance is not implemented",
-        ));
-}
-
-#[test]
 fn render_dry_run_lists_staged_files() {
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
@@ -320,7 +307,7 @@ fn materialize_test_ca_fixture_emits_parseable_placeholder_free_json() {
         "/dev/null/grafhome-ca-test-fixture/step/db"
     );
     assert!(provisioners.iter().any(|item| {
-        item["name"] == "grafhome-user-login"
+        item["name"] == "grafhome-user-enrollment"
             && item["type"] == "JWK"
             && item["key"]["kty"] == "EC"
             && item.get("encryptedKey").is_none()
@@ -366,13 +353,13 @@ fn materialize_runtime_provisioners_writes_placeholder_free_ca_json() {
     let jwk_dir = dir.path().join("provisioners");
     fs::create_dir(&jwk_dir).unwrap();
     fs::write(
-        jwk_dir.join("grafhome-user-login.pub.json"),
-        r#"{"kid":"user-login-kid","kty":"EC"}"#,
+        jwk_dir.join("grafhome-user-enrollment.pub.json"),
+        r#"{"kid":"user-enrollment-kid","kty":"EC"}"#,
     )
     .unwrap();
     fs::write(
-        jwk_dir.join("grafhome-user-login.priv.json"),
-        "{\n  \"protected\": \"encrypted-user-login\"\n}\n",
+        jwk_dir.join("grafhome-user-enrollment.priv.json"),
+        "{\n  \"protected\": \"encrypted-user-enrollment\"\n}\n",
     )
     .unwrap();
     let out_file = dir.path().join("materialized-ca.json");
@@ -410,12 +397,12 @@ fn materialize_runtime_provisioners_writes_placeholder_free_ca_json() {
     assert!(provisioners.iter().any(|item| {
         item["name"] == "grafhome-host-bootstrap"
             && item["encryptedKey"] == "encrypted-bootstrap"
-            && item["claims"]["defaultHostSSHCertDuration"] == "720h"
+            && item["claims"]["defaultHostSSHCertDuration"] == "168h"
     }));
     assert!(provisioners.iter().any(|item| {
-        item["name"] == "grafhome-user-login"
-            && item["key"]["kid"] == "user-login-kid"
-            && item["claims"]["defaultUserSSHCertDuration"] == "16h"
+        item["name"] == "grafhome-user-enrollment"
+            && item["key"]["kid"] == "user-enrollment-kid"
+            && item["claims"]["defaultUserSSHCertDuration"] == "24h"
     }));
     assert!(
         provisioners
@@ -425,40 +412,95 @@ fn materialize_runtime_provisioners_writes_placeholder_free_ca_json() {
 }
 
 #[test]
-fn plan_user_login_can_emit_json() {
+fn add_user_device_provisioner_writes_constrained_jwk_provisioner() {
+    let dir = tempdir().unwrap();
+    let ca_json = dir.path().join("ca.json");
+    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    let public_key = dir.path().join("provisioner.pub.json");
+    fs::write(&public_key, r#"{"kid":"device-kid","kty":"EC"}"#).unwrap();
+    let template = dir.path().join("user.tpl");
+    fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
+    let out_file = dir.path().join("out-ca.json");
+
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .arg("add-user-device-provisioner")
+        .arg("--ca-json")
+        .arg(&ca_json)
+        .arg("--public-key")
+        .arg(&public_key)
+        .arg("--name")
+        .arg("grafhome-user-alice-ca-host")
+        .arg("--ssh-template")
+        .arg(&template)
+        .arg("--default-ttl")
+        .arg("24h")
+        .arg("--max-ttl")
+        .arg("168h")
+        .arg("--out-file")
+        .arg(&out_file)
+        .assert()
+        .success();
+
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&out_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(out_file).unwrap()).unwrap();
+    let provisioner = &value["authority"]["provisioners"][0];
+    assert_eq!(provisioner["name"], "grafhome-user-alice-ca-host");
+    assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
+    assert!(provisioner["claims"]["defaultHostSSHCertDuration"].is_null());
+    assert!(
+        provisioner["options"]["x509"]["template"]
+            .as_str()
+            .unwrap()
+            .contains("x509 issuance disabled")
+    );
+    assert_eq!(
+        provisioner["options"]["ssh"]["template"],
+        r#"{"type":"user","principals":["alice"]}"#
+    );
+}
+
+#[test]
+fn plan_user_enrollment_commands_can_emit_json() {
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.arg("plan")
         .arg("--config-root")
         .arg(example_config_root())
         .arg("--json")
-        .arg("user-login")
+        .arg("enroll-user")
         .arg("--user")
         .arg("alice")
-        .arg("--device")
+        .arg("--host")
         .arg("ca-host")
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"operation\": \"user-login\""))
+        .stdout(predicate::str::contains("\"operation\": \"enroll-user\""))
         .stdout(predicate::str::contains("step ssh certificate"))
         .stdout(predicate::str::contains("--sign"))
-        .stdout(predicate::str::contains("grafhome-user-login"))
+        .stdout(predicate::str::contains("crypto jwk create"))
+        .stdout(predicate::str::contains("grafhome-user-alice-ca-host"))
         .stdout(predicate::str::contains("alice_ca_host_ed25519.pub"));
 }
 
 #[test]
-fn plan_user_login_requires_device_for_multi_device_user() {
+fn plan_ssh_ensure_requires_host_for_multi_host_user() {
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.arg("plan")
         .arg("--config-root")
         .arg(example_config_root())
-        .arg("user-login")
+        .arg("ssh-ensure")
         .arg("--user")
         .arg("alice")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("multiple active client devices"));
+        .stderr(predicate::str::contains("multiple active client hosts"));
 }
 
 #[test]
@@ -500,7 +542,11 @@ fn every_plan_json_command_matches_plan_schema() {
         &["backup-ca"],
         &["verify-live", "--host", "ca-host"],
         &["proxy-cert"],
-        &["user-login", "--user", "alice", "--device", "ca-host"],
+        &["create-host-token", "--host", "ca-host"],
+        &["enroll-host", "--host", "ca-host"],
+        &["create-user-token", "--user", "alice", "--host", "ca-host"],
+        &["enroll-user", "--user", "alice", "--host", "ca-host"],
+        &["ssh-ensure", "--user", "alice", "--host", "ca-host"],
         &["add-host", "--host", "new-host"],
         &["add-user", "--user", "new-user"],
     ];

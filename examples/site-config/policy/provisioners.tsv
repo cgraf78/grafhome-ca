@@ -1,5 +1,5 @@
 role	name	type	default_ttl	max_ttl	renewal_check	status	notes
-host_bootstrap	grafhome-host-bootstrap	JWK	720h	720h	manual	active	one-time host enrollment
-host_renew	grafhome-host-renew	SSHPOP	720h	720h	8h-jitter	active	host cert renewal only
-user_login	grafhome-user-login	JWK	16h	16h	manual	active	user certificate issuance; user authorization enforced by policy
+host_bootstrap	grafhome-host-bootstrap	JWK	168h	720h	manual	active	one-time host enrollment tokens
+host_renew	grafhome-host-renew	SSHPOP	168h	720h	8h-jitter	active	host cert renewal only
+user_enrollment	grafhome-user-enrollment	JWK	24h	168h	manual	active	user enrollment tokens; per-client JWK provisioners handle refresh
 proxy_x509	grafhome-x509-ca-proxy	ACME	720h	720h	24h-jitter	active	X.509 for ca_api.dns_name and ca_origin.dns_name only

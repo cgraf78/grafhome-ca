@@ -14,7 +14,11 @@
         "backup-ca",
         "verify-live",
         "proxy-cert",
-        "user-login",
+        "create-host-token",
+        "enroll-host",
+        "create-user-token",
+        "enroll-user",
+        "ssh-ensure",
         "add-host",
         "add-user"
       ]
@@ -43,15 +47,20 @@
             "install-client",
             "bootstrap-trust",
             "install-rendered-files",
-            "issue-host-cert",
             "renew-host-cert",
-            "issue-user-cert",
             "proxy-cert",
             "verify-ca-api",
             "verify-ssh",
             "verify-proxy-tls",
             "edit-policy",
-            "bootstrap-host"
+            "bootstrap-host",
+            "create-host-token",
+            "consume-host-token",
+            "create-user-token",
+            "consume-user-token",
+            "create-user-provisioner-key",
+            "register-user-provisioner",
+            "ensure-user-cert"
           ]
         },
         "summary": { "$ref": "#/definitions/nonEmptyString" },
