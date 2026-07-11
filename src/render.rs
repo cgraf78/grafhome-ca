@@ -404,11 +404,6 @@ fn provisioners_json(provisioners: &[Provisioner]) -> Result<String> {
         let claims = provisioner_claims(provisioner)?;
         let value = match provisioner.r#type.as_str() {
             "JWK" => json!(provisioner_placeholder(&provisioner.name)),
-            "SSHPOP" => json!({
-                "type": "SSHPOP",
-                "name": provisioner.name,
-                "claims": claims
-            }),
             "ACME" => json!({
                 "type": "ACME",
                 "name": provisioner.name,
@@ -451,7 +446,7 @@ pub fn active_provisioner_claims(model: &SiteModel, name: &str) -> Result<Value>
 
 fn provisioner_claims(provisioner: &Provisioner) -> Result<Value> {
     let claims = match provisioner.role.as_str() {
-        "host_bootstrap" | "host_renew" => json!({
+        "host_bootstrap" => json!({
             "defaultHostSSHCertDuration": provisioner.default_ttl,
             "maxHostSSHCertDuration": provisioner.max_ttl,
             "enableSSHCA": true
@@ -813,7 +808,7 @@ mod tests {
         assert!(ca_json.content.contains(
             "\"RUNTIME_SECRET_PLACEHOLDER:GRAFHOME_CA_PROVISIONER_GRAFHOME_USER_ENROLLMENT_JSON\""
         ));
-        assert!(ca_json.content.contains("\"type\": \"SSHPOP\""));
+        assert!(!ca_json.content.contains("\"type\": \"SSHPOP\""));
         assert!(!ca_json.content.contains("${GRAFHOME_CA_"));
         assert!(!ca_json.content.contains("templateFile"));
     }

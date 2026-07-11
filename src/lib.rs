@@ -5,6 +5,7 @@
 //! Smallstep protocol; `step-ca` and `step` remain the cryptographic boundary.
 
 pub mod config;
+pub mod enrollment;
 pub mod error;
 pub mod lifecycle;
 pub mod model;

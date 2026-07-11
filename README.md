@@ -42,12 +42,6 @@ Validate the checked-in example config:
 cargo run --bin grafhome-ca -- check --config-root examples/site-config
 ```
 
-Run config-only doctor:
-
-```sh
-cargo run --bin grafhome-ca -- doctor --config-only
-```
-
 Show derived CA endpoints:
 
 ```sh
@@ -113,75 +107,103 @@ Generate lifecycle plans without executing any commands:
 
 ```sh
 cargo run --bin grafhome-ca -- plan init-ca
-cargo run --bin grafhome-ca -- plan host-bootstrap --host ca-host
-cargo run --bin grafhome-ca -- plan create-host-token --host ca-host
-cargo run --bin grafhome-ca -- plan enroll-host --host ca-host
-cargo run --bin grafhome-ca -- plan host-renew --host ca-host
-cargo run --bin grafhome-ca -- plan host-renew-all
 cargo run --bin grafhome-ca -- plan backup-ca
 cargo run --bin grafhome-ca -- plan proxy-cert
 cargo run --bin grafhome-ca -- plan verify-live --host ca-host
-cargo run --bin grafhome-ca -- plan create-user-token --user alice --host ca-host
-cargo run --bin grafhome-ca -- plan enroll-user --user alice --host ca-host
-cargo run --bin grafhome-ca -- plan ssh-ensure --user alice --host ca-host
 cargo run --bin grafhome-ca -- plan add-host --host new-host
 cargo run --bin grafhome-ca -- plan add-user --user new-user
 ```
 
-Plans can also be emitted as JSON for tests, scripts, or future executors:
+Host enrollment uses the same request-and-approval shape as user enrollment:
 
 ```sh
-cargo run --bin grafhome-ca -- plan --json enroll-user --user alice --host ca-host
+# Target host as root. Leave this running after copying its REQUEST line.
+grafhome-ca enroll-host
+
+# CA origin as root. Paste the REQUEST, press Ctrl-D, approve it, and copy GRANT.
+grafhome-ca approve-host
 ```
 
-Run the enrollment executor commands after reviewing the corresponding plans:
+The target generates its host-scoped renewal JWK locally; only its public half
+leaves the host. After the grant is pasted back, `enroll-host` installs the SSH
+host certificate and trust configuration, proves JWK renewal works, validates
+`sshd`, and reloads it. Scheduled renewal runs `grafhome-ca renew-host`; the
+existing lifecycle plans retain each host's configured renewal owner.
+
+User enrollment requires one public request copied to the CA and one secret
+grant copied back. User and host default to the current account and short
+hostname, so normal enrollment needs no identity flags:
 
 ```sh
-# CA origin/operator host.
-cargo run --bin grafhome-ca -- ca-fingerprint
-cargo run --bin grafhome-ca -- create-host-token --host ca-host
-cargo run --bin grafhome-ca -- create-user-token --user alice --host ca-host
+# Client device. Enter the renewal password once and leave this running.
+# Copy its REQUEST line to the CA, then paste the returned GRANT here.
+grafhome-ca enroll-user
 
-# SSH server host root account. Reads the host enrollment token from stdin.
-cargo run --bin grafhome-ca -- bootstrap-host-trust
-cargo run --bin grafhome-ca -- enroll-host --host ca-host
+# CA origin as root. Paste the REQUEST line, press Ctrl-D, and approve it.
+grafhome-ca approve-user
 
-# User client account. `bootstrap-client` reads the root fingerprint from stdin.
-# `enroll-user` reads two stdin lines: the enrollment token, then the
-# user-owned refresh password. It prints a pasteable `authorize-user` command
-# containing the public renewal JWK for the CA operator.
-cargo run --bin grafhome-ca -- bootstrap-client
-cargo run --bin grafhome-ca -- enroll-user --user alice --host ca-host
-cargo run --bin grafhome-ca -- ssh-ensure --user alice --host ca-host
-
-# CA origin/operator host. Paste the `authorize-user` here-doc printed by
-# `enroll-user`; the renewal JWK is public and does not require SSH access from
-# the new client to the CA host.
-grafhome-ca authorize-user --user alice --host ca-host <<'GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY'
-{"kty":"OKP","kid":"example-public-key"}
-GRAFHOME_CA_USER_RENEWAL_PUBLIC_KEY
+# Normal use after enrollment.
+ssh ca-host
 ```
 
-Enrollment secrets default to stdin so tokens and user-owned passwords do not
-need to appear in shell history. `enroll-host` reads one line containing the
-host token. `enroll-user` reads the user token first and the refresh password
-second. `ssh-ensure` reads the refresh password. `authorize-user` reads the
-user/client-host public JWK from stdin by default. File overrides exist for automation:
-`--token-file`, `--password-file`, `--fingerprint-file`, and `--public-key`.
-Smallstep accepts signing tokens only as command arguments, so executor errors
-redact token values but process listings can briefly show the child `step`
-command while certificate signing is running.
+Scheduled renewal should run `grafhome-ca renew-host` as root for hosts and
+`grafhome-ca ssh-ensure` as the enrolled user for user certificates. Both
+commands use the local identity by default and skip certificates that Smallstep
+reports as fresh. Grafhome's private dotfiles install these jobs every eight
+hours. Those jobs first call `enrollment-status --quiet --renewable`, so
+machines without a completed local enrollment remain idle. User enrollment
+stores the password in an encrypted systemd user credential for unattended
+renewal, in addition to Secret Service when available. Other deployments must
+provide equivalent scheduling.
 
-Guarded live-operation stubs:
+`enroll-user` generates the SSH and renewal keys, stores the renewal password,
+prints the public request, and waits for the grant. After the grant is pasted,
+the same process bootstraps pinned CA trust, obtains the initial certificate,
+installs stable `$HOME/.ssh/<user>.key*` aliases, verifies renewal, and removes
+pending state. A terminated process can resume from that pending state by
+running `enroll-user` again. File overrides exist for automation:
+`--request-file`, `--grant-file`, and `--password-file`; `--request-only` emits
+the request without waiting. `approve-user --yes` skips operator confirmation.
+
+CA-side revocation does not require a certificate serial:
 
 ```sh
-cargo run --bin grafhome-ca -- init-ca --dry-run
+# Disable the host identity and every user device enrolled on that host.
+grafhome-ca revoke-host --host ca-host
+
+# Disable every enrolled device for a user, or only one device.
+grafhome-ca revoke-user --user alice
+grafhome-ca revoke-user --user alice --host laptop-a
 ```
 
-`grafhome-ca init-ca --dry-run` prints the same reviewed initialization plan as
-`grafhome-ca plan init-ca`.
+Inspect live enrollment state from the CA or an enrolled client. The command
+queries the CA's public provisioner API through the locally pinned trust root;
+it does not read `ca.json` directly:
 
-This release replaces the old direct `user-login` flow. Site policy should use
+```sh
+grafhome-ca enrollment-status --host ca-host
+grafhome-ca enrollment-status --user alice
+grafhome-ca enrollment-status --user alice --host laptop-a
+```
+
+Add `--quiet` to suppress output and use the exit status as a predicate. It
+succeeds only when the requested host or user-device enrollment is active. Add
+`--renewable` to also require the local trust and credential material needed by
+a scheduled renewal.
+
+These root-run commands remove the scoped JWK provisioner and immediately stop
+future issuance and renewal. OpenSSH does not query step-ca on each login, so a
+certificate already issued remains usable until its current expiry. The default
+policy lifetimes remain 24 hours for users and 168 hours for hosts.
+
+Enrollment grants are read from stdin so their Smallstep tokens do not appear
+in shell history. The public request contains no token, password, or private
+key. Smallstep accepts signing tokens only as command arguments, so executor
+errors redact token values but process listings can briefly show the child
+`step` command while certificate signing is running.
+
+This release replaces the old direct `user-login` and shared SSHPOP renewal
+flows. Site policy should use
 the `user_enrollment` provisioner role and point users at that provisioner name;
 the examples use `grafhome-user-enrollment`.
 
