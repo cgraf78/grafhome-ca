@@ -296,18 +296,6 @@ fn exercise_public_export_and_host_certificate_lifecycle(
         .arg("--force"));
     assert!(host_cert.exists());
 
-    run(Command::new("step")
-        .env("STEPPATH", &client_steppath)
-        .arg("ssh")
-        .arg("renew")
-        .arg("--ca-url")
-        .arg(format!("https://{address}"))
-        .arg("--provisioner")
-        .arg("grafhome-host-renew")
-        .arg("--force")
-        .arg(&host_cert)
-        .arg(&host_key));
-
     let user_key = temp.join("id_ed25519");
     run(Command::new("ssh-keygen")
         .arg("-t")
@@ -371,7 +359,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
             .arg("--cert-not-after")
             .arg("24h")
             .arg("--issuer")
-            .arg("grafhome-user-alice-ca-host")
+            .arg("grafhome-user-616c696365-63612d686f7374")
             .arg("--key")
             .arg(temp.join("alice-ca-host.priv.json"))
             .arg("--password-file")
@@ -405,7 +393,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
             .arg("token")
             .arg("attacker.example")
             .arg("--issuer")
-            .arg("grafhome-user-alice-ca-host")
+            .arg("grafhome-user-616c696365-63612d686f7374")
             .arg("--key")
             .arg(temp.join("alice-ca-host.priv.json"))
             .arg("--password-file")
@@ -447,7 +435,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
             .arg("--cert-not-after")
             .arg("24h")
             .arg("--issuer")
-            .arg("grafhome-user-alice-ca-host")
+            .arg("grafhome-user-616c696365-63612d686f7374")
             .arg("--key")
             .arg(temp.join("alice-ca-host.priv.json"))
             .arg("--password-file")
@@ -524,7 +512,7 @@ fn add_test_user_device_provisioner(
     let text = grafhome_ca::runtime_provisioners::add_user_device(
         config_path,
         &public_jwk,
-        "grafhome-user-alice-ca-host",
+        "grafhome-user-616c696365-63612d686f7374",
         template.to_str().unwrap(),
         "24h",
         "168h",
@@ -535,7 +523,7 @@ fn add_test_user_device_provisioner(
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["name"] == "grafhome-user-alice-ca-host")
+        .find(|item| item["name"] == "grafhome-user-616c696365-63612d686f7374")
         .unwrap();
     assert!(provisioner["claims"]["defaultHostSSHCertDuration"].is_null());
     assert!(provisioner["claims"]["maxHostSSHCertDuration"].is_null());

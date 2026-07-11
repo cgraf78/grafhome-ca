@@ -16,9 +16,9 @@
       "notes"
     ],
     "properties": {
-      "role": { "enum": ["host_bootstrap", "host_renew", "user_enrollment", "proxy_x509"] },
+      "role": { "enum": ["host_bootstrap", "user_enrollment", "proxy_x509"] },
       "name": { "$ref": "#/definitions/name" },
-      "type": { "enum": ["JWK", "SSHPOP", "ACME", "OIDC", "X5C"] },
+      "type": { "enum": ["JWK", "ACME"] },
       "default_ttl": { "$ref": "#/definitions/ttl" },
       "max_ttl": { "$ref": "#/definitions/ttl" },
       "renewal_check": { "type": "string", "pattern": "^(manual|[1-9][0-9]*[mh](-jitter)?)$" },
