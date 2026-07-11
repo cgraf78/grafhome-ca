@@ -303,30 +303,28 @@ fn check_uses_xdg_config_home_by_default() {
 #[test]
 fn help_exposes_only_supported_enrollment_operations() {
     let output = Command::cargo_bin("grafhome-ca")
-        .expect("binary exists")
+        .unwrap()
         .arg("help")
         .output()
-        .expect("help exits");
+        .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
 
-    for command in [
-        "approve-user",
-        "approve-host",
-        "enroll-user",
-        "enroll-host",
-        "revoke-user",
-        "revoke-host",
-        "enrollment-status",
-        "renew-host",
-        "ssh-ensure",
-    ] {
+    for command in ["approve", "enroll", "renew", "revoke", "enrollment-status"] {
         assert!(
             text.contains(command),
             "missing supported command {command}"
         );
     }
     for obsolete in [
+        "approve-host",
+        "approve-user",
+        "enroll-host",
+        "enroll-user",
+        "renew-host",
+        "ssh-ensure",
+        "revoke-host",
+        "revoke-user",
         "doctor",
         "init-ca ",
         "bootstrap-client",
@@ -338,6 +336,19 @@ fn help_exposes_only_supported_enrollment_operations() {
             !text.contains(obsolete),
             "found obsolete command {obsolete}"
         );
+    }
+
+    for verb in ["approve", "enroll", "renew", "revoke"] {
+        let output = Command::cargo_bin("grafhome-ca")
+            .unwrap()
+            .args([verb, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        for noun in ["host", "user"] {
+            assert!(text.contains(noun), "missing `{verb} {noun}` command");
+        }
     }
 }
 
@@ -725,9 +736,14 @@ fn plan_help_exposes_only_supported_operations() {
         "host-bootstrap",
         "host-renew",
         "host-renew-all",
-        "ssh-ensure",
+        "renew",
+        "user",
     ] {
-        assert!(!text.contains(obsolete), "found obsolete plan {obsolete}");
+        let listed = text
+            .lines()
+            .map(str::trim_start)
+            .any(|line| line == obsolete || line.starts_with(&format!("{obsolete} ")));
+        assert!(!listed, "found obsolete plan {obsolete}");
     }
 }
 
@@ -826,7 +842,7 @@ fn approve_host_prints_one_complete_grant() {
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"}
     });
 
-    cmd.arg("approve-host")
+    cmd.args(["approve", "host"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--yes")
@@ -868,7 +884,7 @@ fn approve_host_rejects_malformed_ttl_before_step_runs() {
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"}
     });
 
-    cmd.arg("approve-host")
+    cmd.args(["approve", "host"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--yes")
@@ -903,7 +919,7 @@ fn approve_host_token_failure_leaves_ca_state_untouched() {
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["approve-host", "--yes", "--config-root"])
+        .args(["approve", "host", "--yes", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -927,7 +943,7 @@ fn approve_user_token_failure_leaves_ca_state_untouched() {
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["approve-user", "--yes", "--config-root"])
+        .args(["approve", "user", "--yes", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -957,7 +973,7 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
     });
 
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
-    cmd.arg("enroll-host")
+    cmd.args(["enroll", "host"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--host")
@@ -1011,7 +1027,7 @@ fn enroll_user_first_run_creates_public_request_and_pending_state() {
     fs::write(&password_file, "user-owned-password\n").unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
-    cmd.arg("enroll-user")
+    cmd.args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1070,7 +1086,7 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1099,7 +1115,7 @@ fn enroll_user_falls_back_to_systemd_user_credential() {
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1125,7 +1141,7 @@ fn enroll_user_falls_back_to_systemd_user_credential() {
     fs::remove_file(&pending).unwrap();
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1143,7 +1159,7 @@ fn enroll_user_falls_back_to_systemd_user_credential() {
         ));
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("ssh-ensure")
+        .args(["renew", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1176,7 +1192,8 @@ fn enroll_user_stores_an_unattended_credential_when_secret_service_succeeds() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "enroll-user",
+            "enroll",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -1212,7 +1229,7 @@ fn enroll_user_second_run_completes_and_verifies_renewal() {
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1242,7 +1259,7 @@ fn enroll_user_second_run_completes_and_verifies_renewal() {
     });
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1286,7 +1303,7 @@ fn enroll_user_rejects_grant_for_a_different_ssh_key() {
     fs::write(&password_file, "user-owned-password\n").unwrap();
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1315,7 +1332,7 @@ fn enroll_user_rejects_grant_for_a_different_ssh_key() {
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("enroll-user")
+        .args(["enroll", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1346,7 +1363,8 @@ fn enroll_user_rejects_grant_for_a_substituted_renewal_jwk() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "enroll-user",
+            "enroll",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -1382,7 +1400,8 @@ fn enroll_user_rejects_grant_for_a_substituted_renewal_jwk() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "enroll-user",
+            "enroll",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -1409,7 +1428,7 @@ fn enroll_host_redacts_token_from_failed_step_error() {
     let (_dir, fixture) = exec_fixture();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
-    cmd.arg("enroll-host")
+    cmd.args(["enroll", "host"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--host")
@@ -1431,7 +1450,7 @@ fn enroll_host_redacts_token_from_failed_step_error() {
         "token": "sensitive-host-token"
     });
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
-    cmd.arg("enroll-host")
+    cmd.args(["enroll", "host"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--host")
@@ -1455,7 +1474,7 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
     fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
-    cmd.arg("approve-user")
+    cmd.args(["approve", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--yes")
@@ -1508,7 +1527,7 @@ fn approve_user_retries_transient_health_failure_after_restart() {
     fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
-    cmd.arg("approve-user")
+    cmd.args(["approve", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--yes")
@@ -1558,7 +1577,7 @@ fn concurrent_approvals_preserve_both_scoped_provisioners() {
         std::thread::spawn(move || {
             Command::cargo_bin("grafhome-ca")
                 .unwrap()
-                .args(["approve-user", "--yes", "--config-root"])
+                .args(["approve", "user", "--yes", "--config-root"])
                 .arg(config_root)
                 .env("PATH", path)
                 .env("FAKE_LOG", log)
@@ -1592,7 +1611,7 @@ fn approve_user_rolls_back_ca_json_if_restart_fails() {
     fs::write(&ca_json, original).unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
-    cmd.arg("approve-user")
+    cmd.args(["approve", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--yes")
@@ -1621,7 +1640,7 @@ fn ssh_ensure_reads_password_from_stdin_and_refreshes_cert() {
     fs::write(&password_file, "user-owned-password\n").unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
-    cmd.arg("ssh-ensure")
+    cmd.args(["renew", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1646,6 +1665,88 @@ fn ssh_ensure_reads_password_from_stdin_and_refreshes_cert() {
 
 #[cfg(unix)]
 #[test]
+fn quiet_ssh_ensure_suppresses_successful_renewal_output() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    fs::create_dir_all(&material).unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/alice_ca_host_ed25519.pub"), "public\n").unwrap();
+    fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+    let password_file = dir.path().join("password");
+    fs::write(&password_file, "user-owned-password\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "renew",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--quiet",
+            "--password-file",
+        ])
+        .arg(&password_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ssh certificate alice"));
+    assert!(log.contains("ssh-keygen args=-L"));
+}
+
+#[cfg(unix)]
+#[test]
+fn quiet_ssh_ensure_reports_redacted_renewal_failures() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    fs::create_dir_all(&material).unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/alice_ca_host_ed25519.pub"), "public\n").unwrap();
+    fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+    let password_file = dir.path().join("password");
+    fs::write(&password_file, "user-owned-password\n").unwrap();
+
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "renew",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--quiet",
+            "--password-file",
+        ])
+        .arg(&password_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_STEP_FAIL", "ssh-certificate")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("simulated failure"));
+    assert!(!stderr.contains("token-for-alice"));
+}
+
+#[cfg(unix)]
+#[test]
 fn ssh_ensure_skips_fresh_certificate_without_loading_credential() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
@@ -1655,7 +1756,8 @@ fn ssh_ensure_skips_fresh_certificate_without_loading_credential() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "ssh-ensure",
+            "renew",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -1689,7 +1791,7 @@ fn revoke_host_removes_only_the_scoped_provisioner() {
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("revoke-host")
+        .args(["revoke", "host"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--host")
@@ -1910,7 +2012,7 @@ fn revoke_host_discovers_live_enrollment_after_policy_removal() {
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["revoke-host", "--host", "departed", "--config-root"])
+        .args(["revoke", "host", "--host", "departed", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -1929,7 +2031,7 @@ fn revoke_host_discovers_live_enrollment_after_policy_removal() {
     fs::write(&stale_template, "stale\n").unwrap();
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["revoke-host", "--host", "departed", "--config-root"])
+        .args(["revoke", "host", "--host", "departed", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -1952,7 +2054,7 @@ fn revoke_user_discovers_every_live_device_after_policy_removal() {
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
-        .arg("revoke-user")
+        .args(["revoke", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
         .arg("--user")
@@ -1983,7 +2085,8 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "enroll-user",
+            "enroll",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -2004,7 +2107,7 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
     let request = fs::read_to_string(&pending).unwrap();
     let approval = Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["approve-user", "--yes", "--config-root"])
+        .args(["approve", "user", "--yes", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -2017,7 +2120,8 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "enroll-user",
+            "enroll",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -2062,7 +2166,8 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "revoke-user",
+            "revoke",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -2104,7 +2209,8 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "ssh-ensure",
+            "renew",
+            "user",
             "--user",
             "alice",
             "--host",
@@ -2135,7 +2241,8 @@ fn host_enrollment_then_revocation_disables_scoped_renewal() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
-            "enroll-host",
+            "enroll",
+            "host",
             "--host",
             "proxy-host",
             "--request-only",
@@ -2152,7 +2259,7 @@ fn host_enrollment_then_revocation_disables_scoped_renewal() {
     let request = fs::read_to_string(pending).unwrap();
     let approval = Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["approve-host", "--yes", "--config-root"])
+        .args(["approve", "host", "--yes", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -2164,7 +2271,7 @@ fn host_enrollment_then_revocation_disables_scoped_renewal() {
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["enroll-host", "--host", "proxy-host", "--config-root"])
+        .args(["enroll", "host", "--host", "proxy-host", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -2201,7 +2308,7 @@ fn host_enrollment_then_revocation_disables_scoped_renewal() {
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["revoke-host", "--host", "proxy-host", "--config-root"])
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -2233,7 +2340,7 @@ fn host_enrollment_then_revocation_disables_scoped_renewal() {
     );
     Command::cargo_bin("grafhome-ca")
         .unwrap()
-        .args(["renew-host", "--host", "proxy-host", "--config-root"])
+        .args(["renew", "host", "--host", "proxy-host", "--config-root"])
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)

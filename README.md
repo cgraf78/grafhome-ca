@@ -118,16 +118,16 @@ Host enrollment uses the same request-and-approval shape as user enrollment:
 
 ```sh
 # Target host as root. Leave this running after copying its REQUEST line.
-grafhome-ca enroll-host
+grafhome-ca enroll host
 
 # CA origin as root. Paste the REQUEST, press Ctrl-D, approve it, and copy GRANT.
-grafhome-ca approve-host
+grafhome-ca approve host
 ```
 
 The target generates its host-scoped renewal JWK locally; only its public half
-leaves the host. After the grant is pasted back, `enroll-host` installs the SSH
+leaves the host. After the grant is pasted back, `enroll host` installs the SSH
 host certificate and trust configuration, proves JWK renewal works, validates
-`sshd`, and reloads it. Scheduled renewal runs `grafhome-ca renew-host`; the
+`sshd`, and reloads it. Scheduled renewal runs `grafhome-ca renew host`; the
 existing lifecycle plans retain each host's configured renewal owner.
 
 User enrollment requires one public request copied to the CA and one secret
@@ -137,17 +137,17 @@ hostname, so normal enrollment needs no identity flags:
 ```sh
 # Client device. Enter the renewal password once and leave this running.
 # Copy its REQUEST line to the CA, then paste the returned GRANT here.
-grafhome-ca enroll-user
+grafhome-ca enroll user
 
 # CA origin as root. Paste the REQUEST line, press Ctrl-D, and approve it.
-grafhome-ca approve-user
+grafhome-ca approve user
 
 # Normal use after enrollment.
 ssh ca-host
 ```
 
-Scheduled renewal should run `grafhome-ca renew-host` as root for hosts and
-`grafhome-ca ssh-ensure` as the enrolled user for user certificates. Both
+Scheduled renewal should run `grafhome-ca renew host` as root for hosts and
+`grafhome-ca renew user --quiet` as the enrolled user for user certificates. Both
 commands use the local identity by default and skip certificates that Smallstep
 reports as fresh. Grafhome's private dotfiles install these jobs every eight
 hours. Those jobs first call `enrollment-status --quiet --renewable`, so
@@ -156,24 +156,26 @@ stores the password in an encrypted systemd user credential for unattended
 renewal, in addition to Secret Service when available. Other deployments must
 provide equivalent scheduling.
 
-`enroll-user` generates the SSH and renewal keys, stores the renewal password,
+`enroll user` generates the SSH and renewal keys, stores the renewal password,
 prints the public request, and waits for the grant. After the grant is pasted,
 the same process bootstraps pinned CA trust, obtains the initial certificate,
 installs stable `$HOME/.ssh/<user>.key*` aliases, verifies renewal, and removes
 pending state. A terminated process can resume from that pending state by
-running `enroll-user` again. File overrides exist for automation:
+running `enroll user` again. File overrides exist for automation:
 `--request-file`, `--grant-file`, and `--password-file`; `--request-only` emits
-the request without waiting. `approve-user --yes` skips operator confirmation.
+the request without waiting. `approve user --yes` skips operator confirmation.
+Pasted requests and grants may include or omit their `REQUEST:` or `GRANT:`
+label; surrounding whitespace and copied terminal output are ignored.
 
 CA-side revocation does not require a certificate serial:
 
 ```sh
 # Disable the host identity and every user device enrolled on that host.
-grafhome-ca revoke-host --host ca-host
+grafhome-ca revoke host --host ca-host
 
 # Disable every enrolled device for a user, or only one device.
-grafhome-ca revoke-user --user alice
-grafhome-ca revoke-user --user alice --host laptop-a
+grafhome-ca revoke user --user alice
+grafhome-ca revoke user --user alice --host laptop-a
 ```
 
 Inspect live enrollment state from the CA or an enrolled client. The command
