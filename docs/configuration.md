@@ -63,7 +63,7 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 : Absolute path to the root-readable `step-ca` key password file. The file path
   is non-secret; the password file content must never be committed. This path
   must be inside `GRAFHOME_CA_STATE_DIR` so the `step-ca` service user can
-  traverse the parent directories after the lifecycle plan repairs ownership.
+  traverse its parent directories.
 
 `GRAFHOME_CA_SERVICE_USER`
 : Unix service account and primary service group that run the CA server.
@@ -104,7 +104,7 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
   replaces them with complete Smallstep-generated provisioner objects containing
   both the public `key` and encrypted private-key material. Non-secret
   provisioner types that do not require generated key material render directly.
-  The supported first-bootstrap path is `materialize-runtime-provisioners`: it
+  The supported first-bootstrap path is `materialize`: it
   copies the bootstrap JWK from the live `step ca init` output, loads additional
   encrypted JWK files from a private operator directory, and reapplies
   policy-derived claims before the staged `ca.json` is installed.
@@ -114,19 +114,19 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
   in `deployment.env`.
 
 `user_ca_keys.pem`
-: Public trust file exported by `grafhome-ca export-public` and installed at
+: Public trust file exported by `grafhome-ca export` and installed at
   `${GRAFHOME_CA_SSH_TRUST_DIR}/user_ca_keys.pem` for `TrustedUserCAKeys`.
 
 `ssh_known_hosts`
-: Public host-CA trust file exported by `grafhome-ca export-public` and
+: Public host-CA trust file exported by `grafhome-ca export` and
   installed at `${GRAFHOME_CA_SSH_TRUST_DIR}/ssh_known_hosts` for SSH clients.
   It contains `@cert-authority` entries for managed host certificate
   principals, so real exports can reveal private topology even though they do
   not contain secrets.
 
 `root_fingerprint`
-: Public SHA-256 fingerprint of the X.509 root CA certificate. Host bootstrap
-  plans use it for `step ca bootstrap --fingerprint`.
+: Public SHA-256 fingerprint of the X.509 root CA certificate. Enrollment
+  grants carry it so `grafhome-ca` can bootstrap pinned trust internally.
 
 `principal`
 : A name embedded in an SSH certificate and later matched by OpenSSH policy.
@@ -139,5 +139,5 @@ network details in policy files.
 : The local scheduler expected to renew that host's certificates.
 
 `default_ttl`, `max_ttl`, and `cert_ttl`
-: Step duration strings rendered into `ca.json` or lifecycle commands. Use
+: Step duration strings rendered into `ca.json` or used for enrollment. Use
   Go-style `s`, `m`, or `h` units such as `24h`, `168h`, or `720h`; do not use `d`.

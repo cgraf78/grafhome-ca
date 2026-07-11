@@ -1,4 +1,4 @@
-//! JSON Schema validation for site config and generated plan formats.
+//! JSON Schema validation for site configuration.
 
 use std::path::Path;
 
@@ -64,15 +64,6 @@ pub fn validate_config_root(config_root: impl AsRef<Path>) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-/// Validate a generated lifecycle plan against the embedded public plan schema.
-pub fn validate_lifecycle_plan(plan: &crate::lifecycle::Plan) -> Result<()> {
-    validate_schema_text(
-        "schemas/lifecycle/plan.schema.json",
-        include_str!("../schemas/lifecycle/plan.schema.json"),
-        &serde_json::to_value(plan).expect("lifecycle plan serializes"),
-    )
 }
 
 struct PolicySpec {
@@ -219,8 +210,6 @@ fn policy_specs() -> &'static [PolicySpec] {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::lifecycle;
-
     fn example_config_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config")
     }
@@ -228,43 +217,5 @@ mod tests {
     #[test]
     fn example_files_match_embedded_schemas() {
         crate::schema::validate_config_root(example_config_root()).expect("schema validation");
-    }
-
-    #[test]
-    fn generated_lifecycle_plans_match_schema() {
-        let config_root = example_config_root();
-        let model = crate::model::SiteModel::load(&config_root).unwrap();
-        let plans = [
-            lifecycle::init_ca(&model).unwrap(),
-            lifecycle::host_bootstrap(&model, "ca-host").unwrap(),
-            lifecycle::host_renew(&model, "ca-host").unwrap(),
-            lifecycle::host_renew_all(&model).unwrap(),
-            lifecycle::backup_ca(&model).unwrap(),
-            lifecycle::verify_live(&model, Some("ca-host")).unwrap(),
-            lifecycle::proxy_cert(&model).unwrap(),
-            lifecycle::create_host_token(&model, "ca-host", None, None).unwrap(),
-            lifecycle::enroll_host(&model, "ca-host").unwrap(),
-            lifecycle::create_user_token(&model, "alice", "ca-host", None, None).unwrap(),
-            lifecycle::enroll_user(&model, "alice", "ca-host").unwrap(),
-            lifecycle::ssh_ensure(&model, "alice", Some("ca-host")).unwrap(),
-            lifecycle::add_host(&model, "new-host").unwrap(),
-            lifecycle::add_user(&model, "new-user").unwrap(),
-        ];
-
-        for plan in plans {
-            crate::schema::validate_lifecycle_plan(&plan).expect("plan schema validation");
-        }
-    }
-
-    #[test]
-    fn lifecycle_plan_schema_rejects_host_specific_step_ids() {
-        let model = crate::model::SiteModel::load(example_config_root()).unwrap();
-        let mut plan = lifecycle::host_renew_all(&model).unwrap();
-        plan.steps[0].id = "renew-host-cert-ca-host".to_owned();
-        let error = crate::schema::validate_lifecycle_plan(&plan)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("renew-host-cert-ca-host"));
     }
 }
