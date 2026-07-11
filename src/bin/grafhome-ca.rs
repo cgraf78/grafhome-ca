@@ -929,13 +929,22 @@ fn read_document_or_file(
             .read_to_string(&mut value)
             .map_err(|source| grafhome_ca::Error::io(file, source))?;
     } else {
-        eprint!("{label}: ");
+        let interactive = std::io::stdin().is_terminal();
+        if interactive {
+            eprint!("{label} (paste and press Enter): ");
+        } else {
+            eprint!("{label}: ");
+        }
         std::io::stderr()
             .flush()
             .map_err(|source| grafhome_ca::Error::io("<stderr>", source))?;
-        stdin
-            .read_to_string(&mut value)
-            .map_err(|source| grafhome_ca::Error::io("<stdin>", source))?;
+        if interactive {
+            value = read_interactive_document(stdin)?;
+        } else {
+            stdin
+                .read_to_string(&mut value)
+                .map_err(|source| grafhome_ca::Error::io("<stdin>", source))?;
+        }
     }
     let value = value.trim_end_matches(['\r', '\n']).to_owned();
     if value.is_empty() {
@@ -945,6 +954,26 @@ fn read_document_or_file(
         });
     }
     Ok(value)
+}
+
+/// Read through the first complete enrollment document from a terminal.
+///
+/// Generated enrollment documents fit on one line, so normal paste-and-Enter
+/// input returns immediately. Continuing while JSON is incomplete preserves
+/// support for manually formatted multiline documents without requiring an EOF
+/// keystroke on the normal path.
+fn read_interactive_document(stdin: &mut impl BufRead) -> grafhome_ca::Result<String> {
+    let mut value = String::new();
+    loop {
+        let bytes_read = stdin
+            .read_line(&mut value)
+            .map_err(|source| grafhome_ca::Error::io("<stdin>", source))?;
+        if bytes_read == 0
+            || parse_enrollment_document::<serde_json::Value>(&value, "<stdin>").is_ok()
+        {
+            return Ok(value);
+        }
+    }
 }
 
 fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Result<&'a Endpoint> {
@@ -3025,7 +3054,42 @@ fn print_plan(plan: &grafhome_ca::lifecycle::Plan) -> grafhome_ca::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_enrollment_document;
+    use std::io::{BufRead, Cursor};
+
+    use super::{parse_enrollment_document, read_interactive_document};
+
+    #[test]
+    fn interactive_document_returns_after_one_complete_line() {
+        let mut input = Cursor::new("REQUEST: {\"version\": 1}\nnot part of the document\n");
+
+        let document = read_interactive_document(&mut input).unwrap();
+
+        assert_eq!(document, "REQUEST: {\"version\": 1}\n");
+        let mut remaining = String::new();
+        input.read_line(&mut remaining).unwrap();
+        assert_eq!(remaining, "not part of the document\n");
+    }
+
+    #[test]
+    fn interactive_document_waits_for_complete_multiline_json() {
+        let mut input = Cursor::new("GRANT: {\n  \"version\": 1\n}\nafter\n");
+
+        let document = read_interactive_document(&mut input).unwrap();
+
+        assert_eq!(document, "GRANT: {\n  \"version\": 1\n}\n");
+        let mut remaining = String::new();
+        input.read_line(&mut remaining).unwrap();
+        assert_eq!(remaining, "after\n");
+    }
+
+    #[test]
+    fn interactive_document_accepts_copied_text_before_labeled_json() {
+        let mut input = Cursor::new("copy this line:\nREQUEST: {\"version\": 1}\nafter\n");
+
+        let document = read_interactive_document(&mut input).unwrap();
+
+        assert_eq!(document, "copy this line:\nREQUEST: {\"version\": 1}\n");
+    }
 
     #[test]
     fn enrollment_document_accepts_bare_json_with_surrounding_whitespace() {

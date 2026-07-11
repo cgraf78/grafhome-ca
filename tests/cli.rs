@@ -1072,6 +1072,8 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
     fs::create_dir_all(&home).unwrap();
+    let root = home.join(".config/grafhome/step/certs/root_ca.crt");
+    assert!(!root.exists());
     let grant = serde_json::json!({
         "version": 1,
         "kind": "grafhome-user-enrollment-grant",
@@ -1104,6 +1106,13 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
         .stdout(predicate::str::contains(
             "Enrollment complete. Try: ssh nas",
         ));
+
+    assert_eq!(fs::read_to_string(root).unwrap(), "root\n");
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains(
+        "ca bootstrap --ca-url https://ca.example.test --fingerprint trusted-fingerprint --force"
+    ));
+    assert!(log.contains("ca health --ca-url https://ca.example.test"));
 }
 
 #[cfg(unix)]
