@@ -115,6 +115,10 @@ case "$1 $2" in
     printf 'fingerprint-from-fake-step\n'
     ;;
   "ca token")
+    if [ "${FAKE_REQUIRE_RESTART_BEFORE_TOKEN:-}" = "1" ] && [ ! -e "$FAKE_LOG.restarted" ]; then
+      printf 'token minted before CA restart completed\n' >&2
+      exit 47
+    fi
     if [ "${FAKE_STEP_FAIL:-}" = "ca-token" ]; then
       printf 'simulated token failure\n' >&2
       exit 46
@@ -141,7 +145,7 @@ case "$1 $2" in
   "ca health")
     if [ "${FAKE_STEP_HEALTH_FAIL_ONCE:-}" = "1" ] && [ ! -e "$FAKE_LOG.health_failed" ]; then
       touch "$FAKE_LOG.health_failed"
-      printf 'simulated health failure\n' >&2
+      printf 'failed decoding CA error response: transient proxy response\n' >&2
       exit 44
     fi
     printf 'ok\n'
@@ -223,6 +227,7 @@ if [ "${FAKE_SYSTEMCTL_RESTART_FAIL_ONCE:-}" = "1" ] && [ "$1" = "restart" ] && 
   touch "$FAKE_LOG.restart_failed"
   exit 43
 fi
+if [ "$1" = "restart" ]; then touch "$FAKE_LOG.restarted"; fi
 if [ "$1" = "is-active" ]; then printf 'active\n'; fi
 "#,
     );
@@ -807,6 +812,12 @@ fn approve_host_token_failure_leaves_ca_state_untouched() {
         .stderr(predicate::str::contains("simulated token failure"));
 
     assert_eq!(fs::read_to_string(ca_json).unwrap(), original);
+    assert!(
+        !fixture
+            .config_root
+            .join("../state/step/templates/ssh/grafhome-host-70726f78792d686f7374.tpl")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
@@ -831,6 +842,12 @@ fn approve_user_token_failure_leaves_ca_state_untouched() {
         .stderr(predicate::str::contains("simulated token failure"));
 
     assert_eq!(fs::read_to_string(ca_json).unwrap(), original);
+    assert!(
+        !fixture
+            .config_root
+            .join("../state/step/templates/ssh/grafhome-user-616c696365-63612d686f7374.tpl")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
@@ -1423,7 +1440,8 @@ fn approve_user_retries_transient_health_failure_after_restart() {
         .write_stdin(user_enrollment_request())
         .assert()
         .success()
-        .stdout(predicate::str::contains("GRANT:"));
+        .stdout(predicate::str::contains("GRANT:"))
+        .stderr(predicate::str::contains("failed decoding CA error response").not());
 
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert_eq!(log.matches("ca health").count(), 3);
@@ -1510,6 +1528,12 @@ fn approve_user_rolls_back_ca_json_if_restart_fails() {
         .stderr(predicate::str::contains("restored previous ca.json"));
 
     assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+    assert!(
+        !fixture
+            .config_root
+            .join("../state/step/templates/ssh/grafhome-user-616c696365-63612d686f7374.tpl")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
@@ -1984,7 +2008,7 @@ fn revoke_user_discovers_every_live_device_after_policy_removal() {
 
 #[cfg(unix)]
 #[test]
-fn user_enrollment_then_revocation_disables_scoped_renewal() {
+fn fresh_user_enrollment_then_revocation_disables_scoped_renewal() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
     let password_file = dir.path().join("password");
@@ -1993,6 +2017,13 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(&password_file, "user-owned-password\n").unwrap();
     fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    assert!(!home.join(".config/grafhome-ca").exists());
+    assert!(
+        !fixture
+            .config_root
+            .join("../state/step/templates/ssh/grafhome-user-616c696365-63612d686f7374.tpl")
+            .exists()
+    );
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -2023,10 +2054,16 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_REQUIRE_RESTART_BEFORE_TOKEN", "1")
         .write_stdin(request)
         .output()
         .unwrap();
     assert!(approval.status.success());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(
+        log.find("systemctl args=restart step-ca.service").unwrap()
+            < log.find("args=ca token").unwrap()
+    );
     let grant = prefixed_document(&approval.stdout, "GRANT:");
 
     Command::cargo_bin("grafhome-ca")
@@ -2198,11 +2235,23 @@ fn user_enrollment_then_revocation_disables_scoped_renewal() {
 
 #[cfg(unix)]
 #[test]
-fn host_enrollment_then_revocation_disables_scoped_renewal() {
+fn fresh_host_enrollment_then_revocation_disables_scoped_renewal() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    assert!(
+        !fixture
+            .config_root
+            .join("../server-step/secrets/hosts/proxy-host")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .config_root
+            .join("../state/step/templates/ssh/grafhome-host-70726f78792d686f7374.tpl")
+            .exists()
+    );
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -2229,10 +2278,16 @@ fn host_enrollment_then_revocation_disables_scoped_renewal() {
         .arg(&fixture.config_root)
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_REQUIRE_RESTART_BEFORE_TOKEN", "1")
         .write_stdin(request)
         .output()
         .unwrap();
     assert!(approval.status.success());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(
+        log.find("systemctl args=restart step-ca.service").unwrap()
+            < log.find("args=ca token").unwrap()
+    );
     let grant = prefixed_document(&approval.stdout, "GRANT:");
 
     Command::cargo_bin("grafhome-ca")
