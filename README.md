@@ -2,7 +2,9 @@
 
 Grafhome CA is the policy, validation, packaging, and lifecycle tooling for the
 Grafhome SSH certificate authority. The CA cryptographic boundary stays in
-Smallstep: `step-ca` runs the server and `step` performs client operations.
+Smallstep: `step-ca` runs the server and `grafhome-ca` invokes `step` internally
+for client operations. Users and enrollment operators interact through the
+`grafhome-ca` CLI rather than running `step` commands themselves.
 This repo owns the typed local policy model, schemas, templates, packaging, and
 operator commands. Real site policy is loaded at runtime from the XDG config
 root and should live in a private repo or private host configuration system.
@@ -116,11 +118,19 @@ cargo run --bin grafhome-ca -- plan add-user --user new-user
 
 Host enrollment uses the same request-and-approval shape as user enrollment:
 
+Before enrollment, install `grafhome-ca` and the Smallstep `step` CLI (commonly
+packaged as `step-cli`) and provision the private site config under
+`${XDG_CONFIG_HOME:-~/.config}/grafhome-ca`. The CA origin additionally needs
+the `step-ca` server package. No client CA fingerprint file or previous
+Smallstep client state is required: the approved grant carries the CA URL and
+root fingerprint, and `grafhome-ca` creates and verifies pinned trust in its
+dedicated Smallstep state directory.
+
 ```sh
 # Target host as root. Leave this running after copying its REQUEST line.
 grafhome-ca enroll host
 
-# CA origin as root. Paste the REQUEST, press Ctrl-D, approve it, and copy GRANT.
+# CA origin as root. Paste the REQUEST, press Enter, approve it, and copy GRANT.
 grafhome-ca approve host
 ```
 
@@ -139,7 +149,7 @@ hostname, so normal enrollment needs no identity flags:
 # Copy its REQUEST line to the CA, then paste the returned GRANT here.
 grafhome-ca enroll user
 
-# CA origin as root. Paste the REQUEST line, press Ctrl-D, and approve it.
+# CA origin as root. Paste the REQUEST line, press Enter, and approve it.
 grafhome-ca approve user
 
 # Normal use after enrollment.
@@ -165,7 +175,11 @@ running `enroll user` again. File overrides exist for automation:
 `--request-file`, `--grant-file`, and `--password-file`; `--request-only` emits
 the request without waiting. `approve user --yes` skips operator confirmation.
 Pasted requests and grants may include or omit their `REQUEST:` or `GRANT:`
-label; surrounding whitespace and copied terminal output are ignored.
+label, and surrounding whitespace is ignored. At an interactive prompt, paste
+the REQUEST or GRANT document and press Enter; `Ctrl-D` is not required.
+Redirected stdin and file inputs retain read-to-EOF behavior for automation and
+formatted multiline documents, and may include copied terminal output around a
+labeled document.
 
 CA-side revocation does not require a certificate serial:
 
