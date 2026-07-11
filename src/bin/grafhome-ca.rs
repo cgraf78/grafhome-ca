@@ -124,107 +124,25 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
     },
-    /// Approve a public host enrollment request on the CA origin.
-    ApproveHost {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Read the public enrollment request from this file instead of stdin.
-        #[arg(long, value_name = "FILE")]
-        request_file: Option<PathBuf>,
-        /// Enrollment token lifetime.
-        #[arg(long)]
-        ttl: Option<String>,
-        /// SSH host certificate lifetime.
-        #[arg(long)]
-        cert_ttl: Option<String>,
-        /// Approve without an interactive confirmation (for automation).
-        #[arg(long)]
-        yes: bool,
+    /// Approve a public enrollment request on the CA origin.
+    Approve {
+        #[command(subcommand)]
+        command: ApproveCommand,
     },
-    /// Enroll this host using a grant read from stdin by default.
-    EnrollHost {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Host policy name. Defaults to the short local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Read the host enrollment grant from this file instead of stdin.
-        #[arg(long, value_name = "FILE")]
-        grant_file: Option<PathBuf>,
-        /// Emit the public request and exit instead of waiting for a grant.
-        #[arg(long)]
-        request_only: bool,
+    /// Enroll a host or user using a grant read from stdin by default.
+    Enroll {
+        #[command(subcommand)]
+        command: EnrollCommand,
     },
-    /// Refresh this host's SSH certificate using its host-owned credential.
-    RenewHost {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Host policy name. Defaults to the short local hostname.
-        #[arg(long)]
-        host: Option<String>,
+    /// Renew a host or user SSH certificate.
+    Renew {
+        #[command(subcommand)]
+        command: RenewCommand,
     },
-    /// Start or complete user enrollment on this client device.
-    EnrollUser {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// User policy name.
-        #[arg(long)]
-        user: Option<String>,
-        /// Client host policy name.
-        #[arg(long)]
-        host: Option<String>,
-        /// Complete enrollment using this grant instead of reading stdin.
-        #[arg(long, value_name = "FILE")]
-        grant_file: Option<PathBuf>,
-        /// Read the user-owned provisioner password from this file instead of stdin.
-        #[arg(long, value_name = "FILE")]
-        password_file: Option<PathBuf>,
-        /// Emit the public request and exit instead of waiting for a grant.
-        #[arg(long)]
-        request_only: bool,
-    },
-    /// Approve a public user enrollment request on the CA origin.
-    ApproveUser {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Read the public enrollment request from this file instead of stdin.
-        #[arg(long, value_name = "FILE")]
-        request_file: Option<PathBuf>,
-        /// Enrollment token lifetime.
-        #[arg(long)]
-        ttl: Option<String>,
-        /// SSH user certificate lifetime.
-        #[arg(long)]
-        cert_ttl: Option<String>,
-        /// Approve without an interactive confirmation (for automation).
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Disable issuance and renewal for one user's enrolled devices.
-    RevokeUser {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Policy user to revoke.
-        #[arg(long)]
-        user: String,
-        /// Revoke only the device on this host. Omit to revoke every device.
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Disable issuance and renewal for one host.
-    RevokeHost {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Policy host to revoke.
-        #[arg(long)]
-        host: String,
+    /// Disable future issuance and renewal for a host or user.
+    Revoke {
+        #[command(subcommand)]
+        command: RevokeCommand,
     },
     /// Report scoped host and user enrollment identities from live CA state.
     EnrollmentStatus {
@@ -244,20 +162,141 @@ enum Command {
         #[arg(long, requires = "quiet")]
         renewable: bool,
     },
-    /// Refresh this user's SSH certificate. Reads the user-owned password from stdin by default.
-    SshEnsure {
+}
+
+#[derive(Debug, Subcommand)]
+enum ApproveCommand {
+    /// Approve a public host enrollment request.
+    Host {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// User policy name.
+        /// Read the public enrollment request from this file instead of stdin.
+        #[arg(long, value_name = "FILE")]
+        request_file: Option<PathBuf>,
+        /// Enrollment token lifetime.
         #[arg(long)]
-        user: Option<String>,
-        /// Client host policy name. Required when the user has multiple active client hosts.
+        ttl: Option<String>,
+        /// SSH host certificate lifetime.
+        #[arg(long)]
+        cert_ttl: Option<String>,
+        /// Approve without an interactive confirmation (for automation).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Approve a public user enrollment request.
+    User {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Read the public enrollment request from this file instead of stdin.
+        #[arg(long, value_name = "FILE")]
+        request_file: Option<PathBuf>,
+        /// Enrollment token lifetime.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// SSH user certificate lifetime.
+        #[arg(long)]
+        cert_ttl: Option<String>,
+        /// Approve without an interactive confirmation (for automation).
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnrollCommand {
+    /// Enroll this host.
+    Host {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to the short local hostname.
         #[arg(long)]
         host: Option<String>,
+        /// Read the host enrollment grant from this file instead of stdin.
+        #[arg(long, value_name = "FILE")]
+        grant_file: Option<PathBuf>,
+        /// Emit the public request and exit instead of waiting for a grant.
+        #[arg(long)]
+        request_only: bool,
+    },
+    /// Start or complete user enrollment on this client device.
+    User {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// User policy name. Defaults to the current account.
+        #[arg(long)]
+        user: Option<String>,
+        /// Client host policy name. Defaults to the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Complete enrollment using this grant instead of reading stdin.
+        #[arg(long, value_name = "FILE")]
+        grant_file: Option<PathBuf>,
         /// Read the user-owned provisioner password from this file instead of stdin.
         #[arg(long, value_name = "FILE")]
         password_file: Option<PathBuf>,
+        /// Emit the public request and exit instead of waiting for a grant.
+        #[arg(long)]
+        request_only: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RenewCommand {
+    /// Renew this host's SSH certificate.
+    Host {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Renew this user's SSH certificate.
+    User {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// User policy name. Defaults to the current account.
+        #[arg(long)]
+        user: Option<String>,
+        /// Client host policy name. Defaults to the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Read the user-owned provisioner password from this file instead of stored credentials.
+        #[arg(long, value_name = "FILE")]
+        password_file: Option<PathBuf>,
+        /// Suppress successful renewal output. Errors are still reported.
+        #[arg(long)]
+        quiet: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RevokeCommand {
+    /// Disable issuance and renewal for one host.
+    Host {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Policy host to revoke.
+        #[arg(long)]
+        host: String,
+    },
+    /// Disable issuance and renewal for one user's enrolled devices.
+    User {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Policy user to revoke.
+        #[arg(long)]
+        user: String,
+        /// Revoke only the device on this host. Omit to revoke every device.
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -445,12 +484,15 @@ fn run() -> grafhome_ca::Result<()> {
             )?;
             write_raw_stdout(&output)
         }
-        Command::ApproveHost {
-            config_root,
-            request_file,
-            ttl,
-            cert_ttl,
-            yes,
+        Command::Approve {
+            command:
+                ApproveCommand::Host {
+                    config_root,
+                    request_file,
+                    ttl,
+                    cert_ttl,
+                    yes,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             let mut stdin = std::io::stdin().lock();
@@ -466,16 +508,21 @@ fn run() -> grafhome_ca::Result<()> {
             }
             approve_host_enrollment(&model, &request, ttl.as_deref(), cert_ttl.as_deref())
         }
-        Command::EnrollHost {
-            config_root,
-            host,
-            grant_file,
-            request_only,
+        Command::Enroll {
+            command:
+                EnrollCommand::Host {
+                    config_root,
+                    host,
+                    grant_file,
+                    request_only,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             enroll_host_flow(&model, host.as_deref(), grant_file.as_deref(), request_only)
         }
-        Command::RenewHost { config_root, host } => {
+        Command::Renew {
+            command: RenewCommand::Host { config_root, host },
+        } => {
             let model = load_valid_model(config_root)?;
             let host = resolve_host(host.as_deref())?;
             if !ssh_certificate_needs_renewal(
@@ -486,13 +533,16 @@ fn run() -> grafhome_ca::Result<()> {
             }
             renew_host(&model, &host)
         }
-        Command::EnrollUser {
-            config_root,
-            user,
-            host,
-            grant_file,
-            password_file,
-            request_only,
+        Command::Enroll {
+            command:
+                EnrollCommand::User {
+                    config_root,
+                    user,
+                    host,
+                    grant_file,
+                    password_file,
+                    request_only,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             enroll_user_flow(
@@ -504,12 +554,15 @@ fn run() -> grafhome_ca::Result<()> {
                 request_only,
             )
         }
-        Command::ApproveUser {
-            config_root,
-            request_file,
-            ttl,
-            cert_ttl,
-            yes,
+        Command::Approve {
+            command:
+                ApproveCommand::User {
+                    config_root,
+                    request_file,
+                    ttl,
+                    cert_ttl,
+                    yes,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             let mut stdin = std::io::stdin().lock();
@@ -525,15 +578,20 @@ fn run() -> grafhome_ca::Result<()> {
             }
             approve_user_enrollment(&model, &request, ttl.as_deref(), cert_ttl.as_deref())
         }
-        Command::RevokeUser {
-            config_root,
-            user,
-            host,
+        Command::Revoke {
+            command:
+                RevokeCommand::User {
+                    config_root,
+                    user,
+                    host,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             revoke_user(&model, &user, host.as_deref())
         }
-        Command::RevokeHost { config_root, host } => {
+        Command::Revoke {
+            command: RevokeCommand::Host { config_root, host },
+        } => {
             let model = load_valid_model(config_root)?;
             revoke_host(&model, &host)
         }
@@ -552,11 +610,15 @@ fn run() -> grafhome_ca::Result<()> {
             }
             Ok(())
         }
-        Command::SshEnsure {
-            config_root,
-            user,
-            host,
-            password_file,
+        Command::Renew {
+            command:
+                RenewCommand::User {
+                    config_root,
+                    user,
+                    host,
+                    password_file,
+                    quiet,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             let mut stdin = std::io::stdin().lock();
@@ -569,7 +631,7 @@ fn run() -> grafhome_ca::Result<()> {
                 Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
                 None => lookup_renewal_password(&user, &host)?,
             };
-            ssh_ensure(&model, &user, Some(&host), &password)
+            ssh_ensure(&model, &user, Some(&host), &password, quiet)
         }
     }
 }
@@ -729,6 +791,32 @@ fn run_status_redacted(
         return Err(grafhome_ca::Error::Validation {
             field: "command".to_owned(),
             message: format!("{debug} failed with {status}"),
+        });
+    }
+    Ok(())
+}
+
+fn run_status_quiet(
+    command: &mut ProcessCommand,
+    redactions: &[&str],
+    quiet: bool,
+) -> grafhome_ca::Result<()> {
+    if !quiet {
+        return run_status_redacted(command, redactions);
+    }
+    let debug = redacted_command(command, redactions);
+    let output = command.output().map_err(|source| {
+        grafhome_ca::Error::io(command.get_program().to_string_lossy().into_owned(), source)
+    })?;
+    if !output.status.success() {
+        let stderr = redact_text(&String::from_utf8_lossy(&output.stderr), redactions);
+        return Err(grafhome_ca::Error::Validation {
+            field: "command".to_owned(),
+            message: format!(
+                "{debug} failed with {}; stderr: {}",
+                output.status,
+                stderr.trim()
+            ),
         });
     }
     Ok(())
@@ -1103,24 +1191,49 @@ fn parse_enrollment_document<T: serde::de::DeserializeOwned>(
     text: &str,
     label: &str,
 ) -> grafhome_ca::Result<T> {
-    let document = text
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or(text.trim())
-        .strip_prefix("REQUEST:")
-        .or_else(|| {
-            text.lines()
+    let text =
+        text.trim_matches(|character: char| character.is_whitespace() || character == '\u{feff}');
+    let document = strip_enrollment_label(text).unwrap_or_else(|| {
+        // Preserve paste-from-terminal convenience when a labeled one-line document
+        // is surrounded by prompts or informational output.
+        text.lines()
+            .rev()
+            .find_map(|line| strip_enrollment_label(line.trim()))
+            .unwrap_or(text)
+    });
+    match serde_json::from_str(document) {
+        Ok(value) => Ok(value),
+        Err(source) => {
+            let line_document = text
+                .lines()
                 .rev()
-                .map(str::trim)
-                .find_map(|line| line.strip_prefix("GRANT:"))
-        })
-        .unwrap_or_else(|| text.trim());
-    serde_json::from_str(document).map_err(|source| grafhome_ca::Error::Json {
-        path: PathBuf::from(label),
-        source,
-    })
+                .find_map(|line| strip_enrollment_label(line.trim()));
+            if let Some(line_document) = line_document
+                && line_document != document
+            {
+                return serde_json::from_str(line_document).map_err(|source| {
+                    grafhome_ca::Error::Json {
+                        path: PathBuf::from(label),
+                        source,
+                    }
+                });
+            }
+            Err(grafhome_ca::Error::Json {
+                path: PathBuf::from(label),
+                source,
+            })
+        }
+    }
+}
+
+fn strip_enrollment_label(text: &str) -> Option<&str> {
+    let (prefix, document) = text.split_once(':')?;
+    if prefix.trim().eq_ignore_ascii_case("REQUEST") || prefix.trim().eq_ignore_ascii_case("GRANT")
+    {
+        Some(document.trim())
+    } else {
+        None
+    }
 }
 
 fn resolve_user(user: Option<&str>) -> grafhome_ca::Result<String> {
@@ -1269,12 +1382,12 @@ fn validate_renewal_password(
 fn confirm_user_approval(request: &UserRequest) -> grafhome_ca::Result<()> {
     confirm_approval(
         &format!("{}@{}", request.user, request.host),
-        "approve-user",
+        "approve user",
     )
 }
 
 fn confirm_host_approval(request: &HostRequest) -> grafhome_ca::Result<()> {
-    confirm_approval(&request.host, "approve-host")
+    confirm_approval(&request.host, "approve host")
 }
 
 fn confirm_approval(identity: &str, command: &str) -> grafhome_ca::Result<()> {
@@ -1337,7 +1450,7 @@ fn enroll_user_flow(
         let text = serde_json::to_string(&request).expect("enrollment request serializes");
         write_secret_file(&pending_path, text.as_bytes())?;
         eprintln!("Created a public enrollment request for {user}@{host}.");
-        eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve-user");
+        eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve user");
         outln!("REQUEST:{text}");
         std::io::stdout()
             .flush()
@@ -1377,7 +1490,7 @@ fn enroll_user_flow(
         Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
         None => lookup_renewal_password(&user, &host)?,
     };
-    ssh_ensure(model, &user, Some(&host), &password)?;
+    ssh_ensure(model, &user, Some(&host), &password, false)?;
     std::fs::remove_file(&pending_path)
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
     outln!("Enrollment complete. Try: ssh nas");
@@ -1392,10 +1505,10 @@ fn approve_user_enrollment(
 ) -> grafhome_ca::Result<()> {
     request.validate()?;
     if let Some(ttl) = token_ttl {
-        checked_ttl("approve-user.ttl", ttl)?;
+        checked_ttl("approve user.ttl", ttl)?;
     }
     if let Some(ttl) = cert_ttl {
-        checked_ttl("approve-user.cert_ttl", ttl)?;
+        checked_ttl("approve user.cert_ttl", ttl)?;
     }
     active_user(model, &request.user)?;
     required_user_device(model, &request.user, &request.host)?;
@@ -1411,7 +1524,7 @@ fn approve_user_enrollment(
         String::from_utf8_lossy(&token).trim(),
     );
     eprintln!("Approved {}@{}.", request.user, request.host);
-    eprintln!("Copy the GRANT line back to the pending enroll-user command.");
+    eprintln!("Copy the GRANT line back to the pending enroll user command.");
     outln!(
         "GRANT:{}",
         serde_json::to_string(&grant).expect("user grant serializes")
@@ -1486,7 +1599,7 @@ fn enroll_host_flow(
         let text = serde_json::to_string(&request).expect("host enrollment request serializes");
         write_secret_file(&pending_path, text.as_bytes())?;
         eprintln!("Created a public host enrollment request for {host}.");
-        eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve-host");
+        eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve host");
         outln!("REQUEST:{text}");
         std::io::stdout()
             .flush()
@@ -1528,10 +1641,10 @@ fn approve_host_enrollment(
 ) -> grafhome_ca::Result<()> {
     request.validate()?;
     if let Some(ttl) = token_ttl {
-        checked_ttl("approve-host.ttl", ttl)?;
+        checked_ttl("approve host.ttl", ttl)?;
     }
     if let Some(ttl) = cert_ttl {
-        checked_ttl("approve-host.cert_ttl", ttl)?;
+        checked_ttl("approve host.cert_ttl", ttl)?;
     }
     required_host(model, &request.host)?;
     let token = create_host_token(model, &request.host, token_ttl, cert_ttl)?;
@@ -1545,7 +1658,7 @@ fn approve_host_enrollment(
         String::from_utf8_lossy(&token).trim(),
     );
     eprintln!("Approved {}.", request.host);
-    eprintln!("Copy the GRANT line back to the pending enroll-host command.");
+    eprintln!("Copy the GRANT line back to the pending enroll host command.");
     outln!(
         "GRANT:{}",
         serde_json::to_string(&grant).expect("host grant serializes")
@@ -1803,7 +1916,7 @@ fn renew_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
     if !private_jwk.exists() || !password_file.exists() {
         return Err(grafhome_ca::Error::Validation {
             field: material_dir.display().to_string(),
-            message: "host renewal credential is missing; run enroll-host".to_owned(),
+            message: "host renewal credential is missing; run enroll host".to_owned(),
         });
     }
     let mut token_command = process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]);
@@ -2040,7 +2153,7 @@ fn authorize_host_locked(
 fn revoke_user(model: &SiteModel, user_name: &str, host: Option<&str>) -> grafhome_ca::Result<()> {
     if user_name.trim().is_empty() {
         return Err(grafhome_ca::Error::Validation {
-            field: "revoke-user.user".to_owned(),
+            field: "revoke user.user".to_owned(),
             message: "user must not be empty".to_owned(),
         });
     }
@@ -2077,7 +2190,7 @@ fn revoke_user(model: &SiteModel, user_name: &str, host: Option<&str>) -> grafho
 fn revoke_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
     if host_name.trim().is_empty() {
         return Err(grafhome_ca::Error::Validation {
-            field: "revoke-host.host".to_owned(),
+            field: "revoke host.host".to_owned(),
             message: "host must not be empty".to_owned(),
         });
     }
@@ -2459,6 +2572,7 @@ fn ssh_ensure(
     user_name: &str,
     host: Option<&str>,
     password: &str,
+    quiet: bool,
 ) -> grafhome_ca::Result<()> {
     let user = active_user(model, user_name)?;
     let device = match host {
@@ -2500,7 +2614,7 @@ fn ssh_ensure(
         field: "step ca token".to_owned(),
         message: format!("token output was not UTF-8: {error}"),
     })?;
-    run_status_redacted(
+    run_status_quiet(
         process(USER_STEP_BIN)
             .env("STEPPATH", user_steppath(model)?)
             .arg("ssh")
@@ -2517,8 +2631,13 @@ fn ssh_ensure(
             .arg("--force")
             .arg("--no-agent"),
         &[token.trim()],
+        quiet,
     )?;
-    run_status(process("ssh-keygen").arg("-L").arg("-f").arg(certificate))
+    run_status_quiet(
+        process("ssh-keygen").arg("-L").arg("-f").arg(certificate),
+        &[],
+        quiet,
+    )
 }
 
 fn user_certificate_needs_renewal(
@@ -2902,4 +3021,65 @@ fn print_plan(plan: &grafhome_ca::lifecycle::Plan) -> grafhome_ca::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_enrollment_document;
+
+    #[test]
+    fn enrollment_document_accepts_bare_json_with_surrounding_whitespace() {
+        let value: serde_json::Value =
+            parse_enrollment_document("\n\t {\"version\": 1} \r\n", "document").unwrap();
+
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
+    fn enrollment_document_accepts_request_label_and_multiline_json() {
+        let value: serde_json::Value =
+            parse_enrollment_document("  request :  {\n  \"version\": 1\n}  \n", "document")
+                .unwrap();
+
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
+    fn enrollment_document_accepts_grant_label_with_terminal_output() {
+        let value: serde_json::Value = parse_enrollment_document(
+            "Waiting for input...\n  GRANT: {\"version\": 1}  \nshell prompt",
+            "document",
+        )
+        .unwrap();
+
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
+    fn enrollment_document_accepts_request_label_before_terminal_output() {
+        let value: serde_json::Value = parse_enrollment_document(
+            "REQUEST: {\"version\": 1}\nWaiting for the enrollment grant...",
+            "document",
+        )
+        .unwrap();
+
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
+    fn enrollment_document_accepts_grant_label_before_terminal_output() {
+        let value: serde_json::Value =
+            parse_enrollment_document("GRANT: {\"version\": 1}\nshell prompt", "document").unwrap();
+
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
+    fn enrollment_document_rejects_unknown_labels() {
+        let error =
+            parse_enrollment_document::<serde_json::Value>("TOKEN: {\"version\": 1}", "document")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("document"));
+    }
 }

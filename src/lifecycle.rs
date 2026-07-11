@@ -374,8 +374,8 @@ pub fn host_bootstrap(model: &SiteModel, host: &str) -> Result<Plan> {
             summary: "create and consume a short-lived host enrollment token before enabling HostCertificate".to_owned(),
             hosts: unique_hosts([host.host.clone(), ca_origin.target.clone()]),
             commands: vec![
-                "grafhome-ca approve-host".to_owned(),
-                format!("grafhome-ca enroll-host --host {}", sh(&host.host)),
+                "grafhome-ca approve host".to_owned(),
+                format!("grafhome-ca enroll host --host {}", sh(&host.host)),
             ],
             files: vec![host_public_key_path(model), host_cert_path(model)],
             manual: true,
@@ -761,7 +761,7 @@ pub fn enroll_user(model: &SiteModel, user: &str, host: &str) -> Result<Plan> {
                 summary: "run once on the user device; copy its public request to the CA and paste the returned grant into the waiting command".to_owned(),
                 hosts: vec![device.device.clone()],
                 commands: vec![format!(
-                    "grafhome-ca enroll-user --user {} --host {}",
+                    "grafhome-ca enroll user --user {} --host {}",
                     sh(&user.user),
                     sh(&device.device)
                 )],
@@ -778,7 +778,7 @@ pub fn enroll_user(model: &SiteModel, user: &str, host: &str) -> Result<Plan> {
                 id: STEP_REGISTER_USER_PROVISIONER.to_owned(),
                 summary: "run on the CA origin as root; paste and approve the public request, then copy the secret grant back".to_owned(),
                 hosts: vec![ca_origin.target.clone()],
-                commands: vec!["grafhome-ca approve-user".to_owned()],
+                commands: vec!["grafhome-ca approve user".to_owned()],
                 files: vec![format!(
                     "{}/config/ca.json",
                     model.deployment.ca_steppath()
@@ -912,11 +912,11 @@ pub fn add_user(model: &SiteModel, user: &str) -> Result<Plan> {
                 hosts: Vec::new(),
                 commands: vec![
                     format!(
-                        "grafhome-ca enroll-user --user {} --host {}",
+                        "grafhome-ca enroll user --user {} --host {}",
                         sh(user),
                         sh("<client-host>")
                     ),
-                    "grafhome-ca approve-user".to_owned(),
+                    "grafhome-ca approve user".to_owned(),
                 ],
                 files: vec![],
                 manual: true,
@@ -1167,7 +1167,7 @@ fn host_enroll_command(model: &SiteModel, host: &Host, ca_url: &str) -> String {
 }
 
 fn host_renew_command(host: &str) -> String {
-    format!("grafhome-ca renew-host --host {}", sh(host))
+    format!("grafhome-ca renew host --host {}", sh(host))
 }
 
 fn user_token_command(
@@ -1989,8 +1989,8 @@ mod tests {
         assert_eq!(
             plan.steps[2].commands,
             vec![
-                "grafhome-ca approve-host",
-                "grafhome-ca enroll-host --host proxy-host"
+                "grafhome-ca approve host",
+                "grafhome-ca enroll host --host proxy-host"
             ]
         );
         assert!(
@@ -2049,7 +2049,7 @@ mod tests {
         assert!(!plan.steps[0].manual);
         assert_eq!(
             plan.steps[0].commands[0],
-            "grafhome-ca renew-host --host edge-host"
+            "grafhome-ca renew host --host edge-host"
         );
     }
 
@@ -2081,7 +2081,7 @@ mod tests {
         assert!(
             plan.steps
                 .iter()
-                .all(|step| step.commands[0].starts_with("grafhome-ca renew-host --host "))
+                .all(|step| step.commands[0].starts_with("grafhome-ca renew host --host "))
         );
     }
 
@@ -2186,9 +2186,9 @@ mod tests {
         );
         assert_eq!(
             plan.steps[0].commands,
-            vec!["grafhome-ca enroll-user --user alice --host ca-host"]
+            vec!["grafhome-ca enroll user --user alice --host ca-host"]
         );
-        assert_eq!(plan.steps[1].commands, vec!["grafhome-ca approve-user"]);
+        assert_eq!(plan.steps[1].commands, vec!["grafhome-ca approve user"]);
         assert_eq!(plan.steps[0].hosts, vec!["ca-host"]);
         assert_eq!(plan.steps[1].hosts, vec!["ca-host"]);
     }
@@ -2283,8 +2283,8 @@ mod tests {
         assert_eq!(
             plan.steps[1].commands,
             vec![
-                "grafhome-ca enroll-user --user new-user --host '<client-host>'",
-                "grafhome-ca approve-user"
+                "grafhome-ca enroll user --user new-user --host '<client-host>'",
+                "grafhome-ca approve user"
             ]
         );
     }
