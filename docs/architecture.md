@@ -14,7 +14,7 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 - Parse and validate private policy inventories without compiling them into the binary.
 - Render non-secret config into a staging directory from typed policy.
 - Export public CA trust material from initialized Smallstep state for reviewed rollout.
-- Provide CLIs for validation, lifecycle orchestration, and local cert renewal.
+- Provide CLIs for validation, scoped enrollment, renewal, and revocation.
 - Keep machine-readable statuses and identifiers centralized.
 
 ## Non-Rust Responsibilities
@@ -37,30 +37,8 @@ without certificate serial lookup. Existing SSH certificates remain valid until
 expiry because OpenSSH does not perform online CA revocation checks.
 `enroll host` installs only host-specific SSH trust/configuration after issuing
 the host certificate, validates JWK renewal and `sshd`, and reloads it. Broader
-firewall, DNS, Apache, CA initialization, and fleet rollout changes remain
-explicitly gated behind reviewed plans.
-
-Lifecycle plans are structured data, not execution. They deliberately describe
-commands and files that future executors can mock or run behind explicit
-operator gates. The `commands` entries are POSIX-shell command lines intended
-for an operator shell or a shell-backed executor; non-shell executors must
-either invoke them through that contract or grow a structured argv field before
-executing plan output directly.
-
-Command arguments derived from config or policy are shell-quoted by the planner.
-Quoted angle-bracket paths identify operator-provided rollout inputs, not public
-repo files. For example, initial JWK-backed SSH certificate issuance requires a
-private provisioner password file placeholder, while public trust installation
-uses the private rollout export directory produced by `export-public`.
-Backup and restore-test plans use the same convention for `<backup-file>` and
-`<restore-test-dir>` so operators choose durable private locations explicitly.
-
-The planner includes live-verification and proxy-certificate operations, but
-they remain reviewable command plans. They do not mutate live hosts until an
-operator runs them during the separate rollout phase. Proxy certificate plans
-model Smallstep ACME issuance through the configured `proxy_x509` provisioner
-and use the configured `GRAFHOME_CA_PROXY_ACME_WEBROOT` for HTTP-01 challenge
-serving. DNS and Apache routing still belong to private site configuration.
+firewall, DNS, Apache, CA initialization, backup, and fleet rollout changes
+remain owned by private configuration management and explicit operator runbooks.
 
 Rendered files are staging artifacts, not an imperative deploy. They must
 either contain complete non-secret support files, such as empty revocation
@@ -75,7 +53,7 @@ files from previous renders cannot be installed accidentally. Clean renders
 remove generated top-level roots, such as `hosts/`, rather than deleting every
 child in the staging directory.
 
-`export-public` is a read-only bridge from initialized Smallstep state to
+`export` is a read-only bridge from initialized Smallstep state to
 rollout inputs. It reads the root certificate and SSH CA public keys, computes
 the root fingerprint with the configured `step` binary, and emits a no-secret
 bundle whose manifest is validated by
@@ -85,11 +63,3 @@ principals, so real exports belong in private rollout state and must not be
 committed to the public repository. The command must never read from
 `step/secrets` or export provisioner tokens, encrypted JWKs, passwords, or
 private keys.
-
-Plan steps include stable operation/step identifiers and a structured `hosts`
-list. Automation should use those machine-readable fields for routing and
-policy decisions, not parse human-readable summaries.
-
-Generated plan JSON is validated by `schemas/lifecycle/plan.schema.json`. When
-adding a lifecycle operation or step kind, update the Rust constants, schema,
-and tests together so future executors get a coherent contract.

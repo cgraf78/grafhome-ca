@@ -16,7 +16,7 @@ that XDG location in a private repository or private host configuration system,
 then replace every example hostname, address, account, and path with site-local
 values. Runtime secrets such as CA private keys, passwords, provisioner
 encrypted keys, SSH private keys, and tokens still do not belong in these files.
-After a real CA is initialized, `grafhome-ca export-public` derives rollout
+After a real CA is initialized, `grafhome-ca export` derives rollout
 inputs from the CA's public state and writes a bundle whose `manifest.json`
 matches `schemas/public/export-manifest.schema.json`. Real export bundles may
 include private topology in CA URLs and host principals, so they should stay in

@@ -1,4 +1,4 @@
-//! Grafhome CA repository and lifecycle CLI.
+//! Grafhome CA policy, enrollment, and certificate CLI.
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 #[cfg(unix)]
@@ -20,6 +20,7 @@ use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{ClientDevice, Endpoint, Host, Provisioner, User};
 
 const USER_STEP_BIN: &str = "step";
+const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
 const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
 const CA_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CA_HEALTH_CONSECUTIVE_SUCCESSES: usize = 2;
@@ -32,7 +33,7 @@ macro_rules! outln {
 
 #[derive(Debug, Parser)]
 #[command(name = "grafhome-ca")]
-#[command(about = "Grafhome CA policy and lifecycle tooling")]
+#[command(about = "Grafhome CA policy, enrollment, and certificate tooling")]
 #[command(version = grafhome_ca::version::cli())]
 struct Cli {
     #[command(subcommand)]
@@ -49,35 +50,29 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
     },
-    /// Show derived endpoint URLs.
-    Endpoints {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-    },
     /// Render non-secret deployment files into a staging directory.
     Render {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
         /// Output directory for rendered staging files.
-        #[arg(long)]
-        out_dir: PathBuf,
+        #[arg(long, required_unless_present = "dry_run")]
+        out_dir: Option<PathBuf>,
         /// Show rendered paths without writing files.
         #[arg(long)]
         dry_run: bool,
         /// Remove stale files under the output directory before writing.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dry_run")]
         clean: bool,
     },
     /// Export public CA trust material into a staging directory.
-    ExportPublic {
+    Export {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
         /// Output directory for exported public trust material.
-        #[arg(long)]
-        out_dir: PathBuf,
+        #[arg(long, required_unless_present = "dry_run")]
+        out_dir: Option<PathBuf>,
         /// Show exported paths without writing files.
         #[arg(long)]
         dry_run: bool,
@@ -90,7 +85,7 @@ enum Command {
         config_root: Option<PathBuf>,
     },
     /// Materialize runtime JWK provisioners into a rendered CA config.
-    MaterializeRuntimeProvisioners {
+    Materialize {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
@@ -106,23 +101,6 @@ enum Command {
         /// Write materialized ca.json to this file with owner-only permissions.
         #[arg(long, value_name = "FILE")]
         out_file: PathBuf,
-    },
-    /// Produce a structured lifecycle plan without executing it.
-    Plan {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Emit JSON instead of text.
-        #[arg(long)]
-        json: bool,
-        #[command(subcommand)]
-        command: PlanCommand,
-    },
-    /// Print the trusted CA root fingerprint from the local CA state.
-    CaFingerprint {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
     },
     /// Approve a public enrollment request on the CA origin.
     Approve {
@@ -144,22 +122,22 @@ enum Command {
         #[command(subcommand)]
         command: RevokeCommand,
     },
-    /// Report scoped host and user enrollment identities from live CA state.
-    EnrollmentStatus {
+    /// Report enrollment and local renewal readiness from live CA state.
+    Status {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// Limit the report to this policy user.
+        /// Policy user. With no filters, defaults to the current non-root account.
         #[arg(long)]
         user: Option<String>,
-        /// Limit the report to this policy host.
+        /// Policy host. With no filters, defaults to the short local hostname.
         #[arg(long)]
         host: Option<String>,
         /// Print nothing and exit unsuccessfully when the requested enrollment is absent.
         #[arg(long)]
         quiet: bool,
         /// Also require the local credential material needed for unattended renewal.
-        #[arg(long, requires = "quiet")]
+        #[arg(long)]
         renewable: bool,
     },
 }
@@ -254,6 +232,12 @@ enum RenewCommand {
         /// Host policy name. Defaults to the short local hostname.
         #[arg(long)]
         host: Option<String>,
+        /// Exit successfully without output unless this host is enrolled and renewable.
+        #[arg(long)]
+        if_enrolled: bool,
+        /// Suppress successful renewal output. Errors are still reported.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Renew this user's SSH certificate.
     User {
@@ -269,6 +253,9 @@ enum RenewCommand {
         /// Read the user-owned provisioner password from this file instead of stored credentials.
         #[arg(long, value_name = "FILE")]
         password_file: Option<PathBuf>,
+        /// Exit successfully without output unless this user is enrolled and renewable.
+        #[arg(long)]
+        if_enrolled: bool,
         /// Suppress successful renewal output. Errors are still reported.
         #[arg(long)]
         quiet: bool,
@@ -297,34 +284,6 @@ enum RevokeCommand {
         /// Revoke only the device on this host. Omit to revoke every device.
         #[arg(long)]
         host: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum PlanCommand {
-    /// Plan CA initialization.
-    InitCa,
-    /// Plan CA state backup and restore-test.
-    BackupCa,
-    /// Plan live non-mutating rollout verification.
-    VerifyLive {
-        /// Limit verification to one host's SSH rollout checks.
-        #[arg(long)]
-        host: Option<String>,
-    },
-    /// Plan proxy X.509 certificate issuance or renewal.
-    ProxyCert,
-    /// Plan policy edits for a new host.
-    AddHost {
-        /// New host policy name.
-        #[arg(long)]
-        host: String,
-    },
-    /// Plan policy edits for a new user.
-    AddUser {
-        /// New user policy name.
-        #[arg(long)]
-        user: String,
     },
 }
 
@@ -360,14 +319,6 @@ fn run() -> grafhome_ca::Result<()> {
             );
             Ok(())
         }
-        Command::Endpoints { config_root } => {
-            let config_root = resolve_config_root(config_root)?;
-            let model = SiteModel::load(&config_root)?;
-            for endpoint in &model.policy.endpoints {
-                outln!("{}\t{}\t{}", endpoint.role, endpoint.target, endpoint.url());
-            }
-            Ok(())
-        }
         Command::Render {
             config_root,
             out_dir,
@@ -383,6 +334,7 @@ fn run() -> grafhome_ca::Result<()> {
                     outln!("{:04o}\t{}", file.mode, file.path.display());
                 }
             } else {
+                let out_dir = out_dir.expect("clap requires --out-dir unless --dry-run");
                 if clean {
                     grafhome_ca::render::write_clean(&files, &out_dir)?;
                 } else {
@@ -392,7 +344,7 @@ fn run() -> grafhome_ca::Result<()> {
             }
             Ok(())
         }
-        Command::ExportPublic {
+        Command::Export {
             config_root,
             out_dir,
             dry_run,
@@ -406,6 +358,7 @@ fn run() -> grafhome_ca::Result<()> {
                     outln!("{:04o}\t{}", file.mode, file.path.display());
                 }
             } else {
+                let out_dir = out_dir.expect("clap requires --out-dir unless --dry-run");
                 let files = grafhome_ca::public_material::collect(&model)?;
                 grafhome_ca::public_material::write(&files, &out_dir)?;
                 outln!(
@@ -426,7 +379,7 @@ fn run() -> grafhome_ca::Result<()> {
             );
             Ok(())
         }
-        Command::MaterializeRuntimeProvisioners {
+        Command::Materialize {
             config_root,
             live_ca_json,
             staged_ca_json,
@@ -444,45 +397,6 @@ fn run() -> grafhome_ca::Result<()> {
             )?;
             write_secret_file(&out_file, text.as_bytes())?;
             Ok(())
-        }
-        Command::Plan {
-            config_root,
-            json,
-            command,
-        } => {
-            let config_root = resolve_config_root(config_root)?;
-            let model = SiteModel::load(&config_root)?;
-            grafhome_ca::schema::validate_config_root(&config_root)?;
-            let plan = match command {
-                PlanCommand::InitCa => grafhome_ca::lifecycle::init_ca(&model)?,
-                PlanCommand::BackupCa => grafhome_ca::lifecycle::backup_ca(&model)?,
-                PlanCommand::VerifyLive { host } => {
-                    grafhome_ca::lifecycle::verify_live(&model, host.as_deref())?
-                }
-                PlanCommand::ProxyCert => grafhome_ca::lifecycle::proxy_cert(&model)?,
-                PlanCommand::AddHost { host } => grafhome_ca::lifecycle::add_host(&model, &host)?,
-                PlanCommand::AddUser { user } => grafhome_ca::lifecycle::add_user(&model, &user)?,
-            };
-            grafhome_ca::schema::validate_lifecycle_plan(&plan)?;
-            if json {
-                outln!(
-                    "{}",
-                    serde_json::to_string_pretty(&plan).expect("plan serializes")
-                );
-            } else {
-                print_plan(&plan)?;
-            }
-            Ok(())
-        }
-        Command::CaFingerprint { config_root } => {
-            let model = load_valid_model(config_root)?;
-            let output = run_capture(
-                process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
-                    .arg("certificate")
-                    .arg("fingerprint")
-                    .arg(ca_root_cert_path(&model)),
-            )?;
-            write_raw_stdout(&output)
         }
         Command::Approve {
             command:
@@ -521,17 +435,26 @@ fn run() -> grafhome_ca::Result<()> {
             enroll_host_flow(&model, host.as_deref(), grant_file.as_deref(), request_only)
         }
         Command::Renew {
-            command: RenewCommand::Host { config_root, host },
+            command:
+                RenewCommand::Host {
+                    config_root,
+                    host,
+                    if_enrolled,
+                    quiet,
+                },
         } => {
             let model = load_valid_model(config_root)?;
             let host = resolve_host(host.as_deref())?;
+            if if_enrolled && !status(&model, None, Some(&host), true, true)? {
+                return Ok(());
+            }
             if !ssh_certificate_needs_renewal(
                 &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"],
                 &host_cert_path(&model),
             )? {
                 return Ok(());
             }
-            renew_host(&model, &host)
+            renew_host(&model, &host, quiet)
         }
         Command::Enroll {
             command:
@@ -595,7 +518,7 @@ fn run() -> grafhome_ca::Result<()> {
             let model = load_valid_model(config_root)?;
             revoke_host(&model, &host)
         }
-        Command::EnrollmentStatus {
+        Command::Status {
             config_root,
             user,
             host,
@@ -603,8 +526,8 @@ fn run() -> grafhome_ca::Result<()> {
             renewable,
         } => {
             let model = load_valid_model(config_root)?;
-            let enrolled =
-                enrollment_status(&model, user.as_deref(), host.as_deref(), quiet, renewable)?;
+            let (user, host) = resolve_status_scope(user, host)?;
+            let enrolled = status(&model, user.as_deref(), host.as_deref(), quiet, renewable)?;
             if quiet && !enrolled {
                 std::process::exit(1);
             }
@@ -617,6 +540,7 @@ fn run() -> grafhome_ca::Result<()> {
                     user,
                     host,
                     password_file,
+                    if_enrolled,
                     quiet,
                 },
         } => {
@@ -624,6 +548,13 @@ fn run() -> grafhome_ca::Result<()> {
             let mut stdin = std::io::stdin().lock();
             let user = resolve_user(user.as_deref())?;
             let host = resolve_host(host.as_deref())?;
+            if if_enrolled {
+                let local_ready =
+                    user_local_renewal_ready(&model, &user, &host, password_file.is_none())?;
+                if !local_ready || !status(&model, Some(&user), Some(&host), true, false)? {
+                    return Ok(());
+                }
+            }
             if !user_certificate_needs_renewal(&model, &user, &host)? {
                 return Ok(());
             }
@@ -631,7 +562,7 @@ fn run() -> grafhome_ca::Result<()> {
                 Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
                 None => lookup_renewal_password(&user, &host)?,
             };
-            ssh_ensure(&model, &user, Some(&host), &password, quiet)
+            renew_user(&model, &user, Some(&host), &password, quiet)
         }
     }
 }
@@ -656,14 +587,6 @@ fn write_stdout(args: std::fmt::Arguments<'_>) -> grafhome_ca::Result<()> {
         return handle_stdout_error(source);
     }
     if let Err(source) = stdout.write_all(b"\n") {
-        return handle_stdout_error(source);
-    }
-    Ok(())
-}
-
-fn write_raw_stdout(content: &[u8]) -> grafhome_ca::Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    if let Err(source) = stdout.write_all(content) {
         return handle_stdout_error(source);
     }
     Ok(())
@@ -1519,7 +1442,7 @@ fn enroll_user_flow(
         Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
         None => lookup_renewal_password(&user, &host)?,
     };
-    ssh_ensure(model, &user, Some(&host), &password, false)?;
+    renew_user(model, &user, Some(&host), &password, false)?;
     std::fs::remove_file(&pending_path)
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
     outln!("Enrollment complete. Try: ssh nas");
@@ -1656,7 +1579,7 @@ fn enroll_host_flow(
         });
     }
     complete_host_enrollment(model, &grant)?;
-    renew_host(model, &host)?;
+    renew_host(model, &host, false)?;
     std::fs::remove_file(&pending_path)
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
     Ok(())
@@ -1707,7 +1630,7 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
     enroll_host(model, &grant.host, &grant.token)?;
     install_host_ssh_trust(model, &grant.host, &grant.ca_url)?;
     run_status(process("sshd").arg("-t"))?;
-    reload_ssh()?;
+    reload_ssh(false)?;
     outln!("Host enrollment complete: {}", grant.host);
     Ok(())
 }
@@ -1868,7 +1791,7 @@ fn create_host_token(
     let provisioner = required_provisioner(model, "host_bootstrap")?;
     let token_ttl = checked_ttl(
         "create-host-token.ttl",
-        token_ttl.unwrap_or(grafhome_ca::lifecycle::DEFAULT_ENROLLMENT_TOKEN_TTL),
+        token_ttl.unwrap_or(DEFAULT_ENROLLMENT_TOKEN_TTL),
     )?;
     let cert_ttl = checked_ttl(
         "create-host-token.cert_ttl",
@@ -1932,10 +1855,10 @@ fn enroll_host(model: &SiteModel, host: &str, token: &str) -> grafhome_ca::Resul
             .arg(host_cert_path(model)),
     )?;
     run_status(process("sshd").arg("-t"))?;
-    reload_ssh()
+    reload_ssh(false)
 }
 
-fn renew_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
+fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::Result<()> {
     let host = required_host(model, host_name)?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let host_policy = required_provisioner(model, "host_bootstrap")?;
@@ -1983,7 +1906,7 @@ fn renew_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
         field: "step ca token".to_owned(),
         message: format!("token output was not UTF-8: {error}"),
     })?;
-    run_status_redacted(
+    run_status_quiet(
         process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
             .env(
                 "STEPPATH",
@@ -2003,15 +1926,18 @@ fn renew_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
             .arg(server_root_cert_path(model))
             .arg("--force"),
         &[token.trim()],
+        quiet,
     )?;
-    run_status(
+    run_status_quiet(
         process("ssh-keygen")
             .arg("-L")
             .arg("-f")
             .arg(host_cert_path(model)),
+        &[],
+        quiet,
     )?;
-    run_status(process("sshd").arg("-t"))?;
-    reload_ssh()
+    run_status_quiet(process("sshd").arg("-t"), &[], quiet)?;
+    reload_ssh(quiet)
 }
 
 fn create_user_token(
@@ -2026,7 +1952,7 @@ fn create_user_token(
     let ca_api = required_endpoint(model, "ca_api")?;
     let token_ttl = checked_ttl(
         "create-user-token.ttl",
-        token_ttl.unwrap_or(grafhome_ca::lifecycle::DEFAULT_ENROLLMENT_TOKEN_TTL),
+        token_ttl.unwrap_or(DEFAULT_ENROLLMENT_TOKEN_TTL),
     )?;
     let cert_ttl = checked_ttl(
         "create-user-token.cert_ttl",
@@ -2247,20 +2173,22 @@ fn revoke_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
     })
 }
 
-fn enrollment_status(
+fn status(
     model: &SiteModel,
     user: Option<&str>,
     host: Option<&str>,
     quiet: bool,
     renewable: bool,
 ) -> grafhome_ca::Result<bool> {
-    if user.is_none() && host.is_none() {
-        return Err(grafhome_ca::Error::Validation {
-            field: "enrollment-status".to_owned(),
-            message: "pass --user, --host, or both".to_owned(),
-        });
-    }
     if renewable && !local_renewal_ready(model, user, host)? {
+        if !quiet {
+            let identity = match (user, host) {
+                (Some(user), Some(host)) => format!("user {user} on {host}"),
+                (None, Some(host)) => format!("host {host}"),
+                _ => "requested enrollment".to_owned(),
+            };
+            outln!("{identity}: not renewable locally");
+        }
         return Ok(false);
     }
     let Some(names) = remote_provisioner_names(model, user, quiet)? else {
@@ -2327,8 +2255,24 @@ fn enrollment_status(
             }
             Ok(host_enrolled)
         }
-        (None, None) => unreachable!("validated enrollment-status filters"),
+        (None, None) => unreachable!("status scope is inferred before lookup"),
     }
+}
+
+fn resolve_status_scope(
+    user: Option<String>,
+    host: Option<String>,
+) -> grafhome_ca::Result<(Option<String>, Option<String>)> {
+    if user.is_some() || host.is_some() {
+        return Ok((user, host));
+    }
+    let host = Some(resolve_host(None)?);
+    let user = if std::env::var("USER").as_deref() == Ok("root") {
+        None
+    } else {
+        Some(resolve_user(None)?)
+    };
+    Ok((user, host))
 }
 
 fn local_renewal_ready(
@@ -2338,21 +2282,30 @@ fn local_renewal_ready(
 ) -> grafhome_ca::Result<bool> {
     let Some(host) = host else {
         return Err(grafhome_ca::Error::Validation {
-            field: "enrollment-status --renewable".to_owned(),
+            field: "status --renewable".to_owned(),
             message: "requires --host".to_owned(),
         });
     };
     match user {
-        Some(user) => Ok(user_root_cert_path(model)?.is_file()
-            && user_device_material_dir(user, host)?
-                .join("provisioner.priv.json")
-                .is_file()
-            && renewal_credential_path(user, host)?.is_file()),
+        Some(user) => user_local_renewal_ready(model, user, host, true),
         None => Ok(server_root_cert_path(model).is_file()
             && host_material_dir(model, host)
                 .join("provisioner.priv.json")
                 .is_file()),
     }
+}
+
+fn user_local_renewal_ready(
+    model: &SiteModel,
+    user: &str,
+    host: &str,
+    require_stored_credential: bool,
+) -> grafhome_ca::Result<bool> {
+    Ok(user_root_cert_path(model)?.is_file()
+        && user_device_material_dir(user, host)?
+            .join("provisioner.priv.json")
+            .is_file()
+        && (!require_stored_credential || renewal_credential_path(user, host)?.is_file()))
 }
 
 fn remote_provisioner_names(
@@ -2366,7 +2319,7 @@ fn remote_provisioner_names(
             return Ok(None);
         }
         return Err(grafhome_ca::Error::Validation {
-            field: "enrollment-status trust root".to_owned(),
+            field: "status trust root".to_owned(),
             message: "no locally pinned CA root is installed; this machine is not enrolled"
                 .to_owned(),
         });
@@ -2596,7 +2549,7 @@ fn ca_json_backup_path(ca_json: &Path) -> PathBuf {
     ))
 }
 
-fn ssh_ensure(
+fn renew_user(
     model: &SiteModel,
     user_name: &str,
     host: Option<&str>,
@@ -2948,11 +2901,11 @@ fn with_temp_file<T>(
     action(file.path())
 }
 
-fn reload_ssh() -> grafhome_ca::Result<()> {
-    if run_status(process("systemctl").arg("reload").arg("ssh")).is_ok() {
+fn reload_ssh(quiet: bool) -> grafhome_ca::Result<()> {
+    if run_status_quiet(process("systemctl").arg("reload").arg("ssh"), &[], quiet).is_ok() {
         return Ok(());
     }
-    run_status(process("systemctl").arg("reload").arg("sshd"))
+    run_status_quiet(process("systemctl").arg("reload").arg("sshd"), &[], quiet)
 }
 
 fn split_list(value: &str) -> impl Iterator<Item = &str> {
@@ -3029,26 +2982,6 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
     let temp_path = file.into_temp_path();
     std::fs::rename(&temp_path, path).map_err(|source| grafhome_ca::Error::io(path, source))?;
     let _ = temp_path.close();
-    Ok(())
-}
-
-fn print_plan(plan: &grafhome_ca::lifecycle::Plan) -> grafhome_ca::Result<()> {
-    outln!("{}: {}", plan.operation, plan.summary);
-    for step in &plan.steps {
-        outln!("- {}: {}", step.id, step.summary);
-        if !step.hosts.is_empty() {
-            outln!("  hosts: {}", step.hosts.join(","));
-        }
-        for command in &step.commands {
-            outln!("  command: {command}");
-        }
-        for file in &step.files {
-            outln!("  file: {file}");
-        }
-        if step.manual {
-            outln!("  manual: true");
-        }
-    }
     Ok(())
 }
 

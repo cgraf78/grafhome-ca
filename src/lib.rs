@@ -7,7 +7,6 @@
 pub mod config;
 pub mod enrollment;
 pub mod error;
-pub mod lifecycle;
 pub mod model;
 pub mod policy;
 pub mod public_material;
