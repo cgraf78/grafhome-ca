@@ -656,8 +656,8 @@ fn run_status_with_retries(
     let mut last_error = None;
     let mut consecutive_successes = 0;
     for attempt in 1..=attempts {
-        match run_status(&mut build_command()) {
-            Ok(()) => {
+        match run_capture_redacted(&mut build_command(), &[]) {
+            Ok(_) => {
                 consecutive_successes += 1;
                 if consecutive_successes == consecutive_successes_required {
                     return Ok(());
@@ -1464,10 +1464,11 @@ fn approve_user_enrollment(
     }
     active_user(model, &request.user)?;
     required_user_device(model, &request.user, &request.host)?;
-    let token = create_user_token(model, &request.user, &request.host, token_ttl, cert_ttl)?;
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
-    authorize_user(model, &request.user, &request.host, &public_jwk)?;
+    let token = authorize_user(model, &request.user, &request.host, &public_jwk, || {
+        create_user_token(model, &request.user, &request.host, token_ttl, cert_ttl)
+    })?;
     let fingerprint = ca_fingerprint(model)?;
     let grant = UserGrant::new(
         request,
@@ -1599,10 +1600,11 @@ fn approve_host_enrollment(
         checked_ttl("approve host.cert_ttl", ttl)?;
     }
     required_host(model, &request.host)?;
-    let token = create_host_token(model, &request.host, token_ttl, cert_ttl)?;
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
-    authorize_host(model, &request.host, &public_jwk)?;
+    let token = authorize_host(model, &request.host, &public_jwk, || {
+        create_host_token(model, &request.host, token_ttl, cert_ttl)
+    })?;
     let grant = HostGrant::new(
         request,
         required_endpoint(model, "ca_api")?.url(),
@@ -2015,23 +2017,25 @@ fn issue_user_certificate(
     Ok(())
 }
 
-fn authorize_user(
+fn authorize_user<T>(
     model: &SiteModel,
     user_name: &str,
     host: &str,
     public_key: &str,
-) -> grafhome_ca::Result<()> {
-    with_ca_lock(model, || {
-        authorize_user_locked(model, user_name, host, public_key)
+    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
+) -> grafhome_ca::Result<T> {
+    with_ca_lock(model, move || {
+        authorize_user_locked(model, user_name, host, public_key, after_activate)
     })
 }
 
-fn authorize_user_locked(
+fn authorize_user_locked<T>(
     model: &SiteModel,
     user_name: &str,
     host: &str,
     public_key: &str,
-) -> grafhome_ca::Result<()> {
+    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
+) -> grafhome_ca::Result<T> {
     let user = active_user(model, user_name)?;
     let device = required_user_device(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
@@ -2053,28 +2057,43 @@ fn authorize_user_locked(
             &user_enrollment.default_ttl,
             &user_enrollment.max_ttl,
         )?;
-        install_ca_json_with_rollback(model, &ca_json, text.as_bytes(), ca_api.url())?;
-        Ok(())
+        install_ca_json_with_rollback(
+            model,
+            &ca_json,
+            text.as_bytes(),
+            ca_api.url(),
+            after_activate,
+        )
     });
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&template_file);
-        return Err(error);
+    match result {
+        Ok(value) => {
+            outln!("authorized provisioner: {provisioner}");
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&template_file);
+            Err(error)
+        }
     }
-    outln!("authorized provisioner: {provisioner}");
-    Ok(())
 }
 
-fn authorize_host(model: &SiteModel, host_name: &str, public_key: &str) -> grafhome_ca::Result<()> {
-    with_ca_lock(model, || {
-        authorize_host_locked(model, host_name, public_key)
-    })
-}
-
-fn authorize_host_locked(
+fn authorize_host<T>(
     model: &SiteModel,
     host_name: &str,
     public_key: &str,
-) -> grafhome_ca::Result<()> {
+    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
+) -> grafhome_ca::Result<T> {
+    with_ca_lock(model, move || {
+        authorize_host_locked(model, host_name, public_key, after_activate)
+    })
+}
+
+fn authorize_host_locked<T>(
+    model: &SiteModel,
+    host_name: &str,
+    public_key: &str,
+    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
+) -> grafhome_ca::Result<T> {
     let host = required_host(model, host_name)?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let host_policy = required_provisioner(model, "host_bootstrap")?;
@@ -2095,14 +2114,24 @@ fn authorize_host_locked(
             &host_policy.default_ttl,
             &host_policy.max_ttl,
         )?;
-        install_ca_json_with_rollback(model, &ca_json, text.as_bytes(), ca_api.url())
+        install_ca_json_with_rollback(
+            model,
+            &ca_json,
+            text.as_bytes(),
+            ca_api.url(),
+            after_activate,
+        )
     });
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&template_file);
-        return Err(error);
+    match result {
+        Ok(value) => {
+            outln!("authorized provisioner: {provisioner}");
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&template_file);
+            Err(error)
+        }
     }
-    outln!("authorized provisioner: {provisioner}");
-    Ok(())
 }
 
 fn revoke_user(model: &SiteModel, user_name: &str, host: Option<&str>) -> grafhome_ca::Result<()> {
@@ -2454,6 +2483,7 @@ fn finish_revocation(
             ca_json,
             text.as_bytes(),
             required_endpoint(model, "ca_api")?.url(),
+            || Ok(()),
         )?;
         outln!("Revoked {identity}: future issuance and renewal are disabled.");
     } else {
@@ -2463,12 +2493,13 @@ fn finish_revocation(
     Ok(())
 }
 
-fn install_ca_json_with_rollback(
+fn install_ca_json_with_rollback<T>(
     model: &SiteModel,
     ca_json: &Path,
     content: &[u8],
     ca_url: String,
-) -> grafhome_ca::Result<()> {
+    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
+) -> grafhome_ca::Result<T> {
     let previous =
         std::fs::read(ca_json).map_err(|source| grafhome_ca::Error::io(ca_json, source))?;
     let backup = ca_json_backup_path(ca_json);
@@ -2476,8 +2507,16 @@ fn install_ca_json_with_rollback(
     write_secret_file_atomic(ca_json, content)?;
     let activate = || -> grafhome_ca::Result<()> {
         install_ca_json_permissions(model, ca_json)?;
-        run_status(process("systemctl").arg("restart").arg("step-ca.service"))?;
-        run_status(process("systemctl").arg("is-active").arg("step-ca.service"))?;
+        run_status_quiet(
+            process("systemctl").arg("restart").arg("step-ca.service"),
+            &[],
+            true,
+        )?;
+        run_status_quiet(
+            process("systemctl").arg("is-active").arg("step-ca.service"),
+            &[],
+            true,
+        )?;
         run_status_with_retries(
             "step ca health",
             CA_HEALTH_RETRY_ATTEMPTS,
@@ -2496,29 +2535,41 @@ fn install_ca_json_with_rollback(
             },
         )
     };
-    if let Err(error) = activate() {
-        let rollback = (|| -> grafhome_ca::Result<()> {
-            write_secret_file_atomic(ca_json, &previous)?;
-            install_ca_json_permissions(model, ca_json)?;
-            run_status(process("systemctl").arg("restart").arg("step-ca.service"))?;
-            run_status(process("systemctl").arg("is-active").arg("step-ca.service"))
-        })();
-        return Err(grafhome_ca::Error::Validation {
-            field: "CA activation".to_owned(),
-            message: match rollback {
-                Ok(()) => format!(
-                    "{error}; restored previous ca.json from {}",
-                    backup.display()
-                ),
-                Err(rollback_error) => format!(
-                    "{error}; rollback failed after writing backup {}: {rollback_error}",
-                    backup.display()
-                ),
-            },
-        });
-    }
+    let result = activate().and_then(|()| after_activate());
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let rollback = (|| -> grafhome_ca::Result<()> {
+                write_secret_file_atomic(ca_json, &previous)?;
+                install_ca_json_permissions(model, ca_json)?;
+                run_status_quiet(
+                    process("systemctl").arg("restart").arg("step-ca.service"),
+                    &[],
+                    true,
+                )?;
+                run_status_quiet(
+                    process("systemctl").arg("is-active").arg("step-ca.service"),
+                    &[],
+                    true,
+                )
+            })();
+            return Err(grafhome_ca::Error::Validation {
+                field: "CA update".to_owned(),
+                message: match rollback {
+                    Ok(()) => format!(
+                        "{error}; restored previous ca.json from {}",
+                        backup.display()
+                    ),
+                    Err(rollback_error) => format!(
+                        "{error}; rollback failed after writing backup {}: {rollback_error}",
+                        backup.display()
+                    ),
+                },
+            });
+        }
+    };
     outln!("backup ca.json: {}", backup.display());
-    Ok(())
+    Ok(value)
 }
 
 fn install_ca_json_permissions(model: &SiteModel, ca_json: &Path) -> grafhome_ca::Result<()> {
