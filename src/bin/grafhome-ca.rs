@@ -3688,6 +3688,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::{BufRead, Cursor, Write};
     use std::path::PathBuf;
+    use std::thread;
 
     use tempfile::tempdir;
 
@@ -3812,14 +3813,19 @@ mod tests {
 
         let pty = rustix_openpty::openpty(None, None).unwrap();
         let mut terminal = File::from(pty.user);
-        let mut controller = File::from(pty.controller);
-        let original = rustix::termios::tcgetattr(&terminal).unwrap();
+        let controller = File::from(pty.controller);
+        let mut original = rustix::termios::tcgetattr(&terminal).unwrap();
         assert!(original.local_modes.contains(LocalModes::ICANON));
+        original.local_modes.remove(LocalModes::ECHO);
+        rustix::termios::tcsetattr(&terminal, rustix::termios::OptionalActions::Now, &original)
+            .unwrap();
         let mode = NoncanonicalTerminalMode::enter(&terminal).unwrap();
         let payload = "x".repeat(2_048);
         let document = format!("GRANT:{{\"token\":\"{payload}\"}}");
         let pasted = format!("{document}\n");
-        controller.write_all(pasted.as_bytes()).unwrap();
+        let mut writer = controller.try_clone().unwrap();
+        let pasted_for_writer = pasted.clone();
+        let writer = thread::spawn(move || writer.write_all(pasted_for_writer.as_bytes()).unwrap());
 
         let actual = read_terminal_document(
             &mut terminal,
@@ -3828,6 +3834,7 @@ mod tests {
         )
         .unwrap();
         drop(mode);
+        writer.join().unwrap();
 
         assert_eq!(actual, pasted);
         let restored = rustix::termios::tcgetattr(&terminal).unwrap();
