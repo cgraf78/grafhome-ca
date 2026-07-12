@@ -11,8 +11,9 @@ root and should live in a private repo or private host configuration system.
 
 Generated deployment files are written only to operator-chosen staging
 directories. Live mutation is limited to explicit enrollment, approval,
-renewal, and revocation commands; broader fleet rollout remains owned by the
-private configuration-management system.
+renewal, revocation, and local host-policy application commands. Distribution
+of private site config remains owned by the private configuration-management
+system.
 
 The source tree is intentionally free of real site topology. The checked-in
 `examples/site-config` tree uses reserved example names and addresses so tests
@@ -120,6 +121,28 @@ leaves the host. After the grant is pasted back, `enroll host` installs the SSH
 host certificate and trust configuration, proves JWK renewal works, validates
 `sshd`, and reloads it. Scheduled renewal runs `grafhome-ca renew host`; site
 policy retains each host's configured renewal owner.
+
+After changing and distributing site policy, preview and activate the affected
+host's OpenSSH policy locally:
+
+```sh
+# Affected host as root. The hostname is inferred and cannot target another host.
+grafhome-ca apply host --dry-run
+grafhome-ca apply host
+```
+
+`apply host` uses the same validated site model and pinned CA trust as
+enrollment. It reconciles only Grafhome-managed OpenSSH files for the local
+host, including the dedicated authorized-principals directory, then validates
+`sshd` and reloads SSH. A no-op does not reload SSH. If validation or reload
+fails, the command restores the previous files and reloads that configuration.
+Removing an authorization row therefore removes its stale principals file on
+the affected host. This changes login authorization; it does not revoke an
+enrollment or an already-issued certificate, which remains the responsibility
+of `revoke host` or `revoke user`. Changes to CA issuance policy or an enrolled
+identity's certificate principals require the corresponding CA bootstrap,
+revocation, or re-enrollment workflow; `apply host` intentionally does not
+rewrite live CA state.
 
 User enrollment requires one public request copied to the CA and one secret
 grant copied back. User and host default to the current account and short
