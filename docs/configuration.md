@@ -46,7 +46,14 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 : Absolute path to the `step-ca` server binary.
 
 `GRAFHOME_CA_ROOT_STEP_BIN`
-: Absolute path to the root-owned `step` client binary.
+: Preferred absolute path to the `step` client binary. If it is absent,
+  `grafhome-ca` checks `/usr/local/bin/step`, `/usr/bin/step`, and `PATH`. The
+  selected executable must be owned by root or the invoking user and must not
+  be group- or world-writable. When invoked as root, the executable and every
+  parent directory must be root-owned and not group- or world-writable. On
+  macOS, install `step` with
+  Homebrew as a normal user and copy it into `/usr/local/bin/step` with root
+  ownership for privileged host operations; never run Homebrew as root.
 
 `GRAFHOME_CA_HELPER_BIN`
 : Absolute path where the root-run `grafhome-ca` helper is installed. For

@@ -324,6 +324,27 @@ esac
 }
 
 #[cfg(unix)]
+fn configure_step_path_fallback(dir: &tempfile::TempDir, fixture: &ExecFixture) -> String {
+    let path_bin = dir.path().join("path-bin");
+    fs::create_dir(&path_bin).unwrap();
+    fs::copy(fixture.fake_bin.join("step"), path_bin.join("step")).unwrap();
+    fs::set_permissions(path_bin.join("step"), fs::Permissions::from_mode(0o755)).unwrap();
+    let deployment_path = fixture.config_root.join("config/deployment.env");
+    let deployment = fs::read_to_string(&deployment_path).unwrap().replace(
+        &format!(
+            "GRAFHOME_CA_ROOT_STEP_BIN={}",
+            fixture.fake_bin.join("step").display()
+        ),
+        &format!(
+            "GRAFHOME_CA_ROOT_STEP_BIN={}",
+            fixture.fake_bin.join("missing-step").display()
+        ),
+    );
+    fs::write(deployment_path, deployment).unwrap();
+    format!("{}:{}", path_bin.display(), prepend_path(&fixture.fake_bin))
+}
+
+#[cfg(unix)]
 fn prepare_apply_host(fixture: &ExecFixture) {
     let root = fixture.config_root.join("../server-step/certs/root_ca.crt");
     fs::create_dir_all(root.parent().unwrap()).unwrap();
@@ -1316,6 +1337,153 @@ fn approve_user_token_failure_leaves_ca_state_untouched() {
 
 #[cfg(unix)]
 #[test]
+fn enroll_host_restart_rebuilds_request_without_replacing_keys() {
+    let (_dir, fixture) = exec_fixture();
+    let args = [
+        "enroll",
+        "host",
+        "--host",
+        "proxy-host",
+        "--request-only",
+        "--config-root",
+    ];
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let material = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/proxy-host");
+    let pending = material.join("pending-enrollment.json");
+    let original_request = fs::read_to_string(&pending).unwrap();
+    let private_jwk = fs::read(material.join("provisioner.priv.json")).unwrap();
+    let public_jwk = fs::read(material.join("provisioner.pub.json")).unwrap();
+    let password = fs::read(material.join("renewal-password")).unwrap();
+    let original_log = fs::read(&fixture.log).unwrap();
+    fs::write(&pending, "corrupt pending request\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .arg("--restart")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Restarted a public host enrollment request for proxy-host",
+        ))
+        .stdout(predicate::str::contains("REQUEST:{\"version\":1"));
+
+    assert_eq!(fs::read_to_string(pending).unwrap(), original_request);
+    assert_eq!(
+        fs::read(material.join("provisioner.priv.json")).unwrap(),
+        private_jwk
+    );
+    assert_eq!(
+        fs::read(material.join("provisioner.pub.json")).unwrap(),
+        public_jwk
+    );
+    assert_eq!(
+        fs::read(material.join("renewal-password")).unwrap(),
+        password
+    );
+    assert_eq!(fs::read(&fixture.log).unwrap(), original_log);
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_host_restart_requires_existing_enrollment_material() {
+    let (_dir, fixture) = exec_fixture();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enroll",
+            "host",
+            "--host",
+            "proxy-host",
+            "--restart",
+            "--request-only",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot restart because"))
+        .stderr(predicate::str::contains(
+            "run enroll host without --restart",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_host_uses_trusted_path_step_when_configured_path_is_missing() {
+    let (dir, fixture) = exec_fixture();
+    let path = configure_step_path_fallback(&dir, &fixture);
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enroll",
+            "host",
+            "--host",
+            "proxy-host",
+            "--request-only",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", path)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("REQUEST:{\"version\":1"));
+
+    assert!(
+        fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("crypto jwk create")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_host_uses_trusted_path_step_when_configured_path_is_missing() {
+    let (dir, fixture) = exec_fixture();
+    let path = configure_step_path_fallback(&dir, &fixture);
+    let material = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/proxy-host");
+    fs::create_dir_all(&material).unwrap();
+    fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+    fs::write(material.join("renewal-password"), "password\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["renew", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", path)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ssh needs-renewal"));
+    assert!(log.contains("ca token proxy-host"));
+    assert!(log.contains("ssh certificate proxy-host"));
+}
+
+#[cfg(unix)]
+#[test]
 fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
     let (dir, fixture) = exec_fixture();
     let install_root = dir.path().join("install-root");
@@ -1478,6 +1646,106 @@ fn enroll_user_first_run_creates_public_request_and_pending_state() {
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains("crypto jwk create"));
     assert!(!log.contains("user-owned-password"));
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_user_restart_rebuilds_request_without_replacing_keys() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let password_file = dir.path().join("password");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&password_file, "user-owned-password\n").unwrap();
+    let args = [
+        "enroll",
+        "user",
+        "--user",
+        "alice",
+        "--host",
+        "ca-host",
+        "--request-only",
+        "--config-root",
+    ];
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .arg("--password-file")
+        .arg(&password_file)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    let pending = material.join("pending-enrollment.json");
+    let original_request = fs::read_to_string(&pending).unwrap();
+    let private_key = fs::read(home.join(".ssh/id_ed25519")).unwrap();
+    let private_jwk = fs::read(material.join("provisioner.priv.json")).unwrap();
+    let public_jwk = fs::read(material.join("provisioner.pub.json")).unwrap();
+    let original_log = fs::read(&fixture.log).unwrap();
+    fs::write(&pending, "corrupt pending request\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .arg("--restart")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Restarted a public enrollment request for alice@ca-host",
+        ))
+        .stdout(predicate::str::contains("REQUEST:{\"version\":1"));
+
+    assert_eq!(fs::read_to_string(pending).unwrap(), original_request);
+    assert_eq!(fs::read(home.join(".ssh/id_ed25519")).unwrap(), private_key);
+    assert_eq!(
+        fs::read(material.join("provisioner.priv.json")).unwrap(),
+        private_jwk
+    );
+    assert_eq!(
+        fs::read(material.join("provisioner.pub.json")).unwrap(),
+        public_jwk
+    );
+    assert_eq!(fs::read(&fixture.log).unwrap(), original_log);
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_user_restart_requires_existing_enrollment_material() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enroll",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--restart",
+            "--request-only",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot restart because"))
+        .stderr(predicate::str::contains(
+            "run enroll user without --restart",
+        ));
 }
 
 #[cfg(unix)]

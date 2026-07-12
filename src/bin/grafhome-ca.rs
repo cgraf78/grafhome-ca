@@ -17,6 +17,7 @@ use grafhome_ca::enrollment::{
     parse_host_provisioner_name, parse_user_provisioner_name, user_provisioner_host_suffix,
     user_provisioner_name, user_provisioner_prefix,
 };
+use grafhome_ca::executable::root_step_bin;
 use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{Endpoint, Host, Provisioner, User, UserClient};
 
@@ -218,6 +219,9 @@ enum EnrollCommand {
         /// Emit the public request and exit instead of waiting for a grant.
         #[arg(long)]
         request_only: bool,
+        /// Rebuild and reprint the pending request without replacing enrollment keys.
+        #[arg(long, conflicts_with = "grant_file")]
+        restart: bool,
     },
     /// Start or complete user enrollment on this client host.
     User {
@@ -239,6 +243,9 @@ enum EnrollCommand {
         /// Emit the public request and exit instead of waiting for a grant.
         #[arg(long)]
         request_only: bool,
+        /// Rebuild and reprint the pending request without replacing enrollment keys.
+        #[arg(long, conflicts_with = "grant_file")]
+        restart: bool,
     },
 }
 
@@ -460,10 +467,17 @@ fn run() -> grafhome_ca::Result<()> {
                     host,
                     grant_file,
                     request_only,
+                    restart,
                 },
         } => {
             let model = load_root_model(config_root, "enroll host", !request_only)?;
-            enroll_host_flow(&model, host.as_deref(), grant_file.as_deref(), request_only)
+            enroll_host_flow(
+                &model,
+                host.as_deref(),
+                grant_file.as_deref(),
+                request_only,
+                restart,
+            )
         }
         Command::Renew {
             command:
@@ -479,10 +493,8 @@ fn run() -> grafhome_ca::Result<()> {
             if if_enrolled && !status(&model, None, Some(&host), true, true)? {
                 return Ok(());
             }
-            if !ssh_certificate_needs_renewal(
-                &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"],
-                &host_cert_path(&model),
-            )? {
+            let step_bin = root_step_bin(&model)?;
+            if !ssh_certificate_needs_renewal(&step_bin, &host_cert_path(&model))? {
                 return Ok(());
             }
             renew_host(&model, &host, quiet)
@@ -496,6 +508,7 @@ fn run() -> grafhome_ca::Result<()> {
                     grant_file,
                     password_file,
                     request_only,
+                    restart,
                 },
         } => {
             let model = load_valid_model(config_root)?;
@@ -506,6 +519,7 @@ fn run() -> grafhome_ca::Result<()> {
                 grant_file.as_deref(),
                 password_file.as_deref(),
                 request_only,
+                restart,
             )
         }
         Command::Approve {
@@ -1590,7 +1604,33 @@ fn ensure_user_keys(
         std::fs::set_permissions(&public_jwk, std::fs::Permissions::from_mode(0o644))
             .map_err(|source| grafhome_ca::Error::io(&public_jwk, source))?;
     }
-    let ssh_public_key = std::fs::read_to_string(user_public_key_path()?)
+    user_request_from_material(model, &user.user, &client.host)
+}
+
+fn user_request_from_material(
+    model: &SiteModel,
+    user_name: &str,
+    host: &str,
+) -> grafhome_ca::Result<UserRequest> {
+    let user = active_user(model, user_name)?;
+    let client = required_user_client(model, &user.user, host)?;
+    let private_key = user_private_key_path()?;
+    let public_key = user_public_key_path()?;
+    let material_dir = user_client_material_dir(&user.user, &client.host)?;
+    let private_jwk = material_dir.join("provisioner.priv.json");
+    let public_jwk = material_dir.join("provisioner.pub.json");
+    for path in [&private_key, &public_key, &private_jwk, &public_jwk] {
+        if !path.is_file() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "enroll user --restart".to_owned(),
+                message: format!(
+                    "cannot restart because {} is missing; run enroll user without --restart",
+                    path.display()
+                ),
+            });
+        }
+    }
+    let ssh_public_key = std::fs::read_to_string(&public_key)
         .map_err(|source| grafhome_ca::Error::io("SSH public key", source))?;
     let renewal_public_jwk = serde_json::from_str(
         &std::fs::read_to_string(&public_jwk)
@@ -1684,11 +1724,19 @@ fn enroll_user_flow(
     grant_file: Option<&Path>,
     password_file: Option<&Path>,
     request_only: bool,
+    restart: bool,
 ) -> grafhome_ca::Result<()> {
     let user = resolve_user(user)?;
     let host = resolve_host(host)?;
     let pending_path = enrollment_request_path(&user, &host)?;
-    if !pending_path.exists() && grant_file.is_none() {
+    if restart {
+        let request = user_request_from_material(model, &user, &host)?;
+        publish_user_request(&pending_path, &request, true)?;
+        if request_only {
+            return Ok(());
+        }
+        eprintln!("Waiting for the enrollment grant.");
+    } else if !pending_path.exists() && grant_file.is_none() {
         let mut stdin = std::io::stdin().lock();
         let (password, should_store) = match password_file {
             Some(file) => (
@@ -1710,14 +1758,7 @@ fn enroll_user_flow(
         if should_store {
             store_renewal_password(&user, &host, &password)?;
         }
-        let text = serde_json::to_string(&request).expect("enrollment request serializes");
-        write_secret_file(&pending_path, text.as_bytes())?;
-        eprintln!("Created a public enrollment request for {user}@{host}.");
-        eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve user");
-        outln!("REQUEST:{text}");
-        std::io::stdout()
-            .flush()
-            .map_err(|source| grafhome_ca::Error::io("<stdout>", source))?;
+        publish_user_request(&pending_path, &request, false)?;
         if request_only {
             return Ok(());
         }
@@ -1758,6 +1799,25 @@ fn enroll_user_flow(
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
     outln!("User enrollment complete: {user}@{host}");
     Ok(())
+}
+
+fn publish_user_request(
+    pending_path: &Path,
+    request: &UserRequest,
+    restarted: bool,
+) -> grafhome_ca::Result<()> {
+    let text = serde_json::to_string(request).expect("enrollment request serializes");
+    write_secret_file_atomic(pending_path, text.as_bytes())?;
+    let action = if restarted { "Restarted" } else { "Created" };
+    eprintln!(
+        "{action} a public enrollment request for {}@{}.",
+        request.user, request.host
+    );
+    eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve user");
+    outln!("REQUEST:{text}");
+    std::io::stdout()
+        .flush()
+        .map_err(|source| grafhome_ca::Error::io("<stdout>", source))
 }
 
 fn approve_user_enrollment(
@@ -1810,8 +1870,9 @@ fn ensure_host_keys(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<H
     if !private_jwk.exists() {
         let password = random_secret()?;
         write_secret_file(&password_file, password.as_bytes())?;
+        let step_bin = root_step_bin(model)?;
         run_status(
-            process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
+            process(&step_bin)
                 .arg("crypto")
                 .arg("jwk")
                 .arg("create")
@@ -1827,8 +1888,32 @@ fn ensure_host_keys(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<H
                 .to_owned(),
         });
     }
-    let ssh_public_key = std::fs::read_to_string(host_public_key_path(model))
-        .map_err(|source| grafhome_ca::Error::io(host_public_key_path(model), source))?;
+    host_request_from_material(model, host_name)
+}
+
+fn host_request_from_material(
+    model: &SiteModel,
+    host_name: &str,
+) -> grafhome_ca::Result<HostRequest> {
+    required_host(model, host_name)?;
+    let material_dir = host_material_dir(model, host_name);
+    let private_jwk = material_dir.join("provisioner.priv.json");
+    let public_jwk = material_dir.join("provisioner.pub.json");
+    let password_file = material_dir.join("renewal-password");
+    let public_key = host_public_key_path(model);
+    for path in [&public_key, &private_jwk, &public_jwk, &password_file] {
+        if !path.is_file() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "enroll host --restart".to_owned(),
+                message: format!(
+                    "cannot restart because {} is missing; run enroll host without --restart",
+                    path.display()
+                ),
+            });
+        }
+    }
+    let ssh_public_key = std::fs::read_to_string(&public_key)
+        .map_err(|source| grafhome_ca::Error::io(&public_key, source))?;
     let renewal_public_jwk = serde_json::from_str(
         &std::fs::read_to_string(&public_jwk)
             .map_err(|source| grafhome_ca::Error::io(&public_jwk, source))?,
@@ -1855,19 +1940,20 @@ fn enroll_host_flow(
     host: Option<&str>,
     grant_file: Option<&Path>,
     request_only: bool,
+    restart: bool,
 ) -> grafhome_ca::Result<()> {
     let host = resolve_host(host)?;
     let pending_path = host_enrollment_request_path(model, &host);
-    if !pending_path.exists() && grant_file.is_none() {
+    if restart {
+        let request = host_request_from_material(model, &host)?;
+        publish_host_request(&pending_path, &request, true)?;
+        if request_only {
+            return Ok(());
+        }
+        eprintln!("Waiting for the enrollment grant.");
+    } else if !pending_path.exists() && grant_file.is_none() {
         let request = ensure_host_keys(model, &host)?;
-        let text = serde_json::to_string(&request).expect("host enrollment request serializes");
-        write_secret_file(&pending_path, text.as_bytes())?;
-        eprintln!("Created a public host enrollment request for {host}.");
-        eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve host");
-        outln!("REQUEST:{text}");
-        std::io::stdout()
-            .flush()
-            .map_err(|source| grafhome_ca::Error::io("<stdout>", source))?;
+        publish_host_request(&pending_path, &request, false)?;
         if request_only {
             return Ok(());
         }
@@ -1896,6 +1982,25 @@ fn enroll_host_flow(
     std::fs::remove_file(&pending_path)
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
     Ok(())
+}
+
+fn publish_host_request(
+    pending_path: &Path,
+    request: &HostRequest,
+    restarted: bool,
+) -> grafhome_ca::Result<()> {
+    let text = serde_json::to_string(request).expect("host enrollment request serializes");
+    write_secret_file_atomic(pending_path, text.as_bytes())?;
+    let action = if restarted { "Restarted" } else { "Created" };
+    eprintln!(
+        "{action} a public host enrollment request for {}.",
+        request.host
+    );
+    eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve host");
+    outln!("REQUEST:{text}");
+    std::io::stdout()
+        .flush()
+        .map_err(|source| grafhome_ca::Error::io("<stdout>", source))
 }
 
 fn approve_host_enrollment(
@@ -1935,8 +2040,9 @@ fn approve_host_enrollment(
 fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca::Result<()> {
     grant.validate()?;
     required_host(model, &grant.host)?;
+    let step_bin = root_step_bin(model)?;
     bootstrap_trust(
-        &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"],
+        &step_bin,
         Path::new(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
         &grant.ca_url,
         &grant.root_fingerprint,
@@ -1991,12 +2097,12 @@ fn desired_host_ssh_files(
     ca_url: &str,
 ) -> grafhome_ca::Result<BTreeMap<PathBuf, HostPolicyFile>> {
     let host = required_host(model, host_name)?;
-    let step_bin = &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"];
+    let step_bin = root_step_bin(model)?;
     let steppath = Path::new(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]);
     let root = server_root_cert_path(model);
     let user_ca_keys = if host.ssh_server {
         String::from_utf8_lossy(&run_capture(
-            process(step_bin)
+            process(&step_bin)
                 .env("STEPPATH", steppath)
                 .arg("ssh")
                 .arg("config")
@@ -2012,7 +2118,7 @@ fn desired_host_ssh_files(
     };
     let host_ca_keys = if host.ssh_client {
         String::from_utf8_lossy(&run_capture(
-            process(step_bin)
+            process(&step_bin)
                 .env("STEPPATH", steppath)
                 .arg("ssh")
                 .arg("config")
@@ -2344,8 +2450,9 @@ fn write_public_file_atomic(path: &Path, content: &[u8], mode: u32) -> grafhome_
 }
 
 fn ca_fingerprint(model: &SiteModel) -> grafhome_ca::Result<String> {
+    let step_bin = root_step_bin(model)?;
     let output = run_capture(
-        process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
+        process(&step_bin)
             .arg("certificate")
             .arg("fingerprint")
             .arg(ca_root_cert_path(model)),
@@ -2377,7 +2484,8 @@ fn create_host_token(
         "create-host-token.cert_ttl",
         cert_ttl.unwrap_or(&provisioner.default_ttl),
     )?;
-    let mut command = process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]);
+    let step_bin = root_step_bin(model)?;
+    let mut command = process(&step_bin);
     command
         .env("STEPPATH", model.deployment.ca_steppath())
         .arg("ca")
@@ -2407,8 +2515,9 @@ fn create_host_token(
 fn enroll_host(model: &SiteModel, host: &str, token: &str) -> grafhome_ca::Result<()> {
     let host = required_host(model, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
+    let step_bin = root_step_bin(model)?;
     run_status_redacted(
-        process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
+        process(&step_bin)
             .env(
                 "STEPPATH",
                 &model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"],
@@ -2451,7 +2560,8 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
             message: "host renewal credential is missing; run enroll host".to_owned(),
         });
     }
-    let mut token_command = process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]);
+    let step_bin = root_step_bin(model)?;
+    let mut token_command = process(&step_bin);
     token_command
         .env(
             "STEPPATH",
@@ -2487,7 +2597,7 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
         message: format!("token output was not UTF-8: {error}"),
     })?;
     run_status_quiet(
-        process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
+        process(&step_bin)
             .env(
                 "STEPPATH",
                 &model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"],
@@ -2538,8 +2648,9 @@ fn create_user_token(
         "create-user-token.cert_ttl",
         cert_ttl.unwrap_or(&user.cert_ttl),
     )?;
+    let step_bin = root_step_bin(model)?;
     run_capture(
-        process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
+        process(&step_bin)
             .env("STEPPATH", model.deployment.ca_steppath())
             .arg("ca")
             .arg("token")
@@ -2932,12 +3043,12 @@ fn remote_provisioner_names(
         });
     };
     let step_bin = if user_owned {
-        USER_STEP_BIN
+        USER_STEP_BIN.to_owned()
     } else {
-        &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]
+        root_step_bin(model)?
     };
     let output = run_capture(
-        process(step_bin)
+        process(&step_bin)
             .arg("ca")
             .arg("provisioner")
             .arg("list")
@@ -3083,6 +3194,7 @@ fn install_ca_json_with_rollback<T>(
     let backup = ca_json_backup_path(ca_json);
     write_secret_file(&backup, &previous)?;
     write_secret_file_atomic(ca_json, content)?;
+    let step_bin = root_step_bin(model)?;
     let activate = || -> grafhome_ca::Result<()> {
         install_ca_json_permissions(model, ca_json)?;
         run_status_quiet(
@@ -3101,7 +3213,7 @@ fn install_ca_json_with_rollback<T>(
             CA_HEALTH_RETRY_DELAY,
             CA_HEALTH_CONSECUTIVE_SUCCESSES,
             || {
-                let mut command = process(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"]);
+                let mut command = process(&step_bin);
                 command
                     .arg("ca")
                     .arg("health")
