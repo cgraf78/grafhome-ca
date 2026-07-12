@@ -507,7 +507,7 @@ fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedF
             .policy
             .user(&access.user)
             .ok_or_else(|| Error::Validation {
-                field: format!("policy/user-hosts.toml:{}.user", access.user),
+                field: format!("policy/user-remotes.toml:{}.user", access.user),
                 message: "missing policy user".to_owned(),
             })?;
         by_account
@@ -738,6 +738,21 @@ mod tests {
         ));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/auth_principals/alice".to_owned()));
         assert!(paths.iter().all(|path| !path.starts_with('/')));
+    }
+
+    #[test]
+    fn disabled_users_are_not_rendered_as_authorized_principals() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.policy.users[0].status = "disabled".to_owned();
+
+        let files = render(&model).unwrap();
+
+        assert!(files.iter().all(|file| {
+            !file
+                .path
+                .to_string_lossy()
+                .contains("/auth_principals/alice")
+        }));
     }
 
     #[test]

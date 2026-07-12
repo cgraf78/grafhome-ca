@@ -102,7 +102,7 @@ fn rendered_config_can_start_throwaway_step_ca() {
 
     let config_path = steppath.join("config/rendered-ca.json");
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-    add_test_user_device_provisioner(temp.path(), &config_path, &password);
+    add_test_user_client_provisioner(temp.path(), &config_path, &password);
     let child = Command::new("step-ca")
         .arg(&config_path)
         .arg("--password-file")
@@ -481,7 +481,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
     assert!(!cert_details.contains("host certificate"));
 }
 
-fn add_test_user_device_provisioner(
+fn add_test_user_client_provisioner(
     temp: &std::path::Path,
     config_path: &std::path::Path,
     password: &std::path::Path,
@@ -509,7 +509,7 @@ fn add_test_user_device_provisioner(
 "#,
     )
     .unwrap();
-    let text = grafhome_ca::runtime_provisioners::add_user_device(
+    let text = grafhome_ca::runtime_provisioners::add_user_client(
         config_path,
         &public_jwk,
         "grafhome-user-616c696365-63612d686f7374",

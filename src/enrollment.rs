@@ -16,12 +16,12 @@ const USER_GRANT_KIND: &str = "grafhome-user-enrollment-grant";
 const HOST_REQUEST_KIND: &str = "grafhome-host-enrollment-request";
 const HOST_GRANT_KIND: &str = "grafhome-host-enrollment-grant";
 
-/// Return the collision-free provisioner name for one user device.
+/// Return the collision-free provisioner name for one user client host.
 pub fn user_provisioner_name(user: &str, host: &str) -> String {
     format!("{}{}", user_provisioner_prefix(user), encode_identity(host))
 }
 
-/// Return the collision-free provisioner prefix shared by one user's devices.
+/// Return the collision-free provisioner prefix shared by one user's client hosts.
 pub fn user_provisioner_prefix(user: &str) -> String {
     format!("grafhome-user-{}-", encode_identity(user))
 }
@@ -110,7 +110,7 @@ impl HostRequest {
     }
 }
 
-/// Public material prepared by a user device before CA approval.
+/// Public material prepared by a user client host before CA approval.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserRequest {
     /// Enrollment document schema version.
@@ -119,11 +119,11 @@ pub struct UserRequest {
     pub kind: String,
     /// Policy user requesting enrollment.
     pub user: String,
-    /// Policy client-device host.
+    /// Policy client host.
     pub host: String,
     /// OpenSSH public key that the initial certificate must cover.
     pub ssh_public_key: String,
-    /// Public half of the device-owned JWK used for later issuance.
+    /// Public half of the client-host-owned JWK used for later issuance.
     pub renewal_public_jwk: Value,
 }
 
@@ -195,7 +195,7 @@ pub struct UserGrant {
     pub kind: String,
     /// Policy user authorized by the grant.
     pub user: String,
-    /// Policy client-device host authorized by the grant.
+    /// Policy client host authorized by the grant.
     pub host: String,
     /// OpenSSH public key copied from the approved request.
     pub ssh_public_key: String,
@@ -235,6 +235,10 @@ impl UserGrant {
         validate_header(self.version, &self.kind, USER_GRANT_KIND)?;
         nonempty("user enrollment grant CA URL", &self.ca_url)?;
         nonempty(
+            "user enrollment grant root fingerprint",
+            &self.root_fingerprint,
+        )?;
+        validate_fingerprint(
             "user enrollment grant root fingerprint",
             &self.root_fingerprint,
         )?;
@@ -292,6 +296,10 @@ impl HostGrant {
             "host enrollment grant root fingerprint",
             &self.root_fingerprint,
         )?;
+        validate_fingerprint(
+            "host enrollment grant root fingerprint",
+            &self.root_fingerprint,
+        )?;
         nonempty("host enrollment grant token", &self.token)
     }
 }
@@ -319,6 +327,17 @@ fn nonempty(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_fingerprint(field: &str, value: &str) -> Result<()> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(validation(
+            field,
+            "expected a 64-character SHA-256 hexadecimal fingerprint",
+        ))
+    }
+}
+
 fn validation(field: impl Into<String>, message: impl Into<String>) -> Error {
     Error::Validation {
         field: field.into(),
@@ -331,7 +350,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        UserRequest, parse_host_provisioner_name, parse_user_provisioner_name,
+        UserGrant, UserRequest, parse_host_provisioner_name, parse_user_provisioner_name,
         user_provisioner_name,
     };
 
@@ -403,5 +422,20 @@ mod tests {
                 .to_string()
                 .contains("private JWK material (p)")
         );
+    }
+
+    #[test]
+    fn grant_rejects_malformed_root_fingerprint() {
+        let request = UserRequest::new(
+            "alice",
+            "laptop",
+            "ssh-ed25519 AAAA alice@laptop",
+            json!({"kty": "OKP", "crv": "Ed25519", "x": "public"}),
+        );
+        let grant = UserGrant::new(&request, "https://ca.example.test", "not-a-hash", "token");
+
+        let error = grant.validate().unwrap_err().to_string();
+
+        assert!(error.contains("64-character SHA-256 hexadecimal fingerprint"));
     }
 }

@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::model::SiteModel;
 use crate::policy::Provisioner;
 
-const USER_DEVICE_X509_DENY_TEMPLATE: &str =
+const USER_CLIENT_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome user/client-host provisioner" }}"#;
 const HOST_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome host provisioner" }}"#;
@@ -87,7 +87,7 @@ pub fn materialize(
 }
 
 /// Add one constrained per-user/per-host JWK provisioner to an existing CA config.
-pub fn add_user_device(
+pub fn add_user_client(
     ca_json: impl AsRef<Path>,
     public_key: impl AsRef<Path>,
     name: &str,
@@ -135,7 +135,7 @@ pub fn add_user_device(
         },
         "options": {
             "x509": {
-                "template": USER_DEVICE_X509_DENY_TEMPLATE,
+                "template": USER_CLIENT_X509_DENY_TEMPLATE,
             },
             "ssh": {
                 "template": template,
@@ -478,16 +478,16 @@ mod tests {
     }
 
     #[test]
-    fn adds_user_device_provisioner_without_host_ssh_claims() {
+    fn adds_user_client_provisioner_without_host_ssh_claims() {
         let dir = tempdir().unwrap();
         let ca_json = dir.path().join("ca.json");
         fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"device-kid","kty":"EC"}"#).unwrap();
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
 
-        let text = add_user_device(
+        let text = add_user_client(
             &ca_json,
             &public_key,
             "grafhome-user-alice-ca-host",
@@ -500,7 +500,7 @@ mod tests {
         let provisioner = &value["authority"]["provisioners"][0];
 
         assert_eq!(provisioner["name"], "grafhome-user-alice-ca-host");
-        assert_eq!(provisioner["key"]["kid"], "device-kid");
+        assert_eq!(provisioner["key"]["kid"], "client-kid");
         assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
         assert_eq!(provisioner["claims"]["maxUserSSHCertDuration"], "168h");
         assert_eq!(provisioner["claims"]["enableSSHCA"], true);
@@ -508,7 +508,7 @@ mod tests {
         assert!(provisioner["claims"]["maxHostSSHCertDuration"].is_null());
         assert_eq!(
             provisioner["options"]["x509"]["template"],
-            USER_DEVICE_X509_DENY_TEMPLATE
+            USER_CLIENT_X509_DENY_TEMPLATE
         );
         assert_eq!(
             provisioner["options"]["ssh"]["template"],
@@ -557,20 +557,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_private_jwk_for_user_device_public_key() {
+    fn rejects_private_jwk_for_user_client_public_key() {
         let dir = tempdir().unwrap();
         let ca_json = dir.path().join("ca.json");
         fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
         fs::write(
             &public_key,
-            r#"{"kid":"device-kid","kty":"EC","d":"secret"}"#,
+            r#"{"kid":"client-kid","kty":"EC","d":"secret"}"#,
         )
         .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
 
-        let error = add_user_device(
+        let error = add_user_client(
             &ca_json,
             &public_key,
             "grafhome-user-alice-ca-host",

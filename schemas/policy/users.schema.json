@@ -11,28 +11,13 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "user",
-          "principal",
-          "unix_account",
-          "root_ssh",
-          "provisioner",
-          "cert_ttl",
-          "status",
-          "notes"
-        ],
+        "required": ["user", "principal", "provisioner", "cert_ttl", "status"],
         "properties": {
           "user": {
             "$ref": "#/definitions/account"
           },
           "principal": {
             "$ref": "#/definitions/principal"
-          },
-          "unix_account": {
-            "$ref": "#/definitions/account"
-          },
-          "root_ssh": {
-            "type": "boolean"
           },
           "provisioner": {
             "$ref": "#/definitions/name"
@@ -42,9 +27,6 @@
           },
           "status": {
             "enum": ["active", "planned", "disabled"]
-          },
-          "notes": {
-            "type": "string"
           }
         }
       }

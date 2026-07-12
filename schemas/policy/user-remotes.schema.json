@@ -1,32 +1,38 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/emergency-access.schema.json",
-  "title": "emergency-access policy",
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/user-remotes.schema.json",
+  "title": "user-remotes policy",
   "type": "object",
   "additionalProperties": false,
-  "required": ["emergency_access"],
+  "required": ["user_remotes"],
   "properties": {
-    "emergency_access": {
+    "user_remotes": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["host", "account", "key_id", "storage", "test_interval"],
+        "required": [
+          "user",
+          "host",
+          "unix_account",
+          "allow_ssh",
+          "status"
+        ],
         "properties": {
+          "user": {
+            "$ref": "#/definitions/account"
+          },
           "host": {
             "$ref": "#/definitions/name"
           },
-          "account": {
+          "unix_account": {
             "$ref": "#/definitions/account"
           },
-          "key_id": {
-            "$ref": "#/definitions/name"
+          "allow_ssh": {
+            "type": "boolean"
           },
-          "storage": {
-            "enum": ["password-manager-or-offline", "offline", "password-manager"]
-          },
-          "test_interval": {
-            "enum": ["monthly", "quarterly", "annually"]
+          "status": {
+            "enum": ["active", "planned", "disabled"]
           }
         }
       }

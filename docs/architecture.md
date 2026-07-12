@@ -11,7 +11,7 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 ## Rust-Owned Responsibilities
 
 - Parse and validate runtime site config from the XDG config root.
-- Parse and validate private policy inventories without compiling them into the binary.
+- Parse and validate the private site policy without compiling it into the binary.
 - Render non-secret config into a staging directory from typed policy.
 - Export public CA trust material from initialized Smallstep state for reviewed rollout.
 - Provide CLIs for validation, scoped enrollment, renewal, and revocation.
@@ -31,10 +31,13 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 Enrollment and identity revocation are the narrow live-mutation boundary.
 `approve user` and `approve host` install scoped JWK provisioners on the CA
 origin and roll back if CA activation or health verification fails. Private JWK
-material never leaves the enrolled user device or host. `revoke user` and
+material never leaves its enrolled host. `revoke user` and
 `revoke host` remove those provisioners, disabling future issuance and renewal
 without certificate serial lookup. Existing SSH certificates remain valid until
 expiry because OpenSSH does not perform online CA revocation checks.
+Enrollment grants are bound to the requesting host's keys and the configured
+`ca_api` URL. Their root fingerprints use the fixed SHA-256 hexadecimal form;
+the copied grant remains the out-of-band trust handoff for first bootstrap.
 `enroll host` installs only host-specific SSH trust/configuration after issuing
 the host certificate, validates JWK renewal and `sshd`, and reloads it. Broader
 firewall, DNS, Apache, CA initialization, backup, and fleet rollout changes

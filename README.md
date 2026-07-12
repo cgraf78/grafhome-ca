@@ -149,7 +149,7 @@ grant copied back. User and host default to the current account and short
 hostname, so normal enrollment needs no identity flags:
 
 ```sh
-# Client device. Enter the renewal password once and leave this running.
+# Client host. Enter the renewal password once and leave this running.
 # Copy its REQUEST line to the CA, then paste the returned GRANT here.
 grafhome-ca enroll user
 
@@ -187,10 +187,10 @@ labeled document.
 CA-side revocation does not require a certificate serial:
 
 ```sh
-# Disable the host identity and every user device enrolled on that host.
+# Disable the host identity and every user enrollment on that host.
 grafhome-ca revoke host --host ca-host
 
-# Disable every enrolled device for a user, or only one device.
+# Disable every enrolled client host for a user, or only one client host.
 grafhome-ca revoke user --user alice
 grafhome-ca revoke user --user alice --host laptop-a
 ```
@@ -206,7 +206,7 @@ grafhome-ca status --user alice --host laptop-a
 ```
 
 Add `--quiet` to suppress output and use the exit status as a predicate. It
-succeeds only when the requested host or user-device enrollment is active. Add
+succeeds only when the requested host or user-client enrollment is active. Add
 `--renewable` to also require the local trust and credential material needed by
 a scheduled renewal.
 

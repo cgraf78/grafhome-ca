@@ -11,31 +11,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "role",
-          "name",
-          "dns_name",
-          "target",
-          "interface",
-          "address",
-          "port",
-          "scheme"
-        ],
+        "required": ["role", "dns_name", "target", "address", "port", "scheme"],
         "properties": {
           "role": {
             "enum": ["ca_api", "ca_origin"]
-          },
-          "name": {
-            "$ref": "#/definitions/name"
           },
           "dns_name": {
             "$ref": "#/definitions/dnsName"
           },
           "target": {
             "$ref": "#/definitions/name"
-          },
-          "interface": {
-            "$ref": "#/definitions/interface"
           },
           "address": {
             "$ref": "#/definitions/ipv4"
@@ -61,10 +46,6 @@
     "dnsName": {
       "type": "string",
       "pattern": "^[A-Za-z0-9.-]+$"
-    },
-    "interface": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._:-]+$"
     },
     "ipv4": {
       "type": "string",

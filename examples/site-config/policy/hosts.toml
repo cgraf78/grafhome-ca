@@ -1,31 +1,23 @@
 [[hosts]]
 host = "ca-host"
-kind = "server"
 ssh_server = true
 ssh_client = true
-renewal_owner = "systemd"
 principals = ["ca-host", "ca-origin.example.test"]
 
 [[hosts]]
 host = "proxy-host"
-kind = "server"
 ssh_server = true
 ssh_client = true
-renewal_owner = "systemd"
 principals = ["proxy-host", "ca.example.test"]
 
 [[hosts]]
 host = "edge-host"
-kind = "server"
 ssh_server = true
 ssh_client = true
-renewal_owner = "dot-cron"
 principals = ["edge-host", "edge-host.example.test"]
 
 [[hosts]]
 host = "laptop-a"
-kind = "personal-laptop"
 ssh_server = true
 ssh_client = true
-renewal_owner = "systemd"
 principals = ["laptop-a", "laptop-a.example.test"]

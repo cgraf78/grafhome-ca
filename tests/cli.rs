@@ -112,7 +112,7 @@ set -eu
 printf 'step STEPPATH=%s args=%s\n' "${STEPPATH:-}" "$*" >> "$FAKE_LOG"
 case "$1 $2" in
   "certificate fingerprint")
-    printf 'fingerprint-from-fake-step\n'
+    printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
     ;;
   "ca token")
     if [ "${FAKE_REQUIRE_RESTART_BEFORE_TOKEN:-}" = "1" ] && [ ! -e "$FAKE_LOG.restarted" ]; then
@@ -683,7 +683,7 @@ fn apply_host_rejects_non_file_in_managed_principals_directory() {
 #[test]
 fn apply_host_rejects_locally_writable_policy() {
     let (dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.toml");
+    let policy = fixture.config_root.join("policy/user-remotes.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     apply_host_command(&fixture, &dir.path().join("install"))
@@ -691,7 +691,7 @@ fn apply_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.toml"))
+        .stderr(predicate::str::contains("user-remotes.toml"))
         .stderr(predicate::str::contains("permits group or world writes"));
 
     assert!(!fixture.log.exists());
@@ -701,7 +701,7 @@ fn apply_host_rejects_locally_writable_policy() {
 #[test]
 fn approve_host_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.toml");
+    let policy = fixture.config_root.join("policy/user-remotes.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -713,7 +713,7 @@ fn approve_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.toml"));
+        .stderr(predicate::str::contains("user-remotes.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -722,7 +722,7 @@ fn approve_host_rejects_locally_writable_policy() {
 #[test]
 fn approve_user_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.toml");
+    let policy = fixture.config_root.join("policy/user-remotes.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -734,7 +734,7 @@ fn approve_user_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.toml"));
+        .stderr(predicate::str::contains("user-remotes.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -743,7 +743,7 @@ fn approve_user_rejects_locally_writable_policy() {
 #[test]
 fn revoke_host_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.toml");
+    let policy = fixture.config_root.join("policy/user-remotes.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -755,7 +755,7 @@ fn revoke_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.toml"));
+        .stderr(predicate::str::contains("user-remotes.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -764,7 +764,7 @@ fn revoke_host_rejects_locally_writable_policy() {
 #[test]
 fn revoke_user_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.toml");
+    let policy = fixture.config_root.join("policy/user-remotes.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -776,7 +776,7 @@ fn revoke_user_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.toml"));
+        .stderr(predicate::str::contains("user-remotes.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -791,7 +791,7 @@ fn check_rejects_legacy_sshpop_policy() {
     text.push_str(
         "\n[[provisioners]]\nrole = \"host_renew\"\nname = \"grafhome-host-renew\"\n\
          type = \"SSHPOP\"\ndefault_ttl = \"168h\"\nmax_ttl = \"720h\"\n\
-         renewal_check = \"8h-jitter\"\nstatus = \"active\"\nnotes = \"legacy\"\n",
+         status = \"active\"\n",
     );
     fs::write(provisioners, text).unwrap();
 
@@ -1145,7 +1145,7 @@ fn approve_host_prints_one_complete_grant() {
         .stdout(predicate::str::contains("GRANT:{\"version\":1"))
         .stdout(predicate::str::contains("\"host\":\"proxy-host\""))
         .stdout(predicate::str::contains(
-            "\"root_fingerprint\":\"fingerprint-from-fake-step\"",
+            "\"root_fingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
         ))
         .stdout(predicate::str::contains(
             "\"token\":\"token-for-proxy-host\"",
@@ -1272,7 +1272,7 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
         "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
-        "root_fingerprint": "trusted-fingerprint",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "token": "host-token"
     });
 
@@ -1319,6 +1319,62 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
     assert!(log.contains("--token host-token"));
     assert!(log.contains("sshd args=-t"));
     assert!(log.contains("systemctl args=reload ssh"));
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_host_rejects_grant_for_unconfigured_ca() {
+    let (dir, fixture) = exec_fixture();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enroll",
+            "host",
+            "--host",
+            "proxy-host",
+            "--request-only",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+    let pending = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/proxy-host/pending-enrollment.json");
+    let request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pending).unwrap()).unwrap();
+    let grant = serde_json::json!({
+        "version": 1,
+        "kind": "grafhome-host-enrollment-grant",
+        "host": request["host"],
+        "ssh_public_key": request["ssh_public_key"],
+        "renewal_public_jwk": request["renewal_public_jwk"],
+        "ca_url": "https://attacker.example",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "token": "attacker-token"
+    });
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enroll", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("GRAFHOME_CA_INSTALL_ROOT", dir.path().join("install-root"))
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin(format!("GRANT:{grant}\n"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "does not match configured CA URL https://ca.example.test",
+        ));
+
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("ca bootstrap")
+    );
 }
 
 #[cfg(unix)]
@@ -1386,7 +1442,7 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
         "ssh_public_key": "ssh-ed25519 AAAApublic test@fixture",
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
-        "root_fingerprint": "trusted-fingerprint",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "token": "user-token"
     });
 
@@ -1408,13 +1464,13 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
         .stderr(predicate::str::contains("Waiting for the enrollment grant"))
         .stdout(predicate::str::contains("REQUEST:"))
         .stdout(predicate::str::contains(
-            "Enrollment complete. Try: ssh nas",
+            "User enrollment complete: alice@ca-host",
         ));
 
     assert_eq!(fs::read_to_string(root).unwrap(), "root\n");
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains(
-        "ca bootstrap --ca-url https://ca.example.test --fingerprint trusted-fingerprint --force"
+        "ca bootstrap --ca-url https://ca.example.test --fingerprint aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --force"
     ));
     assert!(log.contains("ca health --ca-url https://ca.example.test"));
 }
@@ -1567,7 +1623,7 @@ fn enroll_user_second_run_completes_and_verifies_renewal() {
         "ssh_public_key": public_key.trim(),
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
-        "root_fingerprint": "trusted-fingerprint",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "token": "user-token"
     });
     Command::cargo_bin("grafhome-ca")
@@ -1588,7 +1644,7 @@ fn enroll_user_second_run_completes_and_verifies_renewal() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Enrollment complete. Try: ssh nas",
+            "User enrollment complete: alice@ca-host",
         ));
 
     let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
@@ -1639,7 +1695,7 @@ fn enroll_user_rejects_grant_for_a_different_ssh_key() {
         "ssh_public_key": "ssh-ed25519 AAAAdifferent attacker",
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
-        "root_fingerprint": "trusted-fingerprint",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "token": "user-token"
     });
 
@@ -1661,8 +1717,83 @@ fn enroll_user_rejects_grant_for_a_different_ssh_key() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "grant does not match this device's pending request",
+            "grant does not match this client host's pending request",
         ));
+}
+
+#[cfg(unix)]
+#[test]
+fn enroll_user_rejects_grant_for_unconfigured_ca() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let password_file = dir.path().join("password");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&password_file, "user-owned-password\n").unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enroll",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--password-file",
+        ])
+        .arg(&password_file)
+        .arg("--request-only")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+    let pending =
+        home.join(".config/grafhome-ca/users/alice/hosts/ca-host/pending-enrollment.json");
+    let request: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pending).unwrap()).unwrap();
+    let grant = serde_json::json!({
+        "version": 1,
+        "kind": "grafhome-user-enrollment-grant",
+        "user": request["user"],
+        "host": request["host"],
+        "ssh_public_key": request["ssh_public_key"],
+        "renewal_public_jwk": request["renewal_public_jwk"],
+        "ca_url": "https://attacker.example",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "token": "attacker-token"
+    });
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enroll",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--password-file",
+        ])
+        .arg(&password_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin(format!("GRANT:{grant}\n"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "does not match configured CA URL https://ca.example.test",
+        ));
+
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("ca bootstrap")
+    );
 }
 
 #[cfg(unix)]
@@ -1706,7 +1837,7 @@ fn enroll_user_rejects_grant_for_a_substituted_renewal_jwk() {
         "ssh_public_key": request["ssh_public_key"],
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"attacker"},
         "ca_url": "https://ca.example.test",
-        "root_fingerprint": "trusted-fingerprint",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "token": "user-token"
     });
 
@@ -1731,7 +1862,7 @@ fn enroll_user_rejects_grant_for_a_substituted_renewal_jwk() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "grant does not match this device's pending request",
+            "grant does not match this client host's pending request",
         ));
 }
 
@@ -1759,7 +1890,7 @@ fn enroll_host_redacts_token_from_failed_step_error() {
         "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
-        "root_fingerprint": "trusted-fingerprint",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "token": "sensitive-host-token"
     });
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
@@ -2138,7 +2269,7 @@ fn revoke_host_removes_only_the_scoped_provisioner() {
 
 #[cfg(unix)]
 #[test]
-fn status_reports_host_and_user_devices_from_live_ca_state() {
+fn status_reports_host_and_user_clients_from_live_ca_state() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
     let root = home.join(".config/grafhome/step/certs/root_ca.crt");
@@ -2389,7 +2520,7 @@ fn revoke_host_discovers_live_enrollment_after_policy_removal() {
 
 #[cfg(unix)]
 #[test]
-fn revoke_user_discovers_every_live_device_after_policy_removal() {
+fn revoke_user_discovers_every_live_client_after_policy_removal() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
@@ -2846,7 +2977,7 @@ fn user_enrollment_request() -> String {
             "user": "alice",
             "host": "ca-host",
             "ssh_public_key": "ssh-ed25519 AAAApublic alice@ca-host",
-            "renewal_public_jwk": {"kid": "device-kid", "kty": "EC"}
+            "renewal_public_jwk": {"kid": "client-kid", "kty": "EC"}
         })
     )
 }

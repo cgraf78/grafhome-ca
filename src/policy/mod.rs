@@ -3,7 +3,7 @@
 //! Policy files are typed TOML documents so they remain easy to inspect,
 //! comment, and edit by hand without reducing booleans or lists to strings.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,14 +16,10 @@ use crate::error::{Error, Result};
 pub struct Endpoint {
     /// Endpoint role. Current values are `ca_api` and `ca_origin`.
     pub role: String,
-    /// Stable policy name for this endpoint.
-    pub name: String,
     /// DNS name clients or proxies use for this endpoint.
     pub dns_name: String,
     /// Host policy name that owns the endpoint.
     pub target: String,
-    /// Network interface expected to carry this endpoint.
-    pub interface: String,
     /// IP address currently associated with the endpoint.
     pub address: String,
     /// TCP port for the endpoint.
@@ -51,14 +47,10 @@ impl Endpoint {
 pub struct Host {
     /// Stable host name used by policy references.
     pub host: String,
-    /// Host class, such as `server` or `personal-laptop`.
-    pub kind: String,
     /// Whether this host should accept SSH server connections.
     pub ssh_server: bool,
     /// Whether this host should act as an SSH client.
     pub ssh_client: bool,
-    /// Scheduler or operator expected to renew this host's certificates.
-    pub renewal_owner: String,
     /// Host certificate principals.
     pub principals: Vec<String>,
 }
@@ -71,18 +63,12 @@ pub struct User {
     pub user: String,
     /// SSH certificate principal granted to this user.
     pub principal: String,
-    /// Default Unix account for this user.
-    pub unix_account: String,
-    /// Whether root SSH is allowed. Validation rejects `true`.
-    pub root_ssh: bool,
     /// Provisioner used for user certificate issuance.
     pub provisioner: String,
     /// User certificate lifetime.
     pub cert_ttl: String,
     /// Policy status.
     pub status: String,
-    /// Free-form operator notes.
-    pub notes: String,
 }
 
 /// Provisioner entry from `policy/provisioners.toml`.
@@ -99,50 +85,26 @@ pub struct Provisioner {
     pub default_ttl: String,
     /// Maximum certificate lifetime.
     pub max_ttl: String,
-    /// Renewal check cadence.
-    pub renewal_check: String,
     /// Policy status.
     pub status: String,
-    /// Free-form operator notes.
-    pub notes: String,
 }
 
-/// Client device entry from `policy/client-devices.toml`.
+/// User certificate source entry from `policy/user-clients.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClientDevice {
-    /// Device policy name.
-    pub device: String,
-    /// Human owner of the device.
-    pub owner: String,
-    /// Policy user whose SSH certs this device may request.
+pub struct UserClient {
+    /// Enrolled host where the user certificate is stored.
+    pub host: String,
+    /// Policy user whose SSH certs this host may request.
     pub user: String,
-    /// SSH private/public key basename expected on the device.
-    pub key_name: String,
     /// Policy status.
     pub status: String,
 }
 
-/// Principal entry from `policy/principals.toml`.
+/// User login destination entry from `policy/user-remotes.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Principal {
-    /// SSH certificate principal name.
-    pub principal: String,
-    /// Principal class.
-    pub r#type: String,
-    /// Owning policy user, host, or automation identity.
-    pub owner: String,
-    /// Unix accounts this principal may map to, or `-` for host principals.
-    pub allowed_accounts: String,
-    /// Free-form operator notes.
-    pub notes: String,
-}
-
-/// User/host access entry from `policy/user-hosts.toml`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct UserHostAccess {
+pub struct UserRemote {
     /// Policy user.
     pub user: String,
     /// Target host.
@@ -151,54 +113,8 @@ pub struct UserHostAccess {
     pub unix_account: String,
     /// Whether SSH access is allowed.
     pub allow_ssh: bool,
-    /// Whether sudo is expected for this mapping.
-    pub sudo_expected: String,
     /// Policy status.
     pub status: String,
-    /// Free-form operator notes.
-    pub notes: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Operator {
-    user: String,
-    host_ref: String,
-    unix_account: String,
-    privilege: String,
-    status: String,
-    notes: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Automation {
-    name: String,
-    source_ref: String,
-    target_ref: String,
-    purpose: String,
-    auth_model: String,
-    notes: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct StaticKey {
-    account: String,
-    host_ref: String,
-    purpose: String,
-    class: String,
-    required_controls: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EmergencyAccess {
-    host: String,
-    account: String,
-    key_id: String,
-    storage: String,
-    test_interval: String,
 }
 
 /// Parsed policy set.
@@ -214,13 +130,10 @@ pub struct Policy {
     pub users: Vec<User>,
     /// Smallstep provisioners.
     pub provisioners: Vec<Provisioner>,
-    /// Client device key inventory.
-    pub client_devices: Vec<ClientDevice>,
-    /// SSH certificate principals.
-    pub principals: Vec<Principal>,
+    /// Hosts where users may enroll and renew certificates.
+    pub user_clients: Vec<UserClient>,
     /// User-to-host SSH access map.
-    pub user_hosts: Vec<UserHostAccess>,
-    tables: PolicyTables,
+    pub user_remotes: Vec<UserRemote>,
 }
 
 impl Policy {
@@ -231,27 +144,16 @@ impl Policy {
         let hosts = read_typed(root.join("policy/hosts.toml"), "hosts")?;
         let users = read_typed(root.join("policy/users.toml"), "users")?;
         let provisioners = read_typed(root.join("policy/provisioners.toml"), "provisioners")?;
-        let client_devices = read_typed(root.join("policy/client-devices.toml"), "client_devices")?;
-        let principals = read_typed(root.join("policy/principals.toml"), "principals")?;
-        let user_hosts = read_typed(root.join("policy/user-hosts.toml"), "user_hosts")?;
-        let tables = PolicyTables::load(
-            root,
-            users.clone(),
-            provisioners.clone(),
-            client_devices.clone(),
-            principals.clone(),
-            user_hosts.clone(),
-        )?;
+        let user_clients = read_typed(root.join("policy/user-clients.toml"), "user_clients")?;
+        let user_remotes = read_typed(root.join("policy/user-remotes.toml"), "user_remotes")?;
         let policy = Self {
             root: root.to_path_buf(),
             endpoints,
             hosts,
             users,
             provisioners,
-            client_devices,
-            principals,
-            user_hosts,
-            tables,
+            user_clients,
+            user_remotes,
         };
         policy.validate()?;
         Ok(policy)
@@ -276,20 +178,21 @@ impl Policy {
     }
 
     /// Active user-host rows that grant SSH access.
-    pub fn active_ssh_access(&self) -> impl Iterator<Item = &UserHostAccess> {
-        self.user_hosts
-            .iter()
-            .filter(|access| access.status == "active" && access.allow_ssh)
+    pub fn active_ssh_access(&self) -> impl Iterator<Item = &UserRemote> {
+        self.user_remotes.iter().filter(|access| {
+            access.status == "active"
+                && access.allow_ssh
+                && self
+                    .user(&access.user)
+                    .is_some_and(|user| user.status == "active")
+        })
     }
 
-    /// Active client devices for a policy user.
-    pub fn active_client_devices_for_user(
-        &self,
-        user: &str,
-    ) -> impl Iterator<Item = &ClientDevice> {
-        self.client_devices
+    /// Active client hosts for a policy user.
+    pub fn active_user_clients(&self, user: &str) -> impl Iterator<Item = &UserClient> {
+        self.user_clients
             .iter()
-            .filter(move |device| device.status == "active" && device.user == user)
+            .filter(move |client| client.status == "active" && client.user == user)
     }
 
     fn validate(&self) -> Result<()> {
@@ -343,61 +246,40 @@ impl Policy {
             }
         }
 
-        self.validate_tables(&hosts)?;
+        self.validate_relations(&hosts)?;
         Ok(())
     }
 
-    fn validate_tables(&self, hosts: &BTreeSet<String>) -> Result<()> {
+    fn validate_relations(&self, hosts: &BTreeSet<String>) -> Result<()> {
         let users = unique_values(
             "policy/users.toml",
-            self.tables.users.iter().map(|user| user.user.as_str()),
+            self.users.iter().map(|user| user.user.as_str()),
             "user",
+        )?;
+        let user_principals = unique_values(
+            "policy/users.toml",
+            self.users.iter().map(|user| user.principal.as_str()),
+            "principal",
         )?;
         let provisioners = unique_values(
             "policy/provisioners.toml",
-            self.tables
-                .provisioners
+            self.provisioners
                 .iter()
                 .map(|provisioner| provisioner.name.as_str()),
             "name",
         )?;
-        let provisioner_roles = self
-            .provisioners
-            .iter()
-            .map(|provisioner| (provisioner.name.as_str(), provisioner.role.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        let principals = unique_key_map(
-            "policy/principals.toml",
-            self.tables
-                .principals
+        unique_values(
+            "policy/provisioners.toml",
+            self.provisioners
                 .iter()
-                .map(|principal| (principal.principal.as_str(), principal.r#type.as_str())),
-            "principal",
+                .map(|provisioner| provisioner.role.as_str()),
+            "role",
         )?;
 
-        let mut host_refs = hosts.clone();
-        host_refs.insert("fleet".to_owned());
-        for endpoint in &self.endpoints {
-            host_refs.insert(format!("{}.target", endpoint.role));
-        }
-
-        for user in &self.tables.users {
+        for user in &self.users {
             let name = user.user.as_str();
             reject_root_identity("policy/users.toml", name, "user", name)?;
             reject_root_identity("policy/users.toml", name, "principal", &user.principal)?;
-            reject_root_identity(
-                "policy/users.toml",
-                name,
-                "unix_account",
-                &user.unix_account,
-            )?;
-            ensure_contains(
-                "policy/users.toml",
-                name,
-                "principal",
-                &user.principal,
-                principals.keys(),
-            )?;
             ensure_contains(
                 "policy/users.toml",
                 name,
@@ -405,227 +287,135 @@ impl Policy {
                 &user.provisioner,
                 provisioners.iter(),
             )?;
-            if provisioner_roles.get(user.provisioner.as_str()) != Some(&"user_enrollment") {
+            let provisioner = self
+                .provisioners
+                .iter()
+                .find(|provisioner| provisioner.name == user.provisioner)
+                .expect("provisioner existence was validated");
+            if provisioner.role != "user_enrollment" {
                 return Err(Error::Validation {
                     field: format!("policy/users.toml:{name}.provisioner"),
                     message: "user provisioner must use role user_enrollment".to_owned(),
                 });
             }
-            if user.root_ssh {
-                return Err(Error::Validation {
-                    field: format!("policy/users.toml:{name}.root_ssh"),
-                    message: "root SSH login is not supported".to_owned(),
-                });
-            }
             validate_step_duration("policy/users.toml", name, "cert_ttl", &user.cert_ttl)?;
         }
 
-        for row in &self.tables.provisioners {
-            let role = row.role.as_str();
+        for provisioner in &self.provisioners {
             validate_step_duration(
                 "policy/provisioners.toml",
-                role,
+                &provisioner.role,
                 "default_ttl",
-                &row.default_ttl,
+                &provisioner.default_ttl,
             )?;
-            validate_step_duration("policy/provisioners.toml", role, "max_ttl", &row.max_ttl)?;
-            validate_renewal_check(
+            validate_step_duration(
                 "policy/provisioners.toml",
-                role,
-                "renewal_check",
-                &row.renewal_check,
+                &provisioner.role,
+                "max_ttl",
+                &provisioner.max_ttl,
             )?;
         }
 
-        for principal in &self.tables.principals {
-            let name = principal.principal.as_str();
-            let owner = principal.owner.as_str();
-            match principal.r#type.as_str() {
-                "user" => {
-                    reject_root_identity("policy/principals.toml", name, "principal", name)?;
-                    for account in split_list(&principal.allowed_accounts) {
-                        reject_root_identity(
-                            "policy/principals.toml",
-                            name,
-                            "allowed_accounts",
-                            account,
-                        )?;
-                    }
-                    ensure_contains("policy/principals.toml", name, "owner", owner, users.iter())?
-                }
-                "host" => {
-                    ensure_contains("policy/principals.toml", name, "owner", owner, hosts.iter())?
-                }
-                _ => {}
-            }
-        }
-
+        // Certificate principals share one Smallstep namespace. A collision
+        // could make a user certificate valid as a host, or vice versa.
+        let mut certificate_principals = user_principals;
         for host in &self.hosts {
             for principal in &host.principals {
-                ensure_contains(
-                    "policy/hosts.toml",
-                    &host.host,
-                    "principals",
-                    principal,
-                    principals.keys(),
-                )?;
-                if principals.get(principal).map(String::as_str) != Some("host") {
+                if !certificate_principals.insert(principal.clone()) {
                     return Err(Error::Validation {
                         field: format!("policy/hosts.toml:{}.principals", host.host),
-                        message: format!("principal {principal} is not a host principal"),
+                        message: format!("duplicate certificate principal {principal}"),
                     });
                 }
             }
         }
 
-        for row in &self.tables.user_hosts {
-            let user = row.user.as_str();
-            ensure_contains("policy/user-hosts.toml", user, "user", user, users.iter())?;
+        let mut access_rows = BTreeSet::new();
+        for access in &self.user_remotes {
             ensure_contains(
-                "policy/user-hosts.toml",
-                user,
+                "policy/user-remotes.toml",
+                &access.user,
+                "user",
+                &access.user,
+                users.iter(),
+            )?;
+            ensure_contains(
+                "policy/user-remotes.toml",
+                &access.user,
                 "host",
-                &row.host,
+                &access.host,
                 hosts.iter(),
             )?;
-            if row.allow_ssh && row.unix_account == "root" {
+            let remote = self
+                .host(&access.host)
+                .expect("remote host existence was validated");
+            if access.allow_ssh && !remote.ssh_server {
                 return Err(Error::Validation {
-                    field: format!("policy/user-hosts.toml:{user}.unix_account"),
-                    message: "root SSH login is not supported".to_owned(),
+                    field: format!("policy/user-remotes.toml:{}.host", access.user),
+                    message: format!("host {} is not an SSH server", access.host),
+                });
+            }
+            if access.allow_ssh {
+                reject_root_identity(
+                    "policy/user-remotes.toml",
+                    &access.user,
+                    "unix_account",
+                    &access.unix_account,
+                )?;
+            }
+            let key = (
+                access.user.clone(),
+                access.host.clone(),
+                access.unix_account.clone(),
+            );
+            if !access_rows.insert(key) {
+                return Err(Error::Validation {
+                    field: format!("policy/user-remotes.toml:{}", access.user),
+                    message: format!(
+                        "duplicate access row for {}@{} as {}",
+                        access.user, access.host, access.unix_account
+                    ),
                 });
             }
         }
 
-        for row in &self.tables.operators {
-            let user = row.user.as_str();
-            ensure_contains("policy/operators.toml", user, "user", user, users.iter())?;
-            reject_root_identity(
-                "policy/operators.toml",
-                user,
-                "unix_account",
-                &row.unix_account,
-            )?;
+        let mut clients = BTreeSet::new();
+        for client in &self.user_clients {
             ensure_contains(
-                "policy/operators.toml",
-                user,
-                "host_ref",
-                &row.host_ref,
-                host_refs.iter(),
-            )?;
-        }
-
-        for row in &self.tables.client_devices {
-            let device = row.device.as_str();
-            ensure_contains(
-                "policy/client-devices.toml",
-                device,
-                "owner",
-                &row.owner,
-                users.iter(),
-            )?;
-            ensure_contains(
-                "policy/client-devices.toml",
-                device,
-                "user",
-                &row.user,
-                users.iter(),
-            )?;
-        }
-
-        for row in &self.tables.automation {
-            let name = row.name.as_str();
-            ensure_contains(
-                "policy/automation.toml",
-                name,
-                "source_ref",
-                &row.source_ref,
-                host_refs.iter(),
-            )?;
-            ensure_contains(
-                "policy/automation.toml",
-                name,
-                "target_ref",
-                &row.target_ref,
-                host_refs.iter(),
-            )?;
-        }
-
-        for row in &self.tables.static_keys {
-            let account = row.account.as_str();
-            reject_root_identity("policy/static-keys.toml", account, "account", account)?;
-            ensure_contains(
-                "policy/static-keys.toml",
-                account,
-                "host_ref",
-                &row.host_ref,
-                host_refs.iter(),
-            )?;
-        }
-
-        for row in &self.tables.emergency_access {
-            let key_id = row.key_id.as_str();
-            ensure_contains(
-                "policy/emergency-access.toml",
-                key_id,
+                "policy/user-clients.toml",
+                &client.host,
                 "host",
-                &row.host,
+                &client.host,
                 hosts.iter(),
             )?;
             ensure_contains(
-                "policy/emergency-access.toml",
-                key_id,
-                "account",
-                &row.account,
+                "policy/user-clients.toml",
+                &client.host,
+                "user",
+                &client.user,
                 users.iter(),
             )?;
-            reject_root_identity(
-                "policy/emergency-access.toml",
-                key_id,
-                "account",
-                &row.account,
-            )?;
+            let host = self
+                .host(&client.host)
+                .expect("client host existence was validated");
+            if !host.ssh_client {
+                return Err(Error::Validation {
+                    field: format!("policy/user-clients.toml:{}.host", client.user),
+                    message: format!("host {} is not an SSH client", client.host),
+                });
+            }
+            if !clients.insert((client.user.clone(), client.host.clone())) {
+                return Err(Error::Validation {
+                    field: format!("policy/user-clients.toml:{}", client.host),
+                    message: format!(
+                        "duplicate user client {} for user {}",
+                        client.host, client.user
+                    ),
+                });
+            }
         }
 
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PolicyTables {
-    users: Vec<User>,
-    operators: Vec<Operator>,
-    provisioners: Vec<Provisioner>,
-    client_devices: Vec<ClientDevice>,
-    principals: Vec<Principal>,
-    user_hosts: Vec<UserHostAccess>,
-    automation: Vec<Automation>,
-    static_keys: Vec<StaticKey>,
-    emergency_access: Vec<EmergencyAccess>,
-}
-
-impl PolicyTables {
-    fn load(
-        root: &Path,
-        users: Vec<User>,
-        provisioners: Vec<Provisioner>,
-        client_devices: Vec<ClientDevice>,
-        principals: Vec<Principal>,
-        user_hosts: Vec<UserHostAccess>,
-    ) -> Result<Self> {
-        Ok(Self {
-            users,
-            operators: read_typed(root.join("policy/operators.toml"), "operators")?,
-            provisioners,
-            client_devices,
-            principals,
-            user_hosts,
-            automation: read_typed(root.join("policy/automation.toml"), "automation")?,
-            static_keys: read_typed(root.join("policy/static-keys.toml"), "static_keys")?,
-            emergency_access: read_typed(
-                root.join("policy/emergency-access.toml"),
-                "emergency_access",
-            )?,
-        })
     }
 }
 
@@ -672,13 +462,6 @@ where
         })
 }
 
-fn split_list(value: &str) -> impl Iterator<Item = &str> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-}
-
 fn unique_values<'a>(
     table: &str,
     values: impl Iterator<Item = &'a str>,
@@ -694,26 +477,6 @@ fn unique_values<'a>(
         }
     }
     Ok(unique)
-}
-
-fn unique_key_map<'a>(
-    table: &str,
-    rows: impl Iterator<Item = (&'a str, &'a str)>,
-    key: &str,
-) -> Result<BTreeMap<String, String>> {
-    let mut values = BTreeMap::new();
-    for (key_value, mapped_value) in rows {
-        if values
-            .insert(key_value.to_owned(), mapped_value.to_owned())
-            .is_some()
-        {
-            return Err(Error::Validation {
-                field: format!("{table}:{key}"),
-                message: format!("duplicate {key} {key_value}"),
-            });
-        }
-    }
-    Ok(values)
 }
 
 fn reject_root_identity(table: &str, row_id: &str, field: &str, identity: &str) -> Result<()> {
@@ -739,27 +502,6 @@ fn validate_step_duration(table: &str, row_id: &str, field: &str, duration: &str
         Err(Error::Validation {
             field: format!("{table}:{row_id}.{field}"),
             message: "step-ca durations must use Go-style s, m, or h units".to_owned(),
-        })
-    }
-}
-
-fn validate_renewal_check(table: &str, row_id: &str, field: &str, value: &str) -> Result<()> {
-    if value == "manual" {
-        return Ok(());
-    }
-    let duration = value.strip_suffix("-jitter").unwrap_or(value);
-    let (digits, unit) = duration.split_at(duration.len().saturating_sub(1));
-    let valid = !digits.is_empty()
-        && digits.as_bytes()[0] != b'0'
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(unit, "m" | "h");
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::Validation {
-            field: format!("{table}:{row_id}.{field}"),
-            message: "renewal checks must be manual or m/h durations with optional -jitter"
-                .to_owned(),
         })
     }
 }
@@ -830,6 +572,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_user_client_on_host_without_ssh_client_role() {
+        let (dir, policy_dir) = copy_policy();
+        let hosts = policy_dir.join("hosts.toml");
+        let text = fs::read_to_string(&hosts).unwrap().replacen(
+            "ssh_client = true",
+            "ssh_client = false",
+            1,
+        );
+        fs::write(&hosts, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("host ca-host is not an SSH client"));
+    }
+
+    #[test]
+    fn rejects_user_remote_on_host_without_ssh_server_role() {
+        let (dir, policy_dir) = copy_policy();
+        let hosts = policy_dir.join("hosts.toml");
+        let text = fs::read_to_string(&hosts).unwrap().replacen(
+            "ssh_server = true",
+            "ssh_server = false",
+            1,
+        );
+        fs::write(&hosts, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("host ca-host is not an SSH server"));
+    }
+
+    #[test]
     fn rejects_wrong_document_table() {
         let (dir, policy_dir) = copy_policy();
         let hosts = policy_dir.join("hosts.toml");
@@ -877,8 +649,7 @@ mod tests {
         let text = fs::read_to_string(&users)
             .unwrap()
             .replace("user = \"alice\"", "user = \"root\"")
-            .replace("principal = \"alice\"", "principal = \"root\"")
-            .replace("unix_account = \"alice\"", "unix_account = \"root\"");
+            .replace("principal = \"alice\"", "principal = \"root\"");
         fs::write(&users, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
@@ -886,18 +657,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_root_user_principal_allowed_account() {
+    fn rejects_user_principal_that_collides_with_host_principal() {
         let (dir, policy_dir) = copy_policy();
-        let principals = policy_dir.join("principals.toml");
-        let text = fs::read_to_string(&principals).unwrap().replacen(
-            "allowed_accounts = \"alice\"",
-            "allowed_accounts = \"root\"",
-            1,
-        );
-        fs::write(&principals, text).unwrap();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .replace("principal = \"alice\"", "principal = \"ca-host\"");
+        fs::write(&users, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("root SSH identities are not supported"));
+        assert!(error.contains("duplicate certificate principal ca-host"));
+    }
+
+    #[test]
+    fn rejects_duplicate_user_principal() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let mut user_text = fs::read_to_string(&users).unwrap();
+        user_text.push_str(
+            "\n[[users]]\nuser = \"bob\"\nprincipal = \"alice\"\n\
+             provisioner = \"grafhome-user-enrollment\"\ncert_ttl = \"24h\"\n\
+             status = \"active\"\n",
+        );
+        fs::write(&users, user_text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("duplicate principal alice"));
     }
 
     #[test]
@@ -913,22 +698,6 @@ mod tests {
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
         assert!(error.contains("step-ca durations must use Go-style"));
-    }
-
-    #[test]
-    fn rejects_root_static_key_account() {
-        let (dir, policy_dir) = copy_policy();
-        let static_keys = policy_dir.join("static-keys.toml");
-        let mut text = fs::read_to_string(&static_keys).unwrap();
-        text.push_str(
-            "\n[[static_keys]]\naccount = \"root\"\nhost_ref = \"ca-host\"\n\
-             purpose = \"root shell\"\nclass = \"breakglass\"\n\
-             required_controls = \"restricted key\"\n",
-        );
-        fs::write(&static_keys, text).unwrap();
-
-        let error = Policy::load(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("root SSH identities are not supported"));
     }
 
     fn copy_policy() -> (tempfile::TempDir, std::path::PathBuf) {

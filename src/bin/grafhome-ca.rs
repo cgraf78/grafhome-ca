@@ -18,7 +18,7 @@ use grafhome_ca::enrollment::{
     user_provisioner_name, user_provisioner_prefix,
 };
 use grafhome_ca::model::SiteModel;
-use grafhome_ca::policy::{ClientDevice, Endpoint, Host, Provisioner, User};
+use grafhome_ca::policy::{Endpoint, Host, Provisioner, User, UserClient};
 
 const USER_STEP_BIN: &str = "step";
 const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
@@ -218,7 +218,7 @@ enum EnrollCommand {
         #[arg(long)]
         request_only: bool,
     },
-    /// Start or complete user enrollment on this client device.
+    /// Start or complete user enrollment on this client host.
     User {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
@@ -292,7 +292,7 @@ enum RevokeCommand {
         #[arg(long)]
         host: String,
     },
-    /// Disable issuance and renewal for one user's enrolled devices.
+    /// Disable issuance and renewal for one user's enrolled clients.
     User {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
@@ -300,7 +300,7 @@ enum RevokeCommand {
         /// Policy user to revoke.
         #[arg(long)]
         user: String,
-        /// Revoke only the device on this host. Omit to revoke every device.
+        /// Revoke only the client on this host. Omit to revoke every client.
         #[arg(long)]
         host: Option<String>,
     },
@@ -1104,40 +1104,40 @@ fn required_provisioner<'a>(
         })
 }
 
-fn required_user_device<'a>(
+fn required_user_client<'a>(
     model: &'a SiteModel,
     user: &str,
     host: &str,
-) -> grafhome_ca::Result<&'a ClientDevice> {
+) -> grafhome_ca::Result<&'a UserClient> {
     model
         .policy
-        .client_devices
+        .user_clients
         .iter()
-        .find(|device| device.user == user && device.device == host && device.status == "active")
+        .find(|client| client.user == user && client.host == host && client.status == "active")
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/client-devices.toml:{user}:{host}"),
-            message: "missing active client device for user and host".to_owned(),
+            field: format!("policy/user-clients.toml:{user}:{host}"),
+            message: "missing active user client for user and host".to_owned(),
         })
 }
 
-fn select_single_user_device<'a>(
+fn select_single_user_client<'a>(
     model: &'a SiteModel,
     user: &str,
-) -> grafhome_ca::Result<&'a ClientDevice> {
-    let mut devices = model.policy.active_client_devices_for_user(user);
-    let Some(device) = devices.next() else {
+) -> grafhome_ca::Result<&'a UserClient> {
+    let mut clients = model.policy.active_user_clients(user);
+    let Some(client) = clients.next() else {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/client-devices.toml:{user}"),
-            message: "user has no active client devices".to_owned(),
+            field: format!("policy/user-clients.toml:{user}"),
+            message: "user has no active client hosts".to_owned(),
         });
     };
-    if devices.next().is_some() {
+    if clients.next().is_some() {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/client-devices.toml:{user}"),
-            message: "user has multiple active client devices; pass --host".to_owned(),
+            field: format!("policy/user-clients.toml:{user}"),
+            message: "user has multiple active client hosts; pass --host".to_owned(),
         });
     }
-    Ok(device)
+    Ok(client)
 }
 
 fn checked_ttl(field: &str, ttl: &str) -> grafhome_ca::Result<String> {
@@ -1229,25 +1229,39 @@ fn user_root_cert_path(model: &SiteModel) -> grafhome_ca::Result<PathBuf> {
     Ok(user_steppath(model)?.join("certs/root_ca.crt"))
 }
 
-fn user_private_key_path(key_name: &str) -> grafhome_ca::Result<PathBuf> {
-    Ok(home_dir()?.join(".ssh").join(key_name))
+fn user_key_name(user: &str, host: &str) -> String {
+    let host = host
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{user}_{host}_ed25519")
 }
 
-fn user_public_key_path(key_name: &str) -> grafhome_ca::Result<PathBuf> {
+fn user_private_key_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
+    Ok(home_dir()?.join(".ssh").join(user_key_name(user, host)))
+}
+
+fn user_public_key_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{}.pub",
-        user_private_key_path(key_name)?.display()
+        user_private_key_path(user, host)?.display()
     )))
 }
 
-fn user_cert_path(key_name: &str) -> grafhome_ca::Result<PathBuf> {
+fn user_cert_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{}-cert.pub",
-        user_private_key_path(key_name)?.display()
+        user_private_key_path(user, host)?.display()
     )))
 }
 
-fn user_device_material_dir(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
+fn user_client_material_dir(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
     Ok(home_dir()?
         .join(".config/grafhome-ca/users")
         .join(user)
@@ -1372,7 +1386,7 @@ fn resolve_host(host: Option<&str>) -> grafhome_ca::Result<String> {
 }
 
 fn enrollment_request_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
-    Ok(user_device_material_dir(user, host)?.join("pending-enrollment.json"))
+    Ok(user_client_material_dir(user, host)?.join("pending-enrollment.json"))
 }
 
 fn ensure_user_keys(
@@ -1382,8 +1396,8 @@ fn ensure_user_keys(
     password: &str,
 ) -> grafhome_ca::Result<UserRequest> {
     let user = active_user(model, user_name)?;
-    let device = required_user_device(model, &user.user, host)?;
-    let private_key = user_private_key_path(&device.key_name)?;
+    let client = required_user_client(model, &user.user, host)?;
+    let private_key = user_private_key_path(&user.user, &client.host)?;
     let ssh_dir = private_key
         .parent()
         .ok_or_else(|| grafhome_ca::Error::Validation {
@@ -1406,7 +1420,7 @@ fn ensure_user_keys(
         )?;
     }
 
-    let material_dir = user_device_material_dir(&user.user, &device.device)?;
+    let material_dir = user_client_material_dir(&user.user, &client.host)?;
     std::fs::create_dir_all(&material_dir)
         .map_err(|source| grafhome_ca::Error::io(&material_dir, source))?;
     #[cfg(unix)]
@@ -1437,7 +1451,7 @@ fn ensure_user_keys(
         std::fs::set_permissions(&public_jwk, std::fs::Permissions::from_mode(0o644))
             .map_err(|source| grafhome_ca::Error::io(&public_jwk, source))?;
     }
-    let ssh_public_key = std::fs::read_to_string(user_public_key_path(&device.key_name)?)
+    let ssh_public_key = std::fs::read_to_string(user_public_key_path(&user.user, &client.host)?)
         .map_err(|source| grafhome_ca::Error::io("SSH public key", source))?;
     let renewal_public_jwk = serde_json::from_str(
         &std::fs::read_to_string(&public_jwk)
@@ -1449,7 +1463,7 @@ fn ensure_user_keys(
     })?;
     let request = UserRequest::new(
         &user.user,
-        &device.device,
+        &client.host,
         ssh_public_key.trim(),
         renewal_public_jwk,
     );
@@ -1580,9 +1594,10 @@ fn enroll_user_flow(
     {
         return Err(grafhome_ca::Error::Validation {
             field: "user enrollment grant".to_owned(),
-            message: "grant does not match this device's pending request".to_owned(),
+            message: "grant does not match this client host's pending request".to_owned(),
         });
     }
+    validate_grant_ca_url(model, &grant.ca_url, "user enrollment grant")?;
     bootstrap_trust(
         USER_STEP_BIN,
         &user_steppath(model)?,
@@ -1598,7 +1613,7 @@ fn enroll_user_flow(
     renew_user(model, &user, Some(&host), &password, false)?;
     std::fs::remove_file(&pending_path)
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
-    outln!("Enrollment complete. Try: ssh nas");
+    outln!("User enrollment complete: {user}@{host}");
     Ok(())
 }
 
@@ -1616,7 +1631,7 @@ fn approve_user_enrollment(
         checked_ttl("approve user.cert_ttl", ttl)?;
     }
     active_user(model, &request.user)?;
-    required_user_device(model, &request.user, &request.host)?;
+    required_user_client(model, &request.user, &request.host)?;
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
     let token = authorize_user(model, &request.user, &request.host, &public_jwk, || {
@@ -1732,6 +1747,7 @@ fn enroll_host_flow(
             message: "grant does not match this host's pending request".to_owned(),
         });
     }
+    validate_grant_ca_url(model, &grant.ca_url, "host enrollment grant")?;
     complete_host_enrollment(model, &grant)?;
     renew_host(model, &host, false)?;
     std::fs::remove_file(&pending_path)
@@ -1788,6 +1804,18 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
     reload_ssh(false)?;
     outln!("Host enrollment complete: {}", grant.host);
     Ok(())
+}
+
+fn validate_grant_ca_url(model: &SiteModel, ca_url: &str, field: &str) -> grafhome_ca::Result<()> {
+    let expected = required_endpoint(model, "ca_api")?.url();
+    if ca_url == expected {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: field.to_owned(),
+            message: format!("CA URL {ca_url} does not match configured CA URL {expected}"),
+        })
+    }
 }
 
 fn install_host_ssh_trust(
@@ -2357,7 +2385,7 @@ fn create_user_token(
     cert_ttl: Option<&str>,
 ) -> grafhome_ca::Result<Vec<u8>> {
     let user = active_user(model, user)?;
-    required_user_device(model, &user.user, host)?;
+    required_user_client(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let token_ttl = checked_ttl(
         "create-user-token.ttl",
@@ -2398,10 +2426,10 @@ fn issue_user_certificate(
     token: &str,
 ) -> grafhome_ca::Result<()> {
     let user = active_user(model, user_name)?;
-    let device = required_user_device(model, &user.user, host)?;
+    let client = required_user_client(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
-    let public_key = user_public_key_path(&device.key_name)?;
-    let cert = user_cert_path(&device.key_name)?;
+    let public_key = user_public_key_path(&user.user, &client.host)?;
+    let cert = user_cert_path(&user.user, &client.host)?;
     run_status_redacted(
         process(USER_STEP_BIN)
             .env("STEPPATH", user_steppath(model)?)
@@ -2444,10 +2472,10 @@ fn authorize_user_locked<T>(
     after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
 ) -> grafhome_ca::Result<T> {
     let user = active_user(model, user_name)?;
-    let device = required_user_device(model, &user.user, host)?;
+    let client = required_user_client(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let user_enrollment = required_provisioner(model, "user_enrollment")?;
-    let provisioner = user_provisioner_name(&user.user, &device.device);
+    let provisioner = user_provisioner_name(&user.user, &client.host);
     let template_dir = PathBuf::from(model.deployment.ca_steppath()).join("templates/ssh");
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
     std::fs::create_dir_all(&template_dir)
@@ -2456,7 +2484,7 @@ fn authorize_user_locked<T>(
         .map_err(|source| grafhome_ca::Error::io(&template_file, source))?;
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
     let result = with_temp_file(&template_dir, public_key.as_bytes(), |public_key_file| {
-        let text = grafhome_ca::runtime_provisioners::add_user_device(
+        let text = grafhome_ca::runtime_provisioners::add_user_client(
             &ca_json,
             public_key_file,
             &provisioner,
@@ -2738,7 +2766,7 @@ fn user_local_renewal_ready(
     require_stored_credential: bool,
 ) -> grafhome_ca::Result<bool> {
     Ok(user_root_cert_path(model)?.is_file()
-        && user_device_material_dir(user, host)?
+        && user_client_material_dir(user, host)?
             .join("provisioner.priv.json")
             .is_file()
         && (!require_stored_credential || renewal_credential_path(user, host)?.is_file()))
@@ -3015,15 +3043,15 @@ fn renew_user(
     quiet: bool,
 ) -> grafhome_ca::Result<()> {
     let user = active_user(model, user_name)?;
-    let device = match host {
-        Some(host) => required_user_device(model, &user.user, host)?,
-        None => select_single_user_device(model, &user.user)?,
+    let client = match host {
+        Some(host) => required_user_client(model, &user.user, host)?,
+        None => select_single_user_client(model, &user.user)?,
     };
     let ca_api = required_endpoint(model, "ca_api")?;
-    let provisioner = user_provisioner_name(&user.user, &device.device);
-    let material_dir = user_device_material_dir(&user.user, &device.device)?;
+    let provisioner = user_provisioner_name(&user.user, &client.host);
+    let material_dir = user_client_material_dir(&user.user, &client.host)?;
     let private_jwk = material_dir.join("provisioner.priv.json");
-    let certificate = user_cert_path(&device.key_name)?;
+    let certificate = user_cert_path(&user.user, &client.host)?;
     let token = with_password_file(&material_dir, password, |password_file| {
         run_capture(
             process(USER_STEP_BIN)
@@ -3060,7 +3088,7 @@ fn renew_user(
             .arg("ssh")
             .arg("certificate")
             .arg(&user.principal)
-            .arg(user_public_key_path(&device.key_name)?)
+            .arg(user_public_key_path(&user.user, &client.host)?)
             .arg("--sign")
             .arg("--token")
             .arg(token.trim())
@@ -3086,8 +3114,8 @@ fn user_certificate_needs_renewal(
     host: &str,
 ) -> grafhome_ca::Result<bool> {
     let user = active_user(model, user_name)?;
-    let device = required_user_device(model, &user.user, host)?;
-    ssh_certificate_needs_renewal(USER_STEP_BIN, &user_cert_path(&device.key_name)?)
+    let client = required_user_client(model, &user.user, host)?;
+    ssh_certificate_needs_renewal(USER_STEP_BIN, &user_cert_path(&user.user, &client.host)?)
 }
 
 fn ssh_certificate_needs_renewal(step_bin: &str, certificate: &Path) -> grafhome_ca::Result<bool> {
@@ -3195,7 +3223,7 @@ fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<S
 }
 
 fn renewal_credential_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
-    Ok(user_device_material_dir(user, host)?.join("renewal-password.cred"))
+    Ok(user_client_material_dir(user, host)?.join("renewal-password.cred"))
 }
 
 fn store_systemd_credential(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
@@ -3275,19 +3303,20 @@ fn install_identity_aliases(
     host: &str,
 ) -> grafhome_ca::Result<()> {
     let user = active_user(model, user_name)?;
-    let device = required_user_device(model, &user.user, host)?;
+    let client = required_user_client(model, &user.user, host)?;
     let ssh_dir = home_dir()?.join(".ssh");
+    let key_name = user_key_name(&user.user, &client.host);
     let aliases = [
         (
-            PathBuf::from(&device.key_name),
+            PathBuf::from(&key_name),
             ssh_dir.join(format!("{}.key", user.user)),
         ),
         (
-            PathBuf::from(format!("{}.pub", device.key_name)),
+            PathBuf::from(format!("{key_name}.pub")),
             ssh_dir.join(format!("{}.key.pub", user.user)),
         ),
         (
-            PathBuf::from(format!("{}-cert.pub", device.key_name)),
+            PathBuf::from(format!("{key_name}-cert.pub")),
             ssh_dir.join(format!("{}.key-cert.pub", user.user)),
         ),
     ];
@@ -3442,8 +3471,29 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, Cursor};
+    use std::path::PathBuf;
 
-    use super::{parse_enrollment_document, read_interactive_document};
+    use super::{
+        parse_enrollment_document, read_interactive_document, user_key_name, validate_grant_ca_url,
+    };
+
+    #[test]
+    fn user_key_name_is_derived_from_user_and_host() {
+        assert_eq!(user_key_name("alice", "ca-host"), "alice_ca_host_ed25519");
+    }
+
+    #[test]
+    fn grant_ca_url_must_match_configured_ca() {
+        let config_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config");
+        let model = grafhome_ca::model::SiteModel::load(config_root).expect("example model");
+
+        let error =
+            validate_grant_ca_url(&model, "https://attacker.example", "user enrollment grant")
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("does not match configured CA URL https://ca.example.test"));
+    }
 
     #[test]
     fn interactive_document_returns_after_one_complete_line() {

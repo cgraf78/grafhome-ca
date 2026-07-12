@@ -11,16 +11,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "role",
-          "name",
-          "type",
-          "default_ttl",
-          "max_ttl",
-          "renewal_check",
-          "status",
-          "notes"
-        ],
+        "required": ["role", "name", "type", "default_ttl", "max_ttl", "status"],
         "properties": {
           "role": {
             "enum": ["host_bootstrap", "user_enrollment", "proxy_x509"]
@@ -37,15 +28,8 @@
           "max_ttl": {
             "$ref": "#/definitions/ttl"
           },
-          "renewal_check": {
-            "type": "string",
-            "pattern": "^(manual|[1-9][0-9]*[mh](-jitter)?)$"
-          },
           "status": {
             "enum": ["active", "planned", "disabled"]
-          },
-          "notes": {
-            "type": "string"
           }
         }
       }
