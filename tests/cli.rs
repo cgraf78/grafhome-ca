@@ -213,6 +213,11 @@ fi
         r#"#!/bin/sh
 set -eu
 printf 'sshd args=%s\n' "$*" >> "$FAKE_LOG"
+if [ "${FAKE_SSHD_FAIL_ONCE:-}" = "1" ] && [ ! -e "$FAKE_LOG.sshd_failed" ]; then
+  touch "$FAKE_LOG.sshd_failed"
+  printf 'simulated sshd validation failure\n' >&2
+  exit 48
+fi
 "#,
     );
     write_executable(
@@ -226,6 +231,14 @@ fi
 if [ "${FAKE_SYSTEMCTL_RESTART_FAIL_ONCE:-}" = "1" ] && [ "$1" = "restart" ] && [ ! -e "$FAKE_LOG.restart_failed" ]; then
   touch "$FAKE_LOG.restart_failed"
   exit 43
+fi
+if [ "${FAKE_SYSTEMCTL_RELOAD_FAIL_PAIR:-}" = "1" ] && [ "$1" = "reload" ]; then
+  count_file="$FAKE_LOG.reload_failures"
+  count=0
+  if [ -e "$count_file" ]; then count=$(cat "$count_file"); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$count_file"
+  if [ "$count" -le 2 ]; then exit 44; fi
 fi
 if [ "$1" = "restart" ]; then touch "$FAKE_LOG.restarted"; fi
 if [ "$1" = "is-active" ]; then printf 'active\n'; fi
@@ -276,6 +289,26 @@ esac
     )
 }
 
+#[cfg(unix)]
+fn prepare_apply_host(fixture: &ExecFixture) {
+    let root = fixture.config_root.join("../server-step/certs/root_ca.crt");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    fs::write(root, "root\n").unwrap();
+}
+
+#[cfg(unix)]
+fn apply_host_command(fixture: &ExecFixture, install_root: &Path) -> Command {
+    let mut command = Command::cargo_bin("grafhome-ca").unwrap();
+    command
+        .args(["apply", "host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("HOSTNAME", "proxy-host.example.test")
+        .env("GRAFHOME_CA_INSTALL_ROOT", install_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log);
+    command
+}
+
 #[test]
 fn check_validates_example_config() {
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
@@ -321,6 +354,7 @@ fn help_exposes_only_supported_commands() {
         "render",
         "export",
         "materialize",
+        "apply",
         "approve",
         "enroll",
         "renew",
@@ -372,6 +406,247 @@ fn help_exposes_only_supported_commands() {
             assert!(text.contains(noun), "missing `{verb} {noun}` command");
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_dry_run_does_not_write_or_reload() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("create\t"))
+        .stdout(predicate::str::contains(
+            "Would apply 6 host policy change(s) for proxy-host",
+        ));
+
+    assert!(!install_root.exists());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(!log.contains("sshd args=-t"));
+    assert!(!log.contains("systemctl args=reload"));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_installs_fresh_local_policy() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied 6 host policy change(s) for proxy-host",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(install_root.join("etc/ssh/auth_principals/alice")).unwrap(),
+        "alice\n"
+    );
+    assert!(
+        fs::read_to_string(install_root.join("etc/ssh/grafhome/ssh_known_hosts"))
+            .unwrap()
+            .contains("@cert-authority")
+    );
+    assert!(
+        fs::read_to_string(install_root.join("etc/ssh/grafhome/user_ca_keys.pem"))
+            .unwrap()
+            .contains("AAAAuserca")
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("systemctl args=reload ssh"));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_exposes_only_the_local_host_noun() {
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("host"));
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "user"])
+        .assert()
+        .failure();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "host", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--host").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_corrects_unsafe_special_mode_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let principals = install_root.join("etc/ssh/auth_principals/alice");
+    prepare_apply_host(&fixture);
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+    fs::set_permissions(&principals, fs::Permissions::from_mode(0o4644)).unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "update\t{}",
+            principals.display()
+        )));
+
+    assert_eq!(
+        fs::metadata(principals).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_removes_stale_principal_files() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let auth_dir = install_root.join("etc/ssh/auth_principals");
+    prepare_apply_host(&fixture);
+    fs::create_dir_all(&auth_dir).unwrap();
+    fs::write(auth_dir.join("departed"), "departed\n").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "remove\t{}",
+            auth_dir.join("departed").display()
+        )));
+
+    assert!(!auth_dir.join("departed").exists());
+    assert_eq!(
+        fs::read_to_string(auth_dir.join("alice")).unwrap(),
+        "alice\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_skips_validation_and_reload_when_current() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+    fs::write(&fixture.log, "").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout("Host policy already current: proxy-host\n");
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(!log.contains("sshd args=-t"));
+    assert!(!log.contains("systemctl args=reload"));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_restores_previous_policy_when_sshd_validation_fails() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let auth_dir = install_root.join("etc/ssh/auth_principals");
+    let sshd_config = install_root.join("etc/ssh/sshd_config.d/grafhome-ca.conf");
+    prepare_apply_host(&fixture);
+    fs::create_dir_all(&auth_dir).unwrap();
+    fs::create_dir_all(sshd_config.parent().unwrap()).unwrap();
+    fs::write(auth_dir.join("departed"), "departed\n").unwrap();
+    fs::write(&sshd_config, "previous config\n").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_SSHD_FAIL_ONCE", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "restored the previous host policy",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(auth_dir.join("departed")).unwrap(),
+        "departed\n"
+    );
+    assert!(!auth_dir.join("alice").exists());
+    assert_eq!(
+        fs::read_to_string(sshd_config).unwrap(),
+        "previous config\n"
+    );
+    assert!(
+        !install_root
+            .join("etc/ssh/grafhome/user_ca_keys.pem")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_restores_previous_policy_when_ssh_reload_fails() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let sshd_config = install_root.join("etc/ssh/sshd_config.d/grafhome-ca.conf");
+    prepare_apply_host(&fixture);
+    fs::create_dir_all(sshd_config.parent().unwrap()).unwrap();
+    fs::write(&sshd_config, "previous config\n").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_SYSTEMCTL_RELOAD_FAIL_PAIR", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "restored the previous host policy",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(sshd_config).unwrap(),
+        "previous config\n"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("{}.reload_failures", fixture.log.display())).unwrap(),
+        "3\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_rejects_non_file_in_managed_principals_directory() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let unexpected = install_root.join("etc/ssh/auth_principals/unexpected-directory");
+    prepare_apply_host(&fixture);
+    fs::create_dir_all(&unexpected).unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "principals directory may contain only regular files",
+        ));
+
+    assert!(unexpected.is_dir());
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(!log.contains("sshd args=-t"));
+    assert!(!log.contains("systemctl args=reload"));
 }
 
 #[test]

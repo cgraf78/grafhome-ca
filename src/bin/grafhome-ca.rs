@@ -1,5 +1,6 @@
 //! Grafhome CA policy, enrollment, and certificate CLI.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -102,6 +103,11 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         out_file: PathBuf,
     },
+    /// Apply current policy to a local host.
+    Apply {
+        #[command(subcommand)]
+        command: ApplyCommand,
+    },
     /// Approve a public enrollment request on the CA origin.
     Approve {
         #[command(subcommand)]
@@ -139,6 +145,19 @@ enum Command {
         /// Also require the local credential material needed for unattended renewal.
         #[arg(long)]
         renewable: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ApplyCommand {
+    /// Reconcile this host's Grafhome-managed OpenSSH policy.
+    Host {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Show changes without writing files or reloading SSH.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -397,6 +416,17 @@ fn run() -> grafhome_ca::Result<()> {
             )?;
             write_secret_file(&out_file, text.as_bytes())?;
             Ok(())
+        }
+        Command::Apply {
+            command:
+                ApplyCommand::Host {
+                    config_root,
+                    dry_run,
+                },
+        } => {
+            let model = load_valid_model(config_root)?;
+            let host = resolve_host(None)?;
+            apply_host_policy(&model, &host, dry_run)
         }
         Command::Approve {
             command:
@@ -1642,6 +1672,30 @@ fn install_host_ssh_trust(
     host_name: &str,
     ca_url: &str,
 ) -> grafhome_ca::Result<()> {
+    for (path, file) in desired_host_ssh_files(model, host_name, ca_url)? {
+        write_public_file_atomic(&path, &file.content, file.mode)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostPolicyFile {
+    mode: u32,
+    content: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostPolicyChange {
+    Create,
+    Update,
+    Remove,
+}
+
+fn desired_host_ssh_files(
+    model: &SiteModel,
+    host_name: &str,
+    ca_url: &str,
+) -> grafhome_ca::Result<BTreeMap<PathBuf, HostPolicyFile>> {
     let host = required_host(model, host_name)?;
     let step_bin = &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"];
     let steppath = Path::new(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]);
@@ -1680,6 +1734,7 @@ fn install_host_ssh_trust(
         String::new()
     };
     let known_hosts = known_hosts_from_roots(model, &host_ca_keys);
+    let mut desired = BTreeMap::new();
     for file in grafhome_ca::render::render(model)? {
         let Some(target) = rendered_host_target(&file.path, host_name) else {
             continue;
@@ -1695,9 +1750,238 @@ fn install_host_ssh_trust(
             &file.content
         };
         let target = install_target(&target);
-        write_public_file_atomic(&target, content.as_bytes(), file.mode)?;
+        if desired
+            .insert(
+                target.clone(),
+                HostPolicyFile {
+                    mode: file.mode,
+                    content: content.as_bytes().to_vec(),
+                },
+            )
+            .is_some()
+        {
+            return Err(grafhome_ca::Error::Validation {
+                field: target.display().to_string(),
+                message: "host policy rendered the same target more than once".to_owned(),
+            });
+        }
+    }
+    Ok(desired)
+}
+
+fn apply_host_policy(model: &SiteModel, host_name: &str, dry_run: bool) -> grafhome_ca::Result<()> {
+    let ca_url = required_endpoint(model, "ca_api")?.url();
+    let desired = desired_host_ssh_files(model, host_name, &ca_url)?;
+    if dry_run {
+        let changes = host_policy_changes(model, &desired)?;
+        print_host_policy_changes(host_name, &changes, true)?;
+        return Ok(());
+    }
+
+    with_host_policy_lock(model, || {
+        apply_host_policy_locked(model, host_name, &desired)
+    })
+}
+
+fn apply_host_policy_locked(
+    model: &SiteModel,
+    host_name: &str,
+    desired: &BTreeMap<PathBuf, HostPolicyFile>,
+) -> grafhome_ca::Result<()> {
+    let changes = host_policy_changes(model, desired)?;
+    if changes.is_empty() {
+        outln!("Host policy already current: {host_name}");
+        return Ok(());
+    }
+
+    let mut previous = BTreeMap::new();
+    for path in changes.keys() {
+        previous.insert(path.clone(), read_host_policy_file(path)?);
+    }
+
+    let apply = (|| -> grafhome_ca::Result<()> {
+        for (path, change) in &changes {
+            match change {
+                HostPolicyChange::Create | HostPolicyChange::Update => {
+                    let file = desired.get(path).expect("changed desired file exists");
+                    write_public_file_atomic(path, &file.content, file.mode)?;
+                }
+                HostPolicyChange::Remove => remove_host_policy_file(path)?,
+            }
+        }
+        validate_and_reload_ssh()
+    })();
+
+    if let Err(error) = apply {
+        let rollback =
+            restore_host_policy_files(&previous).and_then(|()| validate_and_reload_ssh());
+        return Err(grafhome_ca::Error::Validation {
+            field: "apply host".to_owned(),
+            message: match rollback {
+                Ok(()) => format!("{error}; restored the previous host policy"),
+                Err(rollback_error) => {
+                    format!("{error}; rollback failed: {rollback_error}")
+                }
+            },
+        });
+    }
+
+    print_host_policy_changes(host_name, &changes, false)
+}
+
+fn host_policy_changes(
+    model: &SiteModel,
+    desired: &BTreeMap<PathBuf, HostPolicyFile>,
+) -> grafhome_ca::Result<BTreeMap<PathBuf, HostPolicyChange>> {
+    let managed = host_policy_managed_paths(model, desired)?;
+    let mut changes = BTreeMap::new();
+    for path in managed {
+        let current = read_host_policy_file(&path)?;
+        match (current.as_ref(), desired.get(&path)) {
+            (None, Some(_)) => {
+                changes.insert(path, HostPolicyChange::Create);
+            }
+            (Some(current), Some(wanted)) if current != wanted => {
+                changes.insert(path, HostPolicyChange::Update);
+            }
+            (Some(_), None) => {
+                changes.insert(path, HostPolicyChange::Remove);
+            }
+            _ => {}
+        }
+    }
+    Ok(changes)
+}
+
+fn host_policy_managed_paths(
+    model: &SiteModel,
+    desired: &BTreeMap<PathBuf, HostPolicyFile>,
+) -> grafhome_ca::Result<BTreeSet<PathBuf>> {
+    let trust_dir = &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"];
+    let auth_dir = install_target(&model.deployment.values["GRAFHOME_CA_AUTH_PRINCIPALS_DIR"]);
+    let mut paths = desired.keys().cloned().collect::<BTreeSet<_>>();
+    for path in [
+        "/etc/ssh/sshd_config.d/grafhome-ca.conf".to_owned(),
+        "/etc/ssh/ssh_config.d/grafhome-ca.conf".to_owned(),
+        format!("{trust_dir}/user_ca_keys.pem"),
+        format!("{trust_dir}/revoked_user_certs"),
+        format!("{trust_dir}/ssh_known_hosts"),
+    ] {
+        paths.insert(install_target(&path));
+    }
+
+    let entries = match std::fs::read_dir(&auth_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(source) => return Err(grafhome_ca::Error::io(&auth_dir, source)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| grafhome_ca::Error::io(&auth_dir, source))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| grafhome_ca::Error::io(entry.path(), source))?;
+        if !file_type.is_file() {
+            return Err(grafhome_ca::Error::Validation {
+                field: entry.path().display().to_string(),
+                message: "the Grafhome-managed principals directory may contain only regular files"
+                    .to_owned(),
+            });
+        }
+        paths.insert(entry.path());
+    }
+    Ok(paths)
+}
+
+fn read_host_policy_file(path: &Path) -> grafhome_ca::Result<Option<HostPolicyFile>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(grafhome_ca::Error::io(path, source)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message: "managed host policy target is not a regular file".to_owned(),
+        });
+    }
+    Ok(Some(HostPolicyFile {
+        mode: metadata.permissions().mode() & 0o7777,
+        content: std::fs::read(path).map_err(|source| grafhome_ca::Error::io(path, source))?,
+    }))
+}
+
+fn remove_host_policy_file(path: &Path) -> grafhome_ca::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(grafhome_ca::Error::io(path, source)),
+    }
+}
+
+fn restore_host_policy_files(
+    previous: &BTreeMap<PathBuf, Option<HostPolicyFile>>,
+) -> grafhome_ca::Result<()> {
+    for (path, file) in previous {
+        match file {
+            Some(file) => write_public_file_atomic(path, &file.content, file.mode)?,
+            None => remove_host_policy_file(path)?,
+        }
     }
     Ok(())
+}
+
+fn validate_and_reload_ssh() -> grafhome_ca::Result<()> {
+    run_status_quiet(process("sshd").arg("-t"), &[], true)?;
+    reload_ssh(true)
+}
+
+fn print_host_policy_changes(
+    host_name: &str,
+    changes: &BTreeMap<PathBuf, HostPolicyChange>,
+    dry_run: bool,
+) -> grafhome_ca::Result<()> {
+    if changes.is_empty() {
+        outln!("Host policy already current: {host_name}");
+        return Ok(());
+    }
+    for (path, change) in changes {
+        let verb = match change {
+            HostPolicyChange::Create => "create",
+            HostPolicyChange::Update => "update",
+            HostPolicyChange::Remove => "remove",
+        };
+        outln!("{verb}\t{}", path.display());
+    }
+    if dry_run {
+        outln!(
+            "Would apply {} host policy change(s) for {host_name}",
+            changes.len()
+        );
+    } else {
+        outln!(
+            "Applied {} host policy change(s) for {host_name}",
+            changes.len()
+        );
+    }
+    Ok(())
+}
+
+fn with_host_policy_lock<T>(
+    model: &SiteModel,
+    action: impl FnOnce() -> grafhome_ca::Result<T>,
+) -> grafhome_ca::Result<T> {
+    let trust_dir = install_target(&model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"]);
+    std::fs::create_dir_all(&trust_dir)
+        .map_err(|source| grafhome_ca::Error::io(&trust_dir, source))?;
+    let path = trust_dir.join(".apply.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).mode(0o600);
+    let file = options
+        .open(&path)
+        .map_err(|source| grafhome_ca::Error::io(&path, source))?;
+    file.lock_exclusive()
+        .map_err(|source| grafhome_ca::Error::io(&path, source))?;
+    action()
 }
 
 fn rendered_host_target(path: &Path, expected_host: &str) -> Option<String> {
