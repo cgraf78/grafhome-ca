@@ -172,9 +172,12 @@ deployments must provide equivalent scheduling.
 `enroll user` generates the SSH and renewal keys, stores the renewal password,
 prints the public request, and waits for the grant. After the grant is pasted,
 the same process bootstraps pinned CA trust, obtains the initial certificate,
-installs stable `$HOME/.ssh/<user>.key*` aliases, verifies renewal, and removes
-pending state. A terminated process can resume from that pending state by
-running `enroll user` again. File overrides exist for automation:
+stores the identity at OpenSSH's standard `$HOME/.ssh/id_ed25519` paths,
+verifies renewal, and removes pending state. If any default identity file
+already exists, enrollment lists the conflicting paths and asks before
+replacing the complete key and certificate set; declining leaves every file
+unchanged. A terminated process can resume from pending state by running
+`enroll user` again. File overrides exist for automation:
 `--request-file`, `--grant-file`, and `--password-file`; `--request-only` emits
 the request without waiting. `approve user --yes` skips operator confirmation.
 Pasted requests and grants may include or omit their `REQUEST:` or `GRANT:`
