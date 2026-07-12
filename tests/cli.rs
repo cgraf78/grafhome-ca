@@ -1433,7 +1433,7 @@ fn enroll_user_first_run_creates_public_request_and_pending_state() {
         .stdout(predicate::str::contains("REQUEST:{\"version\":1"))
         .stdout(predicate::str::contains("\"ssh_public_key\":\"ssh-ed25519"));
 
-    let key = home.join(".ssh/alice_ca_host_ed25519");
+    let key = home.join(".ssh/id_ed25519");
     let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
     assert!(key.exists());
     assert!(material.join("provisioner.pub.json").exists());
@@ -1533,6 +1533,8 @@ fn enroll_user_falls_back_to_systemd_user_credential() {
     let pending =
         home.join(".config/grafhome-ca/users/alice/hosts/ca-host/pending-enrollment.json");
     fs::remove_file(&pending).unwrap();
+    fs::remove_file(home.join(".ssh/id_ed25519")).unwrap();
+    fs::remove_file(home.join(".ssh/id_ed25519.pub")).unwrap();
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
         .args(["enroll", "user"])
@@ -1639,7 +1641,7 @@ fn enroll_user_second_run_completes_and_verifies_renewal() {
         .assert()
         .success();
 
-    let public_key = fs::read_to_string(home.join(".ssh/alice_ca_host_ed25519.pub")).unwrap();
+    let public_key = fs::read_to_string(home.join(".ssh/id_ed25519.pub")).unwrap();
     let grant = serde_json::json!({
         "version": 1,
         "kind": "grafhome-user-enrollment-grant",
@@ -1674,14 +1676,11 @@ fn enroll_user_second_run_completes_and_verifies_renewal() {
 
     let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
     assert!(!material.join("pending-enrollment.json").exists());
-    assert_eq!(
-        fs::read_link(home.join(".ssh/alice.key")).unwrap(),
-        PathBuf::from("alice_ca_host_ed25519")
-    );
-    assert_eq!(
-        fs::read_link(home.join(".ssh/alice.key-cert.pub")).unwrap(),
-        PathBuf::from("alice_ca_host_ed25519-cert.pub")
-    );
+    assert!(home.join(".ssh/id_ed25519").is_file());
+    assert!(home.join(".ssh/id_ed25519.pub").is_file());
+    assert!(home.join(".ssh/id_ed25519-cert.pub").is_file());
+    assert!(!home.join(".ssh/alice.key").exists());
+    assert!(!home.join(".ssh/alice.key-cert.pub").exists());
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains("--token user-token"));
     assert!(log.contains("--issuer grafhome-user-616c696365-63612d686f7374"));
@@ -2111,7 +2110,7 @@ fn renew_user_reads_password_from_stdin_and_refreshes_cert() {
     let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
     fs::create_dir_all(&material).unwrap();
     fs::create_dir_all(home.join(".ssh")).unwrap();
-    fs::write(home.join(".ssh/alice_ca_host_ed25519.pub"), "public\n").unwrap();
+    fs::write(home.join(".ssh/id_ed25519.pub"), "public\n").unwrap();
     fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
     let password_file = dir.path().join("password");
     fs::write(&password_file, "user-owned-password\n").unwrap();
@@ -2148,7 +2147,7 @@ fn quiet_renew_user_suppresses_successful_renewal_output() {
     let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
     fs::create_dir_all(&material).unwrap();
     fs::create_dir_all(home.join(".ssh")).unwrap();
-    fs::write(home.join(".ssh/alice_ca_host_ed25519.pub"), "public\n").unwrap();
+    fs::write(home.join(".ssh/id_ed25519.pub"), "public\n").unwrap();
     fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
     let password_file = dir.path().join("password");
     fs::write(&password_file, "user-owned-password\n").unwrap();
@@ -2189,7 +2188,7 @@ fn quiet_renew_user_reports_redacted_renewal_failures() {
     let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
     fs::create_dir_all(&material).unwrap();
     fs::create_dir_all(home.join(".ssh")).unwrap();
-    fs::write(home.join(".ssh/alice_ca_host_ed25519.pub"), "public\n").unwrap();
+    fs::write(home.join(".ssh/id_ed25519.pub"), "public\n").unwrap();
     fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
     let password_file = dir.path().join("password");
     fs::write(&password_file, "user-owned-password\n").unwrap();
@@ -2228,7 +2227,7 @@ fn renew_user_skips_fresh_certificate_without_loading_credential() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
     fs::create_dir_all(home.join(".ssh")).unwrap();
-    fs::write(home.join(".ssh/alice_ca_host_ed25519-cert.pub"), "cert\n").unwrap();
+    fs::write(home.join(".ssh/id_ed25519-cert.pub"), "cert\n").unwrap();
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()

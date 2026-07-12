@@ -21,6 +21,7 @@ use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{Endpoint, Host, Provisioner, User, UserClient};
 
 const USER_STEP_BIN: &str = "step";
+const USER_KEY_NAME: &str = "id_ed25519";
 const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
 const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
 const CA_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -1229,36 +1230,30 @@ fn user_root_cert_path(model: &SiteModel) -> grafhome_ca::Result<PathBuf> {
     Ok(user_steppath(model)?.join("certs/root_ca.crt"))
 }
 
-fn user_key_name(user: &str, host: &str) -> String {
-    let host = host
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    format!("{user}_{host}_ed25519")
+fn user_private_key_path() -> grafhome_ca::Result<PathBuf> {
+    Ok(home_dir()?.join(".ssh").join(USER_KEY_NAME))
 }
 
-fn user_private_key_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
-    Ok(home_dir()?.join(".ssh").join(user_key_name(user, host)))
-}
-
-fn user_public_key_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
+fn user_public_key_path() -> grafhome_ca::Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{}.pub",
-        user_private_key_path(user, host)?.display()
+        user_private_key_path()?.display()
     )))
 }
 
-fn user_cert_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
+fn user_cert_path() -> grafhome_ca::Result<PathBuf> {
     Ok(PathBuf::from(format!(
         "{}-cert.pub",
-        user_private_key_path(user, host)?.display()
+        user_private_key_path()?.display()
     )))
+}
+
+fn user_identity_paths() -> grafhome_ca::Result<[PathBuf; 3]> {
+    Ok([
+        user_private_key_path()?,
+        user_public_key_path()?,
+        user_cert_path()?,
+    ])
 }
 
 fn user_client_material_dir(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
@@ -1389,6 +1384,54 @@ fn enrollment_request_path(user: &str, host: &str) -> grafhome_ca::Result<PathBu
     Ok(user_client_material_dir(user, host)?.join("pending-enrollment.json"))
 }
 
+fn replace_existing_user_identity(
+    paths: &[PathBuf],
+    confirm: impl FnOnce(&[PathBuf]) -> grafhome_ca::Result<bool>,
+) -> grafhome_ca::Result<()> {
+    let mut existing = Vec::new();
+    for path in paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(grafhome_ca::Error::Validation {
+                    field: path.display().to_string(),
+                    message: "refusing to replace an SSH identity path that is a directory"
+                        .to_owned(),
+                });
+            }
+            Ok(_) => existing.push(path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(grafhome_ca::Error::io(path, source)),
+        }
+    }
+    if existing.is_empty() {
+        return Ok(());
+    }
+    if !confirm(&existing)? {
+        return Err(grafhome_ca::Error::Validation {
+            field: "user enrollment SSH identity".to_owned(),
+            message: "enrollment cancelled; existing SSH identity files were not changed"
+                .to_owned(),
+        });
+    }
+    for path in existing {
+        std::fs::remove_file(&path).map_err(|source| grafhome_ca::Error::io(&path, source))?;
+    }
+    Ok(())
+}
+
+fn prepare_user_identity() -> grafhome_ca::Result<PathBuf> {
+    let paths = user_identity_paths()?;
+    replace_existing_user_identity(&paths, |existing| {
+        eprintln!("The default OpenSSH identity already exists:");
+        for path in existing {
+            eprintln!("  {}", path.display());
+        }
+        eprintln!("Replacing it may break unrelated SSH access that uses this key.");
+        confirm_tty("Overwrite the existing id_ed25519 identity? [y/N] ")
+    })?;
+    Ok(paths[0].clone())
+}
+
 fn ensure_user_keys(
     model: &SiteModel,
     user_name: &str,
@@ -1397,7 +1440,7 @@ fn ensure_user_keys(
 ) -> grafhome_ca::Result<UserRequest> {
     let user = active_user(model, user_name)?;
     let client = required_user_client(model, &user.user, host)?;
-    let private_key = user_private_key_path(&user.user, &client.host)?;
+    let private_key = user_private_key_path()?;
     let ssh_dir = private_key
         .parent()
         .ok_or_else(|| grafhome_ca::Error::Validation {
@@ -1408,17 +1451,16 @@ fn ensure_user_keys(
     #[cfg(unix)]
     std::fs::set_permissions(ssh_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|source| grafhome_ca::Error::io(ssh_dir, source))?;
-    if !private_key.exists() {
-        run_status(
-            process("ssh-keygen")
-                .arg("-t")
-                .arg("ed25519")
-                .arg("-N")
-                .arg("")
-                .arg("-f")
-                .arg(&private_key),
-        )?;
-    }
+    let private_key = prepare_user_identity()?;
+    run_status(
+        process("ssh-keygen")
+            .arg("-t")
+            .arg("ed25519")
+            .arg("-N")
+            .arg("")
+            .arg("-f")
+            .arg(&private_key),
+    )?;
 
     let material_dir = user_client_material_dir(&user.user, &client.host)?;
     std::fs::create_dir_all(&material_dir)
@@ -1451,7 +1493,7 @@ fn ensure_user_keys(
         std::fs::set_permissions(&public_jwk, std::fs::Permissions::from_mode(0o644))
             .map_err(|source| grafhome_ca::Error::io(&public_jwk, source))?;
     }
-    let ssh_public_key = std::fs::read_to_string(user_public_key_path(&user.user, &client.host)?)
+    let ssh_public_key = std::fs::read_to_string(user_public_key_path()?)
         .map_err(|source| grafhome_ca::Error::io("SSH public key", source))?;
     let renewal_public_jwk = serde_json::from_str(
         &std::fs::read_to_string(&public_jwk)
@@ -1511,7 +1553,18 @@ fn confirm_host_approval(request: &HostRequest) -> grafhome_ca::Result<()> {
 
 fn confirm_approval(identity: &str, command: &str) -> grafhome_ca::Result<()> {
     eprintln!("Enrollment request: {identity}");
-    eprint!("Approve enrollment? [y/N] ");
+    if confirm_tty("Approve enrollment? [y/N] ")? {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: command.to_owned(),
+            message: "enrollment was not approved".to_owned(),
+        })
+    }
+}
+
+fn confirm_tty(prompt: &str) -> grafhome_ca::Result<bool> {
+    eprint!("{prompt}");
     std::io::stderr()
         .flush()
         .map_err(|source| grafhome_ca::Error::io("<stderr>", source))?;
@@ -1524,13 +1577,7 @@ fn confirm_approval(identity: &str, command: &str) -> grafhome_ca::Result<()> {
     std::io::BufReader::new(&mut terminal)
         .read_line(&mut answer)
         .map_err(|source| grafhome_ca::Error::io("/dev/tty", source))?;
-    if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
-        return Err(grafhome_ca::Error::Validation {
-            field: command.to_owned(),
-            message: "enrollment was not approved".to_owned(),
-        });
-    }
-    Ok(())
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 fn enroll_user_flow(
@@ -1605,7 +1652,6 @@ fn enroll_user_flow(
         &grant.root_fingerprint,
     )?;
     issue_user_certificate(model, &user, &host, &grant.token)?;
-    install_identity_aliases(model, &user, &host)?;
     let password = match password_file {
         Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
         None => lookup_renewal_password(&user, &host)?,
@@ -2426,10 +2472,10 @@ fn issue_user_certificate(
     token: &str,
 ) -> grafhome_ca::Result<()> {
     let user = active_user(model, user_name)?;
-    let client = required_user_client(model, &user.user, host)?;
+    required_user_client(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
-    let public_key = user_public_key_path(&user.user, &client.host)?;
-    let cert = user_cert_path(&user.user, &client.host)?;
+    let public_key = user_public_key_path()?;
+    let cert = user_cert_path()?;
     run_status_redacted(
         process(USER_STEP_BIN)
             .env("STEPPATH", user_steppath(model)?)
@@ -3051,7 +3097,7 @@ fn renew_user(
     let provisioner = user_provisioner_name(&user.user, &client.host);
     let material_dir = user_client_material_dir(&user.user, &client.host)?;
     let private_jwk = material_dir.join("provisioner.priv.json");
-    let certificate = user_cert_path(&user.user, &client.host)?;
+    let certificate = user_cert_path()?;
     let token = with_password_file(&material_dir, password, |password_file| {
         run_capture(
             process(USER_STEP_BIN)
@@ -3088,7 +3134,7 @@ fn renew_user(
             .arg("ssh")
             .arg("certificate")
             .arg(&user.principal)
-            .arg(user_public_key_path(&user.user, &client.host)?)
+            .arg(user_public_key_path()?)
             .arg("--sign")
             .arg("--token")
             .arg(token.trim())
@@ -3114,8 +3160,8 @@ fn user_certificate_needs_renewal(
     host: &str,
 ) -> grafhome_ca::Result<bool> {
     let user = active_user(model, user_name)?;
-    let client = required_user_client(model, &user.user, host)?;
-    ssh_certificate_needs_renewal(USER_STEP_BIN, &user_cert_path(&user.user, &client.host)?)
+    required_user_client(model, &user.user, host)?;
+    ssh_certificate_needs_renewal(USER_STEP_BIN, &user_cert_path()?)
 }
 
 fn ssh_certificate_needs_renewal(step_bin: &str, certificate: &Path) -> grafhome_ca::Result<bool> {
@@ -3297,68 +3343,6 @@ fn lookup_systemd_credential(user: &str, host: &str) -> grafhome_ca::Result<Stri
     Ok(password)
 }
 
-fn install_identity_aliases(
-    model: &SiteModel,
-    user_name: &str,
-    host: &str,
-) -> grafhome_ca::Result<()> {
-    let user = active_user(model, user_name)?;
-    let client = required_user_client(model, &user.user, host)?;
-    let ssh_dir = home_dir()?.join(".ssh");
-    let key_name = user_key_name(&user.user, &client.host);
-    let aliases = [
-        (
-            PathBuf::from(&key_name),
-            ssh_dir.join(format!("{}.key", user.user)),
-        ),
-        (
-            PathBuf::from(format!("{key_name}.pub")),
-            ssh_dir.join(format!("{}.key.pub", user.user)),
-        ),
-        (
-            PathBuf::from(format!("{key_name}-cert.pub")),
-            ssh_dir.join(format!("{}.key-cert.pub", user.user)),
-        ),
-    ];
-    for (target, alias) in aliases {
-        install_symlink(&target, &alias)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn install_symlink(target: &Path, alias: &Path) -> grafhome_ca::Result<()> {
-    use std::os::unix::fs::symlink;
-
-    if let Ok(metadata) = std::fs::symlink_metadata(alias)
-        && !metadata.file_type().is_symlink()
-    {
-        return Err(grafhome_ca::Error::Validation {
-            field: alias.display().to_string(),
-            message: "refusing to replace an existing non-symlink SSH identity".to_owned(),
-        });
-    }
-    let temporary = alias.with_file_name(format!(
-        ".{}.grafhome-ca-{}",
-        alias
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("identity"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&temporary);
-    symlink(target, &temporary).map_err(|source| grafhome_ca::Error::io(&temporary, source))?;
-    std::fs::rename(&temporary, alias).map_err(|source| grafhome_ca::Error::io(alias, source))
-}
-
-#[cfg(not(unix))]
-fn install_symlink(_target: &Path, alias: &Path) -> grafhome_ca::Result<()> {
-    Err(grafhome_ca::Error::Validation {
-        field: alias.display().to_string(),
-        message: "SSH identity aliases require Unix symlinks".to_owned(),
-    })
-}
-
 fn with_password_file<T>(
     dir: &Path,
     password: &str,
@@ -3488,16 +3472,79 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{BufRead, Cursor};
     use std::path::PathBuf;
 
+    use tempfile::tempdir;
+
     use super::{
-        parse_enrollment_document, read_interactive_document, user_key_name, validate_grant_ca_url,
+        parse_enrollment_document, read_interactive_document, replace_existing_user_identity,
+        validate_grant_ca_url,
     };
 
     #[test]
-    fn user_key_name_is_derived_from_user_and_host() {
-        assert_eq!(user_key_name("alice", "ca-host"), "alice_ca_host_ed25519");
+    fn declining_identity_overwrite_preserves_every_file() {
+        let dir = tempdir().unwrap();
+        let paths = [
+            dir.path().join("id_ed25519"),
+            dir.path().join("id_ed25519.pub"),
+            dir.path().join("id_ed25519-cert.pub"),
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            fs::write(path, format!("original-{index}")).unwrap();
+        }
+
+        let error = replace_existing_user_identity(&paths, |_| Ok(false))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("existing SSH identity files were not changed"));
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                format!("original-{index}")
+            );
+        }
+    }
+
+    #[test]
+    fn confirming_identity_overwrite_removes_the_existing_set() {
+        let dir = tempdir().unwrap();
+        let paths = [
+            dir.path().join("id_ed25519"),
+            dir.path().join("id_ed25519.pub"),
+            dir.path().join("id_ed25519-cert.pub"),
+        ];
+        for path in &paths {
+            fs::write(path, "original").unwrap();
+        }
+
+        replace_existing_user_identity(&paths, |existing| {
+            assert_eq!(existing, paths);
+            Ok(true)
+        })
+        .unwrap();
+
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn identity_overwrite_rejects_a_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        fs::create_dir(&path).unwrap();
+        let mut prompted = false;
+
+        let error = replace_existing_user_identity(&[path], |_| {
+            prompted = true;
+            Ok(true)
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("path that is a directory"));
+        assert!(!prompted);
     }
 
     #[test]
