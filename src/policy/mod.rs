@@ -1,20 +1,18 @@
 //! Policy file parsing and validation.
 //!
-//! Policy files are TSV so they remain easy to inspect and edit by hand, but
-//! the rest of the code consumes typed Rust structs rather than raw rows.
+//! Policy files are typed TOML documents so they remain easy to inspect,
+//! comment, and edit by hand without reducing booleans or lists to strings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Raw TSV record for schema validation.
-pub type RawRecord = BTreeMap<String, String>;
-
-/// Endpoint row from `policy/endpoints.tsv`.
+/// Endpoint entry from `policy/endpoints.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Endpoint {
     /// Endpoint role. Current values are `ca_api` and `ca_origin`.
     pub role: String,
@@ -29,7 +27,6 @@ pub struct Endpoint {
     /// IP address currently associated with the endpoint.
     pub address: String,
     /// TCP port for the endpoint.
-    #[serde(deserialize_with = "deserialize_port")]
     pub port: u16,
     /// URL scheme. Only `https` is supported.
     pub scheme: String,
@@ -48,25 +45,27 @@ impl Endpoint {
     }
 }
 
-/// Host row from `policy/hosts.tsv`.
+/// Host entry from `policy/hosts.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Host {
     /// Stable host name used by policy references.
     pub host: String,
     /// Host class, such as `server` or `personal-laptop`.
     pub kind: String,
     /// Whether this host should accept SSH server connections.
-    pub ssh_server: String,
+    pub ssh_server: bool,
     /// Whether this host should act as an SSH client.
-    pub ssh_client: String,
+    pub ssh_client: bool,
     /// Scheduler or operator expected to renew this host's certificates.
     pub renewal_owner: String,
-    /// Comma-separated host certificate principals.
-    pub principals: String,
+    /// Host certificate principals.
+    pub principals: Vec<String>,
 }
 
-/// User row from `policy/users.tsv`.
+/// User entry from `policy/users.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct User {
     /// Stable policy user name.
     pub user: String,
@@ -74,8 +73,8 @@ pub struct User {
     pub principal: String,
     /// Default Unix account for this user.
     pub unix_account: String,
-    /// Whether root SSH is allowed. Validation rejects `yes`.
-    pub root_ssh: String,
+    /// Whether root SSH is allowed. Validation rejects `true`.
+    pub root_ssh: bool,
     /// Provisioner used for user certificate issuance.
     pub provisioner: String,
     /// User certificate lifetime.
@@ -86,8 +85,9 @@ pub struct User {
     pub notes: String,
 }
 
-/// Provisioner row from `policy/provisioners.tsv`.
+/// Provisioner entry from `policy/provisioners.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provisioner {
     /// Provisioner role in Grafhome policy.
     pub role: String,
@@ -107,8 +107,9 @@ pub struct Provisioner {
     pub notes: String,
 }
 
-/// Client device row from `policy/client-devices.tsv`.
+/// Client device entry from `policy/client-devices.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientDevice {
     /// Device policy name.
     pub device: String,
@@ -122,8 +123,9 @@ pub struct ClientDevice {
     pub status: String,
 }
 
-/// Principal row from `policy/principals.tsv`.
+/// Principal entry from `policy/principals.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Principal {
     /// SSH certificate principal name.
     pub principal: String,
@@ -137,8 +139,9 @@ pub struct Principal {
     pub notes: String,
 }
 
-/// User/host access row from `policy/user-hosts.tsv`.
+/// User/host access entry from `policy/user-hosts.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserHostAccess {
     /// Policy user.
     pub user: String,
@@ -147,13 +150,55 @@ pub struct UserHostAccess {
     /// Unix account on the target host.
     pub unix_account: String,
     /// Whether SSH access is allowed.
-    pub allow_ssh: String,
+    pub allow_ssh: bool,
     /// Whether sudo is expected for this mapping.
     pub sudo_expected: String,
     /// Policy status.
     pub status: String,
     /// Free-form operator notes.
     pub notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Operator {
+    user: String,
+    host_ref: String,
+    unix_account: String,
+    privilege: String,
+    status: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Automation {
+    name: String,
+    source_ref: String,
+    target_ref: String,
+    purpose: String,
+    auth_model: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StaticKey {
+    account: String,
+    host_ref: String,
+    purpose: String,
+    class: String,
+    required_controls: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EmergencyAccess {
+    host: String,
+    account: String,
+    key_id: String,
+    storage: String,
+    test_interval: String,
 }
 
 /// Parsed policy set.
@@ -182,77 +227,21 @@ impl Policy {
     /// Load the initial policy files needed for config-only validation.
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let endpoints = read_typed::<Endpoint>(
-            root.join("policy/endpoints.tsv"),
-            &[
-                "role",
-                "name",
-                "dns_name",
-                "target",
-                "interface",
-                "address",
-                "port",
-                "scheme",
-            ],
+        let endpoints = read_typed(root.join("policy/endpoints.toml"), "endpoints")?;
+        let hosts = read_typed(root.join("policy/hosts.toml"), "hosts")?;
+        let users = read_typed(root.join("policy/users.toml"), "users")?;
+        let provisioners = read_typed(root.join("policy/provisioners.toml"), "provisioners")?;
+        let client_devices = read_typed(root.join("policy/client-devices.toml"), "client_devices")?;
+        let principals = read_typed(root.join("policy/principals.toml"), "principals")?;
+        let user_hosts = read_typed(root.join("policy/user-hosts.toml"), "user_hosts")?;
+        let tables = PolicyTables::load(
+            root,
+            users.clone(),
+            provisioners.clone(),
+            client_devices.clone(),
+            principals.clone(),
+            user_hosts.clone(),
         )?;
-        let hosts = read_typed::<Host>(
-            root.join("policy/hosts.tsv"),
-            &[
-                "host",
-                "kind",
-                "ssh_server",
-                "ssh_client",
-                "renewal_owner",
-                "principals",
-            ],
-        )?;
-        let users = read_typed::<User>(
-            root.join("policy/users.tsv"),
-            &[
-                "user",
-                "principal",
-                "unix_account",
-                "root_ssh",
-                "provisioner",
-                "cert_ttl",
-                "status",
-                "notes",
-            ],
-        )?;
-        let provisioners = read_typed::<Provisioner>(
-            root.join("policy/provisioners.tsv"),
-            &[
-                "role",
-                "name",
-                "type",
-                "default_ttl",
-                "max_ttl",
-                "renewal_check",
-                "status",
-                "notes",
-            ],
-        )?;
-        let client_devices = read_typed::<ClientDevice>(
-            root.join("policy/client-devices.tsv"),
-            &["device", "owner", "user", "key_name", "status"],
-        )?;
-        let principals = read_typed::<Principal>(
-            root.join("policy/principals.tsv"),
-            &["principal", "type", "owner", "allowed_accounts", "notes"],
-        )?;
-        let user_hosts = read_typed::<UserHostAccess>(
-            root.join("policy/user-hosts.tsv"),
-            &[
-                "user",
-                "host",
-                "unix_account",
-                "allow_ssh",
-                "sudo_expected",
-                "status",
-                "notes",
-            ],
-        )?;
-        let tables = PolicyTables::load(root)?;
         let policy = Self {
             root: root.to_path_buf(),
             endpoints,
@@ -290,7 +279,7 @@ impl Policy {
     pub fn active_ssh_access(&self) -> impl Iterator<Item = &UserHostAccess> {
         self.user_hosts
             .iter()
-            .filter(|access| access.status == "active" && access.allow_ssh == "yes")
+            .filter(|access| access.status == "active" && access.allow_ssh)
     }
 
     /// Active client devices for a policy user.
@@ -308,19 +297,19 @@ impl Policy {
         for endpoint in &self.endpoints {
             if !matches!(endpoint.role.as_str(), "ca_api" | "ca_origin") {
                 return Err(Error::Validation {
-                    field: format!("policy/endpoints.tsv:{}.role", endpoint.role),
+                    field: format!("policy/endpoints.toml:{}.role", endpoint.role),
                     message: "endpoint role must be ca_api or ca_origin".to_owned(),
                 });
             }
             if !roles.insert(endpoint.role.as_str()) {
                 return Err(Error::Validation {
-                    field: format!("policy/endpoints.tsv:{}.role", endpoint.role),
+                    field: format!("policy/endpoints.toml:{}.role", endpoint.role),
                     message: "duplicate endpoint role".to_owned(),
                 });
             }
             if endpoint.scheme != "https" {
                 return Err(Error::Validation {
-                    field: format!("policy/endpoints.tsv:{}.scheme", endpoint.role),
+                    field: format!("policy/endpoints.toml:{}.scheme", endpoint.role),
                     message: "only https endpoints are supported".to_owned(),
                 });
             }
@@ -328,7 +317,7 @@ impl Policy {
         for required in ["ca_api", "ca_origin"] {
             if !roles.contains(required) {
                 return Err(Error::Validation {
-                    field: format!("policy/endpoints.tsv:{required}"),
+                    field: format!("policy/endpoints.toml:{required}"),
                     message: "missing required endpoint role".to_owned(),
                 });
             }
@@ -341,14 +330,14 @@ impl Policy {
             .collect::<BTreeSet<_>>();
         if hosts.len() != self.hosts.len() {
             return Err(Error::Validation {
-                field: "policy/hosts.tsv:host".to_owned(),
+                field: "policy/hosts.toml:host".to_owned(),
                 message: "duplicate host".to_owned(),
             });
         }
         for endpoint in &self.endpoints {
             if !hosts.contains(&endpoint.target) {
                 return Err(Error::Validation {
-                    field: format!("policy/endpoints.tsv:{}.target", endpoint.role),
+                    field: format!("policy/endpoints.toml:{}.target", endpoint.role),
                     message: format!("unknown host {}", endpoint.target),
                 });
             }
@@ -359,19 +348,31 @@ impl Policy {
     }
 
     fn validate_tables(&self, hosts: &BTreeSet<String>) -> Result<()> {
-        let users = unique_values("policy/users.tsv", &self.tables.users, "user")?;
-        let provisioners =
-            unique_values("policy/provisioners.tsv", &self.tables.provisioners, "name")?;
+        let users = unique_values(
+            "policy/users.toml",
+            self.tables.users.iter().map(|user| user.user.as_str()),
+            "user",
+        )?;
+        let provisioners = unique_values(
+            "policy/provisioners.toml",
+            self.tables
+                .provisioners
+                .iter()
+                .map(|provisioner| provisioner.name.as_str()),
+            "name",
+        )?;
         let provisioner_roles = self
             .provisioners
             .iter()
             .map(|provisioner| (provisioner.name.as_str(), provisioner.role.as_str()))
             .collect::<BTreeMap<_, _>>();
         let principals = unique_key_map(
-            "policy/principals.tsv",
-            &self.tables.principals,
+            "policy/principals.toml",
+            self.tables
+                .principals
+                .iter()
+                .map(|principal| (principal.principal.as_str(), principal.r#type.as_str())),
             "principal",
-            "type",
         )?;
 
         let mut host_refs = hosts.clone();
@@ -381,103 +382,88 @@ impl Policy {
         }
 
         for user in &self.tables.users {
-            let name = value(user, "user");
-            reject_root_identity("policy/users.tsv", name, "user", name)?;
+            let name = user.user.as_str();
+            reject_root_identity("policy/users.toml", name, "user", name)?;
+            reject_root_identity("policy/users.toml", name, "principal", &user.principal)?;
             reject_root_identity(
-                "policy/users.tsv",
-                name,
-                "principal",
-                value(user, "principal"),
-            )?;
-            reject_root_identity(
-                "policy/users.tsv",
+                "policy/users.toml",
                 name,
                 "unix_account",
-                value(user, "unix_account"),
+                &user.unix_account,
             )?;
             ensure_contains(
-                "policy/users.tsv",
+                "policy/users.toml",
                 name,
                 "principal",
-                value(user, "principal"),
+                &user.principal,
                 principals.keys(),
             )?;
             ensure_contains(
-                "policy/users.tsv",
+                "policy/users.toml",
                 name,
                 "provisioner",
-                value(user, "provisioner"),
+                &user.provisioner,
                 provisioners.iter(),
             )?;
-            if provisioner_roles.get(value(user, "provisioner")) != Some(&"user_enrollment") {
+            if provisioner_roles.get(user.provisioner.as_str()) != Some(&"user_enrollment") {
                 return Err(Error::Validation {
-                    field: format!("policy/users.tsv:{name}.provisioner"),
+                    field: format!("policy/users.toml:{name}.provisioner"),
                     message: "user provisioner must use role user_enrollment".to_owned(),
                 });
             }
-            if value(user, "root_ssh") == "yes" {
+            if user.root_ssh {
                 return Err(Error::Validation {
-                    field: format!("policy/users.tsv:{name}.root_ssh"),
+                    field: format!("policy/users.toml:{name}.root_ssh"),
                     message: "root SSH login is not supported".to_owned(),
                 });
             }
-            validate_step_duration(
-                "policy/users.tsv",
-                name,
-                "cert_ttl",
-                value(user, "cert_ttl"),
-            )?;
+            validate_step_duration("policy/users.toml", name, "cert_ttl", &user.cert_ttl)?;
         }
 
         for row in &self.tables.provisioners {
-            let role = value(row, "role");
+            let role = row.role.as_str();
             validate_step_duration(
-                "policy/provisioners.tsv",
+                "policy/provisioners.toml",
                 role,
                 "default_ttl",
-                value(row, "default_ttl"),
+                &row.default_ttl,
             )?;
-            validate_step_duration(
-                "policy/provisioners.tsv",
-                role,
-                "max_ttl",
-                value(row, "max_ttl"),
-            )?;
+            validate_step_duration("policy/provisioners.toml", role, "max_ttl", &row.max_ttl)?;
             validate_renewal_check(
-                "policy/provisioners.tsv",
+                "policy/provisioners.toml",
                 role,
                 "renewal_check",
-                value(row, "renewal_check"),
+                &row.renewal_check,
             )?;
         }
 
         for principal in &self.tables.principals {
-            let name = value(principal, "principal");
-            let owner = value(principal, "owner");
-            match value(principal, "type") {
+            let name = principal.principal.as_str();
+            let owner = principal.owner.as_str();
+            match principal.r#type.as_str() {
                 "user" => {
-                    reject_root_identity("policy/principals.tsv", name, "principal", name)?;
-                    for account in split_list(value(principal, "allowed_accounts")) {
+                    reject_root_identity("policy/principals.toml", name, "principal", name)?;
+                    for account in split_list(&principal.allowed_accounts) {
                         reject_root_identity(
-                            "policy/principals.tsv",
+                            "policy/principals.toml",
                             name,
                             "allowed_accounts",
                             account,
                         )?;
                     }
-                    ensure_contains("policy/principals.tsv", name, "owner", owner, users.iter())?
+                    ensure_contains("policy/principals.toml", name, "owner", owner, users.iter())?
                 }
                 "host" => {
-                    ensure_contains("policy/principals.tsv", name, "owner", owner, hosts.iter())?
+                    ensure_contains("policy/principals.toml", name, "owner", owner, hosts.iter())?
                 }
                 _ => {}
             }
         }
 
         for host in &self.hosts {
-            for principal in split_list(&host.principals) {
+            for principal in &host.principals {
                 ensure_contains(
-                    "policy/hosts.tsv",
+                    "policy/hosts.toml",
                     &host.host,
                     "principals",
                     principal,
@@ -485,7 +471,7 @@ impl Policy {
                 )?;
                 if principals.get(principal).map(String::as_str) != Some("host") {
                     return Err(Error::Validation {
-                        field: format!("policy/hosts.tsv:{}.principals", host.host),
+                        field: format!("policy/hosts.toml:{}.principals", host.host),
                         message: format!("principal {principal} is not a host principal"),
                     });
                 }
@@ -493,110 +479,110 @@ impl Policy {
         }
 
         for row in &self.tables.user_hosts {
-            let user = value(row, "user");
-            ensure_contains("policy/user-hosts.tsv", user, "user", user, users.iter())?;
+            let user = row.user.as_str();
+            ensure_contains("policy/user-hosts.toml", user, "user", user, users.iter())?;
             ensure_contains(
-                "policy/user-hosts.tsv",
+                "policy/user-hosts.toml",
                 user,
                 "host",
-                value(row, "host"),
+                &row.host,
                 hosts.iter(),
             )?;
-            if value(row, "allow_ssh") == "yes" && value(row, "unix_account") == "root" {
+            if row.allow_ssh && row.unix_account == "root" {
                 return Err(Error::Validation {
-                    field: format!("policy/user-hosts.tsv:{user}.unix_account"),
+                    field: format!("policy/user-hosts.toml:{user}.unix_account"),
                     message: "root SSH login is not supported".to_owned(),
                 });
             }
         }
 
         for row in &self.tables.operators {
-            let user = value(row, "user");
-            ensure_contains("policy/operators.tsv", user, "user", user, users.iter())?;
+            let user = row.user.as_str();
+            ensure_contains("policy/operators.toml", user, "user", user, users.iter())?;
             reject_root_identity(
-                "policy/operators.tsv",
+                "policy/operators.toml",
                 user,
                 "unix_account",
-                value(row, "unix_account"),
+                &row.unix_account,
             )?;
             ensure_contains(
-                "policy/operators.tsv",
+                "policy/operators.toml",
                 user,
                 "host_ref",
-                value(row, "host_ref"),
+                &row.host_ref,
                 host_refs.iter(),
             )?;
         }
 
         for row in &self.tables.client_devices {
-            let device = value(row, "device");
+            let device = row.device.as_str();
             ensure_contains(
-                "policy/client-devices.tsv",
+                "policy/client-devices.toml",
                 device,
                 "owner",
-                value(row, "owner"),
+                &row.owner,
                 users.iter(),
             )?;
             ensure_contains(
-                "policy/client-devices.tsv",
+                "policy/client-devices.toml",
                 device,
                 "user",
-                value(row, "user"),
+                &row.user,
                 users.iter(),
             )?;
         }
 
         for row in &self.tables.automation {
-            let name = value(row, "name");
+            let name = row.name.as_str();
             ensure_contains(
-                "policy/automation.tsv",
+                "policy/automation.toml",
                 name,
                 "source_ref",
-                value(row, "source_ref"),
+                &row.source_ref,
                 host_refs.iter(),
             )?;
             ensure_contains(
-                "policy/automation.tsv",
+                "policy/automation.toml",
                 name,
                 "target_ref",
-                value(row, "target_ref"),
+                &row.target_ref,
                 host_refs.iter(),
             )?;
         }
 
         for row in &self.tables.static_keys {
-            let account = value(row, "account");
-            reject_root_identity("policy/static-keys.tsv", account, "account", account)?;
+            let account = row.account.as_str();
+            reject_root_identity("policy/static-keys.toml", account, "account", account)?;
             ensure_contains(
-                "policy/static-keys.tsv",
+                "policy/static-keys.toml",
                 account,
                 "host_ref",
-                value(row, "host_ref"),
+                &row.host_ref,
                 host_refs.iter(),
             )?;
         }
 
         for row in &self.tables.emergency_access {
-            let key_id = value(row, "key_id");
+            let key_id = row.key_id.as_str();
             ensure_contains(
-                "policy/emergency-access.tsv",
+                "policy/emergency-access.toml",
                 key_id,
                 "host",
-                value(row, "host"),
+                &row.host,
                 hosts.iter(),
             )?;
             ensure_contains(
-                "policy/emergency-access.tsv",
+                "policy/emergency-access.toml",
                 key_id,
                 "account",
-                value(row, "account"),
+                &row.account,
                 users.iter(),
             )?;
             reject_root_identity(
-                "policy/emergency-access.tsv",
+                "policy/emergency-access.toml",
                 key_id,
                 "account",
-                value(row, "account"),
+                &row.account,
             )?;
         }
 
@@ -606,206 +592,84 @@ impl Policy {
 
 #[derive(Debug, Clone)]
 struct PolicyTables {
-    users: Vec<RawRecord>,
-    operators: Vec<RawRecord>,
-    provisioners: Vec<RawRecord>,
-    client_devices: Vec<RawRecord>,
-    principals: Vec<RawRecord>,
-    user_hosts: Vec<RawRecord>,
-    automation: Vec<RawRecord>,
-    static_keys: Vec<RawRecord>,
-    emergency_access: Vec<RawRecord>,
+    users: Vec<User>,
+    operators: Vec<Operator>,
+    provisioners: Vec<Provisioner>,
+    client_devices: Vec<ClientDevice>,
+    principals: Vec<Principal>,
+    user_hosts: Vec<UserHostAccess>,
+    automation: Vec<Automation>,
+    static_keys: Vec<StaticKey>,
+    emergency_access: Vec<EmergencyAccess>,
 }
 
 impl PolicyTables {
-    fn load(root: &Path) -> Result<Self> {
+    fn load(
+        root: &Path,
+        users: Vec<User>,
+        provisioners: Vec<Provisioner>,
+        client_devices: Vec<ClientDevice>,
+        principals: Vec<Principal>,
+        user_hosts: Vec<UserHostAccess>,
+    ) -> Result<Self> {
         Ok(Self {
-            users: read_raw(
-                root.join("policy/users.tsv"),
-                &[
-                    "user",
-                    "principal",
-                    "unix_account",
-                    "root_ssh",
-                    "provisioner",
-                    "cert_ttl",
-                    "status",
-                    "notes",
-                ],
-            )?,
-            operators: read_raw(
-                root.join("policy/operators.tsv"),
-                &[
-                    "user",
-                    "host_ref",
-                    "unix_account",
-                    "privilege",
-                    "status",
-                    "notes",
-                ],
-            )?,
-            provisioners: read_raw(
-                root.join("policy/provisioners.tsv"),
-                &[
-                    "role",
-                    "name",
-                    "type",
-                    "default_ttl",
-                    "max_ttl",
-                    "renewal_check",
-                    "status",
-                    "notes",
-                ],
-            )?,
-            client_devices: read_raw(
-                root.join("policy/client-devices.tsv"),
-                &["device", "owner", "user", "key_name", "status"],
-            )?,
-            principals: read_raw(
-                root.join("policy/principals.tsv"),
-                &["principal", "type", "owner", "allowed_accounts", "notes"],
-            )?,
-            user_hosts: read_raw(
-                root.join("policy/user-hosts.tsv"),
-                &[
-                    "user",
-                    "host",
-                    "unix_account",
-                    "allow_ssh",
-                    "sudo_expected",
-                    "status",
-                    "notes",
-                ],
-            )?,
-            automation: read_raw(
-                root.join("policy/automation.tsv"),
-                &[
-                    "name",
-                    "source_ref",
-                    "target_ref",
-                    "purpose",
-                    "auth_model",
-                    "notes",
-                ],
-            )?,
-            static_keys: read_raw(
-                root.join("policy/static-keys.tsv"),
-                &[
-                    "account",
-                    "host_ref",
-                    "purpose",
-                    "class",
-                    "required_controls",
-                ],
-            )?,
-            emergency_access: read_raw(
-                root.join("policy/emergency-access.tsv"),
-                &["host", "account", "key_id", "storage", "test_interval"],
+            users,
+            operators: read_typed(root.join("policy/operators.toml"), "operators")?,
+            provisioners,
+            client_devices,
+            principals,
+            user_hosts,
+            automation: read_typed(root.join("policy/automation.toml"), "automation")?,
+            static_keys: read_typed(root.join("policy/static-keys.toml"), "static_keys")?,
+            emergency_access: read_typed(
+                root.join("policy/emergency-access.toml"),
+                "emergency_access",
             )?,
         })
     }
 }
 
-/// Read a TSV file into raw records for schema validation.
-pub fn read_raw(path: impl AsRef<Path>, expected_headers: &[&str]) -> Result<Vec<RawRecord>> {
+/// Read a TOML policy document into a JSON value for schema validation.
+pub fn read_document(path: impl AsRef<Path>) -> Result<serde_json::Value> {
     let path = path.as_ref();
-    let mut reader = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .comment(None)
-        .flexible(false)
-        .from_path(path)
-        .map_err(|source| Error::Csv {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let headers = reader
-        .headers()
-        .map_err(|source| Error::Csv {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let expected = expected_headers
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect::<Vec<_>>();
-    if headers != expected {
-        return Err(Error::Parse {
-            path: path.to_path_buf(),
-            line: 1,
-            message: format!("expected headers {}", expected_headers.join("\t")),
-        });
-    }
-    if headers.iter().collect::<BTreeSet<_>>().len() != headers.len() {
-        return Err(Error::Parse {
-            path: path.to_path_buf(),
-            line: 1,
-            message: "duplicate header".to_owned(),
-        });
-    }
-
-    let mut rows = Vec::new();
-    for result in reader.records() {
-        let record = result.map_err(|source| Error::Csv {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut row = RawRecord::new();
-        for (header, value) in headers.iter().zip(record.iter()) {
-            if value.contains('\n') || value.contains('\t') {
-                return Err(Error::Parse {
-                    path: path.to_path_buf(),
-                    line: reader.position().line() as usize,
-                    message: "field values may not contain tabs or newlines".to_owned(),
-                });
-            }
-            row.insert(header.clone(), value.to_owned());
-        }
-        rows.push(row);
-    }
-    Ok(rows)
+    let document = read_toml(path)?;
+    Ok(serde_json::to_value(document).expect("TOML document serializes as JSON"))
 }
 
-fn read_typed<T>(path: impl AsRef<Path>, expected_headers: &[&str]) -> Result<Vec<T>>
+fn read_toml(path: &Path) -> Result<toml::Value> {
+    let text = std::fs::read_to_string(path).map_err(|source| Error::io(path, source))?;
+    toml::from_str::<toml::Value>(&text).map_err(|source| Error::Toml {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_typed<T>(path: impl AsRef<Path>, table: &str) -> Result<Vec<T>>
 where
     T: for<'de> Deserialize<'de>,
 {
     let path = path.as_ref();
-    read_raw(path, expected_headers)?
-        .into_iter()
-        .map(|row| {
-            serde_json::from_value(serde_json::to_value(row).expect("raw row serializes")).map_err(
-                |source| Error::Json {
-                    path: path.to_path_buf(),
-                    source,
-                },
-            )
-        })
-        .collect()
-}
-
-fn deserialize_port<'de, D>(deserializer: D) -> std::result::Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    let port = value
-        .parse::<u16>()
-        .map_err(|_| serde::de::Error::custom(format!("invalid TCP port {value}")))?;
-    if port == 0 {
-        Err(serde::de::Error::custom(
-            "TCP port must be greater than zero",
-        ))
-    } else {
-        Ok(port)
+    let mut document = read_toml(path)?;
+    let object = document.as_table_mut().ok_or_else(|| Error::Parse {
+        path: path.to_path_buf(),
+        line: 1,
+        message: "policy document must be a TOML table".to_owned(),
+    })?;
+    if object.len() != 1 || !object.contains_key(table) {
+        return Err(Error::Parse {
+            path: path.to_path_buf(),
+            line: 1,
+            message: format!("policy document must contain only [[{table}]] entries"),
+        });
     }
-}
-
-fn value<'a>(row: &'a RawRecord, key: &str) -> &'a str {
-    row.get(key).map(String::as_str).unwrap_or_default()
+    object
+        .remove(table)
+        .expect("table exists")
+        .try_into()
+        .map_err(|source| Error::Toml {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn split_list(value: &str) -> impl Iterator<Item = &str> {
@@ -815,31 +679,32 @@ fn split_list(value: &str) -> impl Iterator<Item = &str> {
         .filter(|part| !part.is_empty())
 }
 
-fn unique_values(table: &str, rows: &[RawRecord], key: &str) -> Result<BTreeSet<String>> {
-    let mut values = BTreeSet::new();
-    for row in rows {
-        let value = value(row, key);
-        if !values.insert(value.to_owned()) {
+fn unique_values<'a>(
+    table: &str,
+    values: impl Iterator<Item = &'a str>,
+    key: &str,
+) -> Result<BTreeSet<String>> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if !unique.insert(value.to_owned()) {
             return Err(Error::Validation {
                 field: format!("{table}:{key}"),
                 message: format!("duplicate {key} {value}"),
             });
         }
     }
-    Ok(values)
+    Ok(unique)
 }
 
-fn unique_key_map(
+fn unique_key_map<'a>(
     table: &str,
-    rows: &[RawRecord],
+    rows: impl Iterator<Item = (&'a str, &'a str)>,
     key: &str,
-    mapped_key: &str,
 ) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
-    for row in rows {
-        let key_value = value(row, key);
+    for (key_value, mapped_value) in rows {
         if values
-            .insert(key_value.to_owned(), value(row, mapped_key).to_owned())
+            .insert(key_value.to_owned(), mapped_value.to_owned())
             .is_some()
         {
             return Err(Error::Validation {
@@ -939,10 +804,49 @@ mod tests {
     }
 
     #[test]
+    fn accepts_toml_comments() {
+        let (dir, policy_dir) = copy_policy();
+        let hosts = policy_dir.join("hosts.toml");
+        let text = fs::read_to_string(&hosts).unwrap();
+        fs::write(&hosts, format!("# Fleet host inventory.\n{text}")).unwrap();
+
+        Policy::load(dir.path()).expect("comments are valid in policy TOML");
+    }
+
+    #[test]
+    fn rejects_string_instead_of_boolean() {
+        let (dir, policy_dir) = copy_policy();
+        let hosts = policy_dir.join("hosts.toml");
+        let text = fs::read_to_string(&hosts).unwrap().replacen(
+            "ssh_server = true",
+            "ssh_server = \"yes\"",
+            1,
+        );
+        fs::write(&hosts, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("hosts.toml"));
+        assert!(error.contains("boolean"));
+    }
+
+    #[test]
+    fn rejects_wrong_document_table() {
+        let (dir, policy_dir) = copy_policy();
+        let hosts = policy_dir.join("hosts.toml");
+        let text = fs::read_to_string(&hosts)
+            .unwrap()
+            .replace("[[hosts]]", "[[host_inventory]]");
+        fs::write(&hosts, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("must contain only [[hosts]] entries"));
+    }
+
+    #[test]
     fn rejects_dangling_user_provisioner() {
         let (dir, policy_dir) = copy_policy();
 
-        let users = policy_dir.join("users.tsv");
+        let users = policy_dir.join("users.toml");
         let text = fs::read_to_string(&users)
             .unwrap()
             .replace("grafhome-user-enrollment", "missing-provisioner");
@@ -956,7 +860,7 @@ mod tests {
     fn rejects_user_provisioner_with_wrong_role() {
         let (dir, policy_dir) = copy_policy();
 
-        let users = policy_dir.join("users.tsv");
+        let users = policy_dir.join("users.toml");
         let text = fs::read_to_string(&users)
             .unwrap()
             .replace("grafhome-user-enrollment", "grafhome-host-bootstrap");
@@ -969,10 +873,12 @@ mod tests {
     #[test]
     fn rejects_root_user_identity() {
         let (dir, policy_dir) = copy_policy();
-        let users = policy_dir.join("users.tsv");
+        let users = policy_dir.join("users.toml");
         let text = fs::read_to_string(&users)
             .unwrap()
-            .replace("alice\talice\talice\tno", "root\troot\troot\tno");
+            .replace("user = \"alice\"", "user = \"root\"")
+            .replace("principal = \"alice\"", "principal = \"root\"")
+            .replace("unix_account = \"alice\"", "unix_account = \"root\"");
         fs::write(&users, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
@@ -982,10 +888,12 @@ mod tests {
     #[test]
     fn rejects_root_user_principal_allowed_account() {
         let (dir, policy_dir) = copy_policy();
-        let principals = policy_dir.join("principals.tsv");
-        let text = fs::read_to_string(&principals)
-            .unwrap()
-            .replace("alice\tuser\talice\talice", "alice\tuser\talice\troot");
+        let principals = policy_dir.join("principals.toml");
+        let text = fs::read_to_string(&principals).unwrap().replacen(
+            "allowed_accounts = \"alice\"",
+            "allowed_accounts = \"root\"",
+            1,
+        );
         fs::write(&principals, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
@@ -995,10 +903,12 @@ mod tests {
     #[test]
     fn rejects_step_duration_day_unit() {
         let (dir, policy_dir) = copy_policy();
-        let provisioners = policy_dir.join("provisioners.tsv");
-        let text = fs::read_to_string(&provisioners)
-            .unwrap()
-            .replace("168h\t720h", "30d\t720h");
+        let provisioners = policy_dir.join("provisioners.toml");
+        let text = fs::read_to_string(&provisioners).unwrap().replacen(
+            "default_ttl = \"168h\"",
+            "default_ttl = \"30d\"",
+            1,
+        );
         fs::write(&provisioners, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
@@ -1008,9 +918,13 @@ mod tests {
     #[test]
     fn rejects_root_static_key_account() {
         let (dir, policy_dir) = copy_policy();
-        let static_keys = policy_dir.join("static-keys.tsv");
+        let static_keys = policy_dir.join("static-keys.toml");
         let mut text = fs::read_to_string(&static_keys).unwrap();
-        text.push_str("root\tca-host\troot shell\tbreakglass\trestricted key\n");
+        text.push_str(
+            "\n[[static_keys]]\naccount = \"root\"\nhost_ref = \"ca-host\"\n\
+             purpose = \"root shell\"\nclass = \"breakglass\"\n\
+             required_controls = \"restricted key\"\n",
+        );
         fs::write(&static_keys, text).unwrap();
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();

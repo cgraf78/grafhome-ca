@@ -1,21 +1,50 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Grafhome CA hosts policy",
-  "type": "array",
-  "items": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["host", "kind", "ssh_server", "ssh_client", "renewal_owner", "principals"],
-    "properties": {
-      "host": { "$ref": "#/definitions/name" },
-      "kind": { "enum": ["server", "personal-laptop", "workstation", "vm"] },
-      "ssh_server": { "enum": ["yes", "no"] },
-      "ssh_client": { "enum": ["yes", "no"] },
-      "renewal_owner": { "enum": ["systemd", "dot-cron", "manual", "none"] },
-      "principals": { "type": "string", "pattern": "^[A-Za-z0-9._,-]+$" }
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/hosts.schema.json",
+  "title": "hosts policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["hosts"],
+  "properties": {
+    "hosts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "kind", "ssh_server", "ssh_client", "renewal_owner", "principals"],
+        "properties": {
+          "host": {
+            "$ref": "#/definitions/name"
+          },
+          "kind": {
+            "enum": ["server", "personal-laptop", "workstation", "vm"]
+          },
+          "ssh_server": {
+            "type": "boolean"
+          },
+          "ssh_client": {
+            "type": "boolean"
+          },
+          "renewal_owner": {
+            "enum": ["systemd", "dot-cron", "manual", "none"]
+          },
+          "principals": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
     }
   },
   "definitions": {
-    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    }
   }
 }

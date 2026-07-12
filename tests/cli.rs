@@ -683,7 +683,7 @@ fn apply_host_rejects_non_file_in_managed_principals_directory() {
 #[test]
 fn apply_host_rejects_locally_writable_policy() {
     let (dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    let policy = fixture.config_root.join("policy/user-hosts.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     apply_host_command(&fixture, &dir.path().join("install"))
@@ -691,7 +691,7 @@ fn apply_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.tsv"))
+        .stderr(predicate::str::contains("user-hosts.toml"))
         .stderr(predicate::str::contains("permits group or world writes"));
 
     assert!(!fixture.log.exists());
@@ -701,7 +701,7 @@ fn apply_host_rejects_locally_writable_policy() {
 #[test]
 fn approve_host_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    let policy = fixture.config_root.join("policy/user-hosts.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -713,7 +713,7 @@ fn approve_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.tsv"));
+        .stderr(predicate::str::contains("user-hosts.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -722,7 +722,7 @@ fn approve_host_rejects_locally_writable_policy() {
 #[test]
 fn approve_user_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    let policy = fixture.config_root.join("policy/user-hosts.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -734,7 +734,7 @@ fn approve_user_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.tsv"));
+        .stderr(predicate::str::contains("user-hosts.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -743,7 +743,7 @@ fn approve_user_rejects_locally_writable_policy() {
 #[test]
 fn revoke_host_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    let policy = fixture.config_root.join("policy/user-hosts.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -755,7 +755,7 @@ fn revoke_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.tsv"));
+        .stderr(predicate::str::contains("user-hosts.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -764,7 +764,7 @@ fn revoke_host_rejects_locally_writable_policy() {
 #[test]
 fn revoke_user_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    let policy = fixture.config_root.join("policy/user-hosts.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -776,7 +776,7 @@ fn revoke_user_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-hosts.tsv"));
+        .stderr(predicate::str::contains("user-hosts.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -786,10 +786,12 @@ fn check_rejects_legacy_sshpop_policy() {
     let dir = tempdir().unwrap();
     let config_root = dir.path().join("grafhome-ca");
     copy_dir(&example_config_root(), &config_root);
-    let provisioners = config_root.join("policy/provisioners.tsv");
+    let provisioners = config_root.join("policy/provisioners.toml");
     let mut text = fs::read_to_string(&provisioners).unwrap();
     text.push_str(
-        "host_renew\tgrafhome-host-renew\tSSHPOP\t168h\t720h\t8h-jitter\tactive\tlegacy\n",
+        "\n[[provisioners]]\nrole = \"host_renew\"\nname = \"grafhome-host-renew\"\n\
+         type = \"SSHPOP\"\ndefault_ttl = \"168h\"\nmax_ttl = \"720h\"\n\
+         renewal_check = \"8h-jitter\"\nstatus = \"active\"\nnotes = \"legacy\"\n",
     );
     fs::write(provisioners, text).unwrap();
 

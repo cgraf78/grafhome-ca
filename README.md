@@ -263,7 +263,7 @@ By default, `grafhome-ca` reads site config from:
 ```text
 ${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/
   config/deployment.env
-  policy/*.tsv
+  policy/*.toml
 ```
 
 The config root can be overridden for tests, examples, or private repos:
@@ -271,6 +271,11 @@ The config root can be overridden for tests, examples, or private repos:
 ```sh
 grafhome-ca check --config-root /path/to/site-config
 ```
+
+Policy files are typed TOML and support comments. Each file has a corresponding
+JSON Schema under `schemas/policy/`; see
+[`docs/configuration.md`](docs/configuration.md) for the document shape and an
+example.
 
 Runtime firewall, Apache, systemd, and DNS changes remain owned by private
 configuration management. `enroll host` deliberately installs only the scoped

@@ -1,0 +1,27 @@
+[[emergency_access]]
+host = "ca-host"
+account = "alice"
+key_id = "ca-host-breakglass-1"
+storage = "password-manager-or-offline"
+test_interval = "quarterly"
+
+[[emergency_access]]
+host = "proxy-host"
+account = "alice"
+key_id = "proxy-host-breakglass-1"
+storage = "password-manager-or-offline"
+test_interval = "quarterly"
+
+[[emergency_access]]
+host = "edge-host"
+account = "alice"
+key_id = "edge-host-breakglass-1"
+storage = "password-manager-or-offline"
+test_interval = "quarterly"
+
+[[emergency_access]]
+host = "laptop-a"
+account = "alice"
+key_id = "laptop-a-breakglass-1"
+storage = "password-manager-or-offline"
+test_interval = "quarterly"

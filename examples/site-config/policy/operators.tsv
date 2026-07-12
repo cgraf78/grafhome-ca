@@ -1,2 +1,0 @@
-user	host_ref	unix_account	privilege	status	notes
-alice	ca_origin.target	alice	sudo	active	example policy admin; no root SSH login

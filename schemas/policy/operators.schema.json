@@ -1,22 +1,48 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Grafhome CA operators policy",
-  "type": "array",
-  "items": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["user", "host_ref", "unix_account", "privilege", "status", "notes"],
-    "properties": {
-      "user": { "$ref": "#/definitions/account" },
-      "host_ref": { "$ref": "#/definitions/ref" },
-      "unix_account": { "$ref": "#/definitions/account" },
-      "privilege": { "enum": ["sudo", "user", "read-only"] },
-      "status": { "enum": ["active", "planned", "disabled"] },
-      "notes": { "type": "string" }
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/operators.schema.json",
+  "title": "operators policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operators"],
+  "properties": {
+    "operators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["user", "host_ref", "unix_account", "privilege", "status", "notes"],
+        "properties": {
+          "user": {
+            "$ref": "#/definitions/account"
+          },
+          "host_ref": {
+            "$ref": "#/definitions/ref"
+          },
+          "unix_account": {
+            "$ref": "#/definitions/account"
+          },
+          "privilege": {
+            "enum": ["sudo", "user", "read-only"]
+          },
+          "status": {
+            "enum": ["active", "planned", "disabled"]
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
     }
   },
   "definitions": {
-    "account": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
-    "ref": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+    "account": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
+    },
+    "ref": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    }
   }
 }

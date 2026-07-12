@@ -1,21 +1,46 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Grafhome CA principals policy",
-  "type": "array",
-  "items": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["principal", "type", "owner", "allowed_accounts", "notes"],
-    "properties": {
-      "principal": { "$ref": "#/definitions/principal" },
-      "type": { "enum": ["user", "host", "automation"] },
-      "owner": { "$ref": "#/definitions/name" },
-      "allowed_accounts": { "type": "string", "pattern": "^(-|[A-Za-z0-9._,-]+)$" },
-      "notes": { "type": "string" }
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/principals.schema.json",
+  "title": "principals policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["principals"],
+  "properties": {
+    "principals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["principal", "type", "owner", "allowed_accounts", "notes"],
+        "properties": {
+          "principal": {
+            "$ref": "#/definitions/principal"
+          },
+          "type": {
+            "enum": ["user", "host", "automation"]
+          },
+          "owner": {
+            "$ref": "#/definitions/name"
+          },
+          "allowed_accounts": {
+            "type": "string",
+            "pattern": "^(-|[A-Za-z0-9._,-]+)$"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
     }
   },
   "definitions": {
-    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
-    "principal": { "type": "string", "pattern": "^[A-Za-z0-9._@-]+$" }
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "principal": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._@-]+$"
+    }
   }
 }

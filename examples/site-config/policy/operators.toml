@@ -1,0 +1,7 @@
+[[operators]]
+user = "alice"
+host_ref = "ca_origin.target"
+unix_account = "alice"
+privilege = "sudo"
+status = "active"
+notes = "example policy admin; no root SSH login"

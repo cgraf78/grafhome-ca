@@ -1,0 +1,27 @@
+[[static_keys]]
+account = "git"
+host_ref = "ca-host"
+purpose = "git hosting"
+class = "service-account"
+required_controls = "restricted key; policy-owned inventory"
+
+[[static_keys]]
+account = "backup"
+host_ref = "ca-host"
+purpose = "backup"
+class = "service-account"
+required_controls = "restricted key; policy-owned inventory"
+
+[[static_keys]]
+account = "workload"
+host_ref = "proxy-host"
+purpose = "workload access"
+class = "service-account"
+required_controls = "restricted key; policy-owned inventory"
+
+[[static_keys]]
+account = "ca-backup"
+host_ref = "ca_origin.target"
+purpose = "encrypted CA backup pull"
+class = "automation"
+required_controls = "from=laptop-a; restrict; command=grafhome-ca backup --emit"

@@ -67,12 +67,7 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
         )?,
     });
 
-    for host in model
-        .policy
-        .hosts
-        .iter()
-        .filter(|host| host.ssh_server == "yes")
-    {
+    for host in model.policy.hosts.iter().filter(|host| host.ssh_server) {
         files.push(RenderedFile {
             path: host_path(
                 &host.host,
@@ -108,12 +103,7 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
         }
     }
 
-    for host in model
-        .policy
-        .hosts
-        .iter()
-        .filter(|host| host.ssh_client == "yes")
-    {
+    for host in model.policy.hosts.iter().filter(|host| host.ssh_client) {
         files.push(RenderedFile {
             path: host_path(
                 &host.host,
@@ -334,14 +324,14 @@ fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> Result<&'a crate::
         .policy
         .endpoint(role)
         .ok_or_else(|| Error::Validation {
-            field: format!("policy/endpoints.tsv:{role}"),
+            field: format!("policy/endpoints.toml:{role}"),
             message: "missing required endpoint".to_owned(),
         })
 }
 
 fn required_host<'a>(model: &'a SiteModel, name: &str) -> Result<&'a Host> {
     model.policy.host(name).ok_or_else(|| Error::Validation {
-        field: format!("policy/hosts.tsv:{name}"),
+        field: format!("policy/hosts.toml:{name}"),
         message: "missing required host".to_owned(),
     })
 }
@@ -386,7 +376,7 @@ fn x509_allowed_dns_json(ca_api: &Endpoint, ca_origin: &Endpoint) -> Result<Stri
     names.sort_unstable();
     names.dedup();
     serde_json::to_string(&names).map_err(|source| Error::Json {
-        path: PathBuf::from("policy/endpoints.tsv"),
+        path: PathBuf::from("policy/endpoints.toml"),
         source,
     })
 }
@@ -411,7 +401,7 @@ fn provisioners_json(provisioners: &[Provisioner]) -> Result<String> {
             }),
             other => {
                 return Err(Error::Validation {
-                    field: format!("policy/provisioners.tsv:{}.type", provisioner.name),
+                    field: format!("policy/provisioners.toml:{}.type", provisioner.name),
                     message: format!("rendering provisioner type {other} is not implemented"),
                 });
             }
@@ -419,7 +409,7 @@ fn provisioners_json(provisioners: &[Provisioner]) -> Result<String> {
         rendered.push(value);
     }
     serde_json::to_string_pretty(&rendered).map_err(|source| Error::Json {
-        path: PathBuf::from("policy/provisioners.tsv"),
+        path: PathBuf::from("policy/provisioners.toml"),
         source,
     })
 }
@@ -438,7 +428,7 @@ pub fn active_provisioner_claims(model: &SiteModel, name: &str) -> Result<Value>
         .iter()
         .find(|entry| entry.name == name && entry.status == "active")
         .ok_or_else(|| Error::Validation {
-            field: format!("policy/provisioners.tsv:{name}"),
+            field: format!("policy/provisioners.toml:{name}"),
             message: "missing active provisioner".to_owned(),
         })?;
     provisioner_claims(provisioner)
@@ -462,7 +452,7 @@ fn provisioner_claims(provisioner: &Provisioner) -> Result<Value> {
         }),
         other => {
             return Err(Error::Validation {
-                field: format!("policy/provisioners.tsv:{}.role", provisioner.name),
+                field: format!("policy/provisioners.toml:{}.role", provisioner.name),
                 message: format!("rendering provisioner role {other} is not implemented"),
             });
         }
@@ -517,7 +507,7 @@ fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedF
             .policy
             .user(&access.user)
             .ok_or_else(|| Error::Validation {
-                field: format!("policy/user-hosts.tsv:{}.user", access.user),
+                field: format!("policy/user-hosts.toml:{}.user", access.user),
                 message: "missing policy user".to_owned(),
             })?;
         by_account

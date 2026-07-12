@@ -1,5 +1,0 @@
-user	host	unix_account	allow_ssh	sudo_expected	status	notes
-alice	ca-host	alice	yes	yes	active	host account present
-alice	proxy-host	alice	yes	yes	active	host account present
-alice	edge-host	alice	yes	yes	active	host account present
-alice	laptop-a	alice	yes	local	active	client-local account
