@@ -40,6 +40,18 @@ fn prepend_path(dir: &Path) -> String {
 }
 
 #[cfg(unix)]
+fn trusted_tempdir() -> tempfile::TempDir {
+    if rustix::process::geteuid().is_root() {
+        tempfile::Builder::new()
+            .prefix(".grafhome-ca-test-")
+            .tempdir_in("/root")
+            .unwrap()
+    } else {
+        tempdir().unwrap()
+    }
+}
+
+#[cfg(unix)]
 struct ExecFixture {
     config_root: PathBuf,
     fake_bin: PathBuf,
@@ -49,14 +61,7 @@ struct ExecFixture {
 
 #[cfg(unix)]
 fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
-    let dir = if rustix::process::geteuid().is_root() {
-        tempfile::Builder::new()
-            .prefix(".grafhome-ca-test-")
-            .tempdir_in("/root")
-            .unwrap()
-    } else {
-        tempdir().unwrap()
-    };
+    let dir = trusted_tempdir();
     let config_root = dir.path().join("grafhome-ca");
     let fake_bin = dir.path().join("bin");
     let state = dir.path().join("state");
@@ -1002,7 +1007,7 @@ fn export_dry_run_lists_bundle_without_live_ca_state() {
 fn export_writes_trust_bundle_and_manifest() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempdir().unwrap();
+    let dir = trusted_tempdir();
     let config_root = dir.path().join("grafhome-ca");
     let ca_state = dir.path().join("state");
     let step_bin = dir.path().join("fake-step");
