@@ -49,7 +49,14 @@ struct ExecFixture {
 
 #[cfg(unix)]
 fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
-    let dir = tempdir().unwrap();
+    let dir = if rustix::process::geteuid().is_root() {
+        tempfile::Builder::new()
+            .prefix(".grafhome-ca-test-")
+            .tempdir_in("/root")
+            .unwrap()
+    } else {
+        tempdir().unwrap()
+    };
     let config_root = dir.path().join("grafhome-ca");
     let fake_bin = dir.path().join("bin");
     let state = dir.path().join("state");

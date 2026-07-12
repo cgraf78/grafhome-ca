@@ -216,12 +216,24 @@ mod tests {
     use super::collect;
 
     #[cfg(unix)]
+    fn trusted_tempdir() -> tempfile::TempDir {
+        if rustix::process::geteuid().is_root() {
+            tempfile::Builder::new()
+                .prefix(".grafhome-ca-test-")
+                .tempdir_in("/root")
+                .unwrap()
+        } else {
+            tempdir().unwrap()
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn exports_only_public_trust_material() {
         use std::os::unix::fs::PermissionsExt;
 
         let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let ca_state = temp.path().join("state");
         let step_bin = temp.path().join("fake-step");
         fs::create_dir_all(ca_state.join("step/certs")).unwrap();
@@ -292,7 +304,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let ca_state = temp.path().join("state");
         let step_bin = temp.path().join("fake-step");
         fs::create_dir_all(ca_state.join("step/certs")).unwrap();
