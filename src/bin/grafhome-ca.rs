@@ -1801,7 +1801,7 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
     enroll_host(model, &grant.host, &grant.token)?;
     install_host_ssh_trust(model, &grant.host, &grant.ca_url)?;
     run_status(process("sshd").arg("-t"))?;
-    reload_ssh(false)?;
+    reload_ssh()?;
     outln!("Host enrollment complete: {}", grant.host);
     Ok(())
 }
@@ -2083,7 +2083,7 @@ fn restore_host_policy_files(
 
 fn validate_and_reload_ssh() -> grafhome_ca::Result<()> {
     run_status_quiet(process("sshd").arg("-t"), &[], true)?;
-    reload_ssh(true)
+    reload_ssh()
 }
 
 fn print_host_policy_changes(
@@ -2292,7 +2292,7 @@ fn enroll_host(model: &SiteModel, host: &str, token: &str) -> grafhome_ca::Resul
             .arg(host_cert_path(model)),
     )?;
     run_status(process("sshd").arg("-t"))?;
-    reload_ssh(false)
+    reload_ssh()
 }
 
 fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::Result<()> {
@@ -2374,7 +2374,7 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
         quiet,
     )?;
     run_status_quiet(process("sshd").arg("-t"), &[], quiet)?;
-    reload_ssh(quiet)
+    reload_ssh()
 }
 
 fn create_user_token(
@@ -3388,11 +3388,29 @@ fn with_temp_file<T>(
     action(file.path())
 }
 
-fn reload_ssh(quiet: bool) -> grafhome_ca::Result<()> {
-    if run_status_quiet(process("systemctl").arg("reload").arg("ssh"), &[], quiet).is_ok() {
-        return Ok(());
-    }
-    run_status_quiet(process("systemctl").arg("reload").arg("sshd"), &[], quiet)
+fn reload_ssh() -> grafhome_ca::Result<()> {
+    let sshd_error = match run_status_quiet(
+        process("systemctl").arg("reload").arg("sshd.service"),
+        &[],
+        true,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let ssh_error = match run_status_quiet(
+        process("systemctl").arg("reload").arg("ssh.service"),
+        &[],
+        true,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    Err(grafhome_ca::Error::Validation {
+        field: "SSH reload".to_owned(),
+        message: format!(
+            "neither sshd.service nor ssh.service could be reloaded; sshd.service: {sshd_error}; ssh.service: {ssh_error}"
+        ),
+    })
 }
 
 fn user_ssh_template(principal: &str) -> String {

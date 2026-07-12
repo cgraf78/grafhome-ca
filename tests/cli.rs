@@ -233,6 +233,10 @@ if [ "${FAKE_SYSTEMCTL_RESTART_FAIL_ONCE:-}" = "1" ] && [ "$1" = "restart" ] && 
   touch "$FAKE_LOG.restart_failed"
   exit 43
 fi
+if [ "${FAKE_SYSTEMCTL_SSHD_MISSING:-}" = "1" ] && [ "$1" = "reload" ] && [ "$2" = "sshd.service" ]; then
+  printf 'Failed to reload sshd.service: Unit sshd.service not found.\n' >&2
+  exit 5
+fi
 if [ "${FAKE_SYSTEMCTL_RELOAD_FAIL_PAIR:-}" = "1" ] && [ "$1" = "reload" ]; then
   count_file="$FAKE_LOG.reload_failures"
   count=0
@@ -490,7 +494,25 @@ fn apply_host_installs_fresh_local_policy() {
     );
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains("sshd args=-t"));
-    assert!(log.contains("systemctl args=reload ssh"));
+    assert!(log.contains("systemctl args=reload sshd.service"));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_silently_falls_back_to_ssh_service() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_SYSTEMCTL_SSHD_MISSING", "1")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("systemctl args=reload sshd.service"));
+    assert!(log.contains("systemctl args=reload ssh.service"));
 }
 
 #[cfg(unix)]
@@ -643,6 +665,9 @@ fn apply_host_restores_previous_policy_when_ssh_reload_fails() {
         .env("FAKE_SYSTEMCTL_RELOAD_FAIL_PAIR", "1")
         .assert()
         .failure()
+        .stderr(predicate::str::contains(
+            "neither sshd.service nor ssh.service could be reloaded",
+        ))
         .stderr(predicate::str::contains(
             "restored the previous host policy",
         ));
@@ -1318,7 +1343,7 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
     assert!(log.contains("ssh certificate proxy-host"));
     assert!(log.contains("--token host-token"));
     assert!(log.contains("sshd args=-t"));
-    assert!(log.contains("systemctl args=reload ssh"));
+    assert!(log.contains("systemctl args=reload sshd.service"));
 }
 
 #[cfg(unix)]
