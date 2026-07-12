@@ -1,0 +1,27 @@
+[[client_devices]]
+device = "ca-host"
+owner = "alice"
+user = "alice"
+key_name = "alice_ca_host_ed25519"
+status = "active"
+
+[[client_devices]]
+device = "proxy-host"
+owner = "alice"
+user = "alice"
+key_name = "alice_proxy_host_ed25519"
+status = "active"
+
+[[client_devices]]
+device = "edge-host"
+owner = "alice"
+user = "alice"
+key_name = "alice_edge_host_ed25519"
+status = "active"
+
+[[client_devices]]
+device = "laptop-a"
+owner = "alice"
+user = "alice"
+key_name = "alice_laptop_a_ed25519"
+status = "active"

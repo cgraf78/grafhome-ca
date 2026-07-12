@@ -1,21 +1,45 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Grafhome CA client devices policy",
-  "type": "array",
-  "items": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["device", "owner", "user", "key_name", "status"],
-    "properties": {
-      "device": { "$ref": "#/definitions/name" },
-      "owner": { "$ref": "#/definitions/account" },
-      "user": { "$ref": "#/definitions/account" },
-      "key_name": { "$ref": "#/definitions/name" },
-      "status": { "enum": ["active", "planned", "disabled"] }
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/client-devices.schema.json",
+  "title": "client-devices policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["client_devices"],
+  "properties": {
+    "client_devices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["device", "owner", "user", "key_name", "status"],
+        "properties": {
+          "device": {
+            "$ref": "#/definitions/name"
+          },
+          "owner": {
+            "$ref": "#/definitions/account"
+          },
+          "user": {
+            "$ref": "#/definitions/account"
+          },
+          "key_name": {
+            "$ref": "#/definitions/name"
+          },
+          "status": {
+            "enum": ["active", "planned", "disabled"]
+          }
+        }
+      }
     }
   },
   "definitions": {
-    "account": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
-    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+    "account": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    }
   }
 }

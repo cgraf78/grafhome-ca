@@ -73,6 +73,27 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 
 ## Policy Terms
 
+Policy lives in typed TOML documents under `policy/`. Each file contains one
+array of tables named after the file with hyphens replaced by underscores. For
+example, `policy/user-hosts.toml` contains `[[user_hosts]]` entries. TOML
+comments are supported, booleans are written as `true` or `false`, endpoint
+ports are integers, and host principals are arrays:
+
+```toml
+# This host accepts and initiates certificate-authenticated SSH connections.
+[[hosts]]
+host = "server-a"
+kind = "server"
+ssh_server = true
+ssh_client = true
+renewal_owner = "dot-cron"
+principals = ["server-a", "server-a.example.test"]
+```
+
+The schemas in `schemas/policy/` validate the complete TOML documents. Run
+`grafhome-ca check` after editing policy; commands that mutate CA or host state
+also validate policy and its filesystem provenance before proceeding.
+
 `ca_origin`
 : The private CA service endpoint hosted on the CA origin host.
 
@@ -99,7 +120,7 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
   name are both explicit issuance policy.
 
 `GRAFHOME_CA_PROVISIONERS_JSON`
-: Template variable derived from active rows in `policy/provisioners.tsv`.
+: Template variable derived from active rows in `policy/provisioners.toml`.
   JWK rows render as whole-object runtime placeholders until a deployment step
   replaces them with complete Smallstep-generated provisioner objects containing
   both the public `key` and encrypted private-key material. Non-secret

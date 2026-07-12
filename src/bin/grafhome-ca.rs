@@ -1057,7 +1057,7 @@ fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Resul
         .policy
         .endpoint(role)
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/endpoints.tsv:{role}"),
+            field: format!("policy/endpoints.toml:{role}"),
             message: "missing required endpoint".to_owned(),
         })
 }
@@ -1067,7 +1067,7 @@ fn required_host<'a>(model: &'a SiteModel, host: &str) -> grafhome_ca::Result<&'
         .policy
         .host(host)
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/hosts.tsv:{host}"),
+            field: format!("policy/hosts.toml:{host}"),
             message: "unknown host".to_owned(),
         })
 }
@@ -1077,12 +1077,12 @@ fn active_user<'a>(model: &'a SiteModel, user: &str) -> grafhome_ca::Result<&'a 
         .policy
         .user(user)
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/users.tsv:{user}"),
+            field: format!("policy/users.toml:{user}"),
             message: "unknown user".to_owned(),
         })?;
     if user.status != "active" {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/users.tsv:{}.status", user.user),
+            field: format!("policy/users.toml:{}.status", user.user),
             message: "user must be active".to_owned(),
         });
     }
@@ -1099,7 +1099,7 @@ fn required_provisioner<'a>(
         .iter()
         .find(|entry| entry.role == role && entry.status == "active")
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/provisioners.tsv:{role}"),
+            field: format!("policy/provisioners.toml:{role}"),
             message: "missing active provisioner role".to_owned(),
         })
 }
@@ -1115,7 +1115,7 @@ fn required_user_device<'a>(
         .iter()
         .find(|device| device.user == user && device.device == host && device.status == "active")
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/client-devices.tsv:{user}:{host}"),
+            field: format!("policy/client-devices.toml:{user}:{host}"),
             message: "missing active client device for user and host".to_owned(),
         })
 }
@@ -1127,13 +1127,13 @@ fn select_single_user_device<'a>(
     let mut devices = model.policy.active_client_devices_for_user(user);
     let Some(device) = devices.next() else {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/client-devices.tsv:{user}"),
+            field: format!("policy/client-devices.toml:{user}"),
             message: "user has no active client devices".to_owned(),
         });
     };
     if devices.next().is_some() {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/client-devices.tsv:{user}"),
+            field: format!("policy/client-devices.toml:{user}"),
             message: "user has multiple active client devices; pass --host".to_owned(),
         });
     }
@@ -1823,7 +1823,7 @@ fn desired_host_ssh_files(
     let step_bin = &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"];
     let steppath = Path::new(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]);
     let root = server_root_cert_path(model);
-    let user_ca_keys = if host.ssh_server == "yes" {
+    let user_ca_keys = if host.ssh_server {
         String::from_utf8_lossy(&run_capture(
             process(step_bin)
                 .env("STEPPATH", steppath)
@@ -1839,7 +1839,7 @@ fn desired_host_ssh_files(
     } else {
         String::new()
     };
-    let host_ca_keys = if host.ssh_client == "yes" {
+    let host_ca_keys = if host.ssh_client {
         String::from_utf8_lossy(&run_capture(
             process(step_bin)
                 .env("STEPPATH", steppath)
@@ -2127,8 +2127,8 @@ fn known_hosts_from_roots(model: &SiteModel, roots: &str) -> String {
         .policy
         .hosts
         .iter()
-        .filter(|host| host.ssh_server == "yes")
-        .flat_map(|host| split_list(&host.principals))
+        .filter(|host| host.ssh_server)
+        .flat_map(|host| host.principals.iter().map(String::as_str))
         .collect::<Vec<_>>();
     principals.sort_unstable();
     principals.dedup();
@@ -2214,7 +2214,7 @@ fn create_host_token(
         .arg(&host.host)
         .arg("--ssh")
         .arg("--host");
-    for principal in split_list(&host.principals) {
+    for principal in &host.principals {
         command.arg("--principal").arg(principal);
     }
     command
@@ -2291,7 +2291,7 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
         .arg(&host.host)
         .arg("--ssh")
         .arg("--host");
-    for principal in split_list(&host.principals) {
+    for principal in &host.principals {
         token_command.arg("--principal").arg(principal);
     }
     let token = run_capture(
@@ -3366,13 +3366,6 @@ fn reload_ssh(quiet: bool) -> grafhome_ca::Result<()> {
     run_status_quiet(process("systemctl").arg("reload").arg("sshd"), &[], quiet)
 }
 
-fn split_list(value: &str) -> impl Iterator<Item = &str> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-}
-
 fn user_ssh_template(principal: &str) -> String {
     let principal_json = serde_json::to_string(principal).expect("principal string serializes");
     format!(
@@ -3381,7 +3374,10 @@ fn user_ssh_template(principal: &str) -> String {
 }
 
 fn host_ssh_template(host: &Host) -> String {
-    let principals = split_list(&host.principals)
+    let principals = host
+        .principals
+        .iter()
+        .map(String::as_str)
         .map(|principal| serde_json::to_string(principal).expect("principal serializes"))
         .collect::<Vec<_>>()
         .join(", ");

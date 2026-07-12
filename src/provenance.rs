@@ -134,13 +134,13 @@ mod tests {
     fn rejects_group_writable_policy_file() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
-        let input = root.join("policy/user-hosts.tsv");
+        let input = root.join("policy/user-hosts.toml");
         fs::set_permissions(&input, fs::Permissions::from_mode(0o664)).unwrap();
         let uid = fs::metadata(dir.path()).unwrap().uid();
 
         let error = validate_config_root(&root, uid).unwrap_err().to_string();
 
-        assert!(error.contains("user-hosts.tsv"));
+        assert!(error.contains("user-hosts.toml"));
         assert!(error.contains("permits group or world writes"));
     }
 
@@ -164,7 +164,7 @@ mod tests {
         let root = dir.path().join("grafhome-ca");
         let uid = fs::metadata(dir.path()).unwrap().uid();
         let untrusted_uid = if uid == 0 {
-            let input = root.join("policy/user-hosts.tsv");
+            let input = root.join("policy/user-hosts.toml");
             rustix::fs::chown(&input, Some(rustix::fs::Uid::from_raw(1)), None).unwrap();
             2
         } else {
@@ -182,8 +182,8 @@ mod tests {
     fn rejects_writable_symlink_target() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
-        let original = root.join("policy/user-hosts.tsv");
-        let target = dir.path().join("user-hosts.tsv");
+        let original = root.join("policy/user-hosts.toml");
+        let target = dir.path().join("user-hosts.toml");
         fs::rename(&original, &target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
         std::os::unix::fs::symlink(&target, &original).unwrap();
@@ -191,7 +191,7 @@ mod tests {
 
         let error = validate_config_root(&root, uid).unwrap_err().to_string();
 
-        assert!(error.contains("user-hosts.tsv"));
+        assert!(error.contains("user-hosts.toml"));
         assert!(error.contains("permits group or world writes"));
     }
 
@@ -199,8 +199,8 @@ mod tests {
     fn accepts_protected_symlink_target() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
-        let original = root.join("policy/user-hosts.tsv");
-        let target = dir.path().join("user-hosts.tsv");
+        let original = root.join("policy/user-hosts.toml");
+        let target = dir.path().join("user-hosts.toml");
         fs::rename(&original, &target).unwrap();
         std::os::unix::fs::symlink(&target, &original).unwrap();
         let uid = fs::metadata(dir.path()).unwrap().uid();

@@ -31,7 +31,7 @@ pub enum Error {
     /// A policy/config field failed validation.
     #[error("{field}: {message}")]
     Validation {
-        /// Owning field, such as `policy/endpoints.tsv:ca_origin.port`.
+        /// Owning field, such as `policy/endpoints.toml:ca_origin.port`.
         field: String,
         /// Human-readable validation failure.
         message: String,
@@ -46,13 +46,13 @@ pub enum Error {
         source: serde_json::Error,
     },
 
-    /// CSV/TSV parsing failed.
+    /// TOML parsing failed.
     #[error("{path}: {source}")]
-    Csv {
+    Toml {
         /// Path being parsed.
         path: PathBuf,
-        /// Underlying CSV error.
-        source: csv::Error,
+        /// Underlying TOML error.
+        source: toml::de::Error,
     },
 }
 

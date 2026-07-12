@@ -56,12 +56,8 @@ pub fn validate_config_root(config_root: impl AsRef<Path>) -> Result<()> {
     )?;
 
     for spec in policy_specs() {
-        let rows = policy::read_raw(config_root.join(spec.path), spec.headers)?;
-        validate_schema_text(
-            spec.schema,
-            spec.schema_text,
-            &serde_json::to_value(rows).expect("policy rows serialize"),
-        )?;
+        let document = policy::read_document(config_root.join(spec.path))?;
+        validate_schema_text(spec.schema, spec.schema_text, &document)?;
     }
     Ok(())
 }
@@ -78,145 +74,74 @@ struct PolicySpec {
     path: &'static str,
     schema: &'static str,
     schema_text: &'static str,
-    headers: &'static [&'static str],
 }
 
 fn policy_specs() -> &'static [PolicySpec] {
     &[
         PolicySpec {
-            path: "policy/endpoints.tsv",
+            path: "policy/endpoints.toml",
             schema: "schemas/policy/endpoints.schema.json",
             schema_text: include_str!("../schemas/policy/endpoints.schema.json"),
-            headers: &[
-                "role",
-                "name",
-                "dns_name",
-                "target",
-                "interface",
-                "address",
-                "port",
-                "scheme",
-            ],
         },
         PolicySpec {
-            path: "policy/hosts.tsv",
+            path: "policy/hosts.toml",
             schema: "schemas/policy/hosts.schema.json",
             schema_text: include_str!("../schemas/policy/hosts.schema.json"),
-            headers: &[
-                "host",
-                "kind",
-                "ssh_server",
-                "ssh_client",
-                "renewal_owner",
-                "principals",
-            ],
         },
         PolicySpec {
-            path: "policy/users.tsv",
+            path: "policy/users.toml",
             schema: "schemas/policy/users.schema.json",
             schema_text: include_str!("../schemas/policy/users.schema.json"),
-            headers: &[
-                "user",
-                "principal",
-                "unix_account",
-                "root_ssh",
-                "provisioner",
-                "cert_ttl",
-                "status",
-                "notes",
-            ],
         },
         PolicySpec {
-            path: "policy/operators.tsv",
+            path: "policy/operators.toml",
             schema: "schemas/policy/operators.schema.json",
             schema_text: include_str!("../schemas/policy/operators.schema.json"),
-            headers: &[
-                "user",
-                "host_ref",
-                "unix_account",
-                "privilege",
-                "status",
-                "notes",
-            ],
         },
         PolicySpec {
-            path: "policy/provisioners.tsv",
+            path: "policy/provisioners.toml",
             schema: "schemas/policy/provisioners.schema.json",
             schema_text: include_str!("../schemas/policy/provisioners.schema.json"),
-            headers: &[
-                "role",
-                "name",
-                "type",
-                "default_ttl",
-                "max_ttl",
-                "renewal_check",
-                "status",
-                "notes",
-            ],
         },
         PolicySpec {
-            path: "policy/client-devices.tsv",
+            path: "policy/client-devices.toml",
             schema: "schemas/policy/client-devices.schema.json",
             schema_text: include_str!("../schemas/policy/client-devices.schema.json"),
-            headers: &["device", "owner", "user", "key_name", "status"],
         },
         PolicySpec {
-            path: "policy/principals.tsv",
+            path: "policy/principals.toml",
             schema: "schemas/policy/principals.schema.json",
             schema_text: include_str!("../schemas/policy/principals.schema.json"),
-            headers: &["principal", "type", "owner", "allowed_accounts", "notes"],
         },
         PolicySpec {
-            path: "policy/user-hosts.tsv",
+            path: "policy/user-hosts.toml",
             schema: "schemas/policy/user-hosts.schema.json",
             schema_text: include_str!("../schemas/policy/user-hosts.schema.json"),
-            headers: &[
-                "user",
-                "host",
-                "unix_account",
-                "allow_ssh",
-                "sudo_expected",
-                "status",
-                "notes",
-            ],
         },
         PolicySpec {
-            path: "policy/automation.tsv",
+            path: "policy/automation.toml",
             schema: "schemas/policy/automation.schema.json",
             schema_text: include_str!("../schemas/policy/automation.schema.json"),
-            headers: &[
-                "name",
-                "source_ref",
-                "target_ref",
-                "purpose",
-                "auth_model",
-                "notes",
-            ],
         },
         PolicySpec {
-            path: "policy/static-keys.tsv",
+            path: "policy/static-keys.toml",
             schema: "schemas/policy/static-keys.schema.json",
             schema_text: include_str!("../schemas/policy/static-keys.schema.json"),
-            headers: &[
-                "account",
-                "host_ref",
-                "purpose",
-                "class",
-                "required_controls",
-            ],
         },
         PolicySpec {
-            path: "policy/emergency-access.tsv",
+            path: "policy/emergency-access.toml",
             schema: "schemas/policy/emergency-access.schema.json",
             schema_text: include_str!("../schemas/policy/emergency-access.schema.json"),
-            headers: &["host", "account", "key_id", "storage", "test_interval"],
         },
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+
+    use tempfile::tempdir;
 
     fn example_config_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config")
@@ -225,5 +150,37 @@ mod tests {
     #[test]
     fn example_files_match_embedded_schemas() {
         crate::schema::validate_config_root(example_config_root()).expect("schema validation");
+    }
+
+    #[test]
+    fn schema_rejects_unknown_toml_fields() {
+        let dir = tempdir().unwrap();
+        copy_dir(&example_config_root(), dir.path());
+        let hosts = dir.path().join("policy/hosts.toml");
+        let text = fs::read_to_string(&hosts).unwrap().replacen(
+            "kind = \"server\"",
+            "kind = \"server\"\nlegacy_flag = true",
+            1,
+        );
+        fs::write(hosts, text).unwrap();
+
+        let error = crate::schema::validate_config_root(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Additional properties are not allowed"));
+        assert!(error.contains("legacy_flag"));
+    }
+
+    fn copy_dir(source: &std::path::Path, destination: &std::path::Path) {
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                fs::create_dir(&target).unwrap();
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 }

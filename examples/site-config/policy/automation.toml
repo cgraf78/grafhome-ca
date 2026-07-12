@@ -1,0 +1,15 @@
+[[automation]]
+name = "dot-cron"
+source_ref = "fleet"
+target_ref = "fleet"
+purpose = "routine CA checks"
+auth_model = "existing-dotfiles-cron"
+notes = "preferred scheduler where practical"
+
+[[automation]]
+name = "ca-backup"
+source_ref = "laptop-a"
+target_ref = "ca_origin.target"
+purpose = "encrypted CA backup pull"
+auth_model = "restricted-static-key"
+notes = "dedicated ca-backup account, forced command only"

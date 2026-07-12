@@ -1,0 +1,29 @@
+[[provisioners]]
+role = "host_bootstrap"
+name = "grafhome-host-bootstrap"
+type = "JWK"
+default_ttl = "168h"
+max_ttl = "720h"
+renewal_check = "manual"
+status = "active"
+notes = "one-time host enrollment tokens"
+
+[[provisioners]]
+role = "user_enrollment"
+name = "grafhome-user-enrollment"
+type = "JWK"
+default_ttl = "24h"
+max_ttl = "168h"
+renewal_check = "manual"
+status = "active"
+notes = "user enrollment tokens; per-client JWK provisioners handle refresh"
+
+[[provisioners]]
+role = "proxy_x509"
+name = "grafhome-x509-ca-proxy"
+type = "ACME"
+default_ttl = "720h"
+max_ttl = "720h"
+renewal_check = "24h-jitter"
+status = "active"
+notes = "X.509 for ca_api.dns_name and ca_origin.dns_name only"

@@ -1,21 +1,45 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Grafhome CA emergency access policy",
-  "type": "array",
-  "items": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["host", "account", "key_id", "storage", "test_interval"],
-    "properties": {
-      "host": { "$ref": "#/definitions/name" },
-      "account": { "$ref": "#/definitions/account" },
-      "key_id": { "$ref": "#/definitions/name" },
-      "storage": { "enum": ["password-manager-or-offline", "offline", "password-manager"] },
-      "test_interval": { "enum": ["monthly", "quarterly", "annually"] }
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/emergency-access.schema.json",
+  "title": "emergency-access policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["emergency_access"],
+  "properties": {
+    "emergency_access": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "account", "key_id", "storage", "test_interval"],
+        "properties": {
+          "host": {
+            "$ref": "#/definitions/name"
+          },
+          "account": {
+            "$ref": "#/definitions/account"
+          },
+          "key_id": {
+            "$ref": "#/definitions/name"
+          },
+          "storage": {
+            "enum": ["password-manager-or-offline", "offline", "password-manager"]
+          },
+          "test_interval": {
+            "enum": ["monthly", "quarterly", "annually"]
+          }
+        }
+      }
     }
   },
   "definitions": {
-    "account": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
-    "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" }
+    "account": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    }
   }
 }

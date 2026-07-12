@@ -1,0 +1,35 @@
+[[user_hosts]]
+user = "alice"
+host = "ca-host"
+unix_account = "alice"
+allow_ssh = true
+sudo_expected = "yes"
+status = "active"
+notes = "host account present"
+
+[[user_hosts]]
+user = "alice"
+host = "proxy-host"
+unix_account = "alice"
+allow_ssh = true
+sudo_expected = "yes"
+status = "active"
+notes = "host account present"
+
+[[user_hosts]]
+user = "alice"
+host = "edge-host"
+unix_account = "alice"
+allow_ssh = true
+sudo_expected = "yes"
+status = "active"
+notes = "host account present"
+
+[[user_hosts]]
+user = "alice"
+host = "laptop-a"
+unix_account = "alice"
+allow_ssh = true
+sudo_expected = "local"
+status = "active"
+notes = "client-local account"

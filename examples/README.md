@@ -8,7 +8,7 @@ commit publicly and are used by the test suite to keep examples valid.
 ```text
 ${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/
   config/deployment.env
-  policy/*.tsv
+  policy/*.toml
 ```
 
 To adapt the example for a real deployment, copy the `site-config/` contents to

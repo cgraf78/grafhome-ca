@@ -58,7 +58,7 @@ pub fn collect(model: &SiteModel) -> Result<Vec<RenderedFile>> {
         .policy
         .endpoint("ca_api")
         .ok_or_else(|| Error::Validation {
-            field: "policy/endpoints.tsv:ca_api".to_owned(),
+            field: "policy/endpoints.toml:ca_api".to_owned(),
             message: "missing required endpoint".to_owned(),
         })?
         .url();
@@ -177,8 +177,8 @@ fn root_fingerprint(model: &SiteModel, root_cert_path: &Path) -> Result<String> 
 fn host_principals(hosts: &[Host]) -> Vec<String> {
     let mut principals = hosts
         .iter()
-        .filter(|host| host.ssh_server == "yes")
-        .flat_map(|host| host.principals.split(','))
+        .filter(|host| host.ssh_server)
+        .flat_map(|host| host.principals.iter().map(String::as_str))
         .map(str::trim)
         .filter(|principal| !principal.is_empty())
         .map(ToOwned::to_owned)
@@ -191,7 +191,7 @@ fn host_principals(hosts: &[Host]) -> Vec<String> {
 fn known_hosts_line(principals: &[String], host_ca_key: &str) -> Result<String> {
     if principals.is_empty() {
         return Err(Error::Validation {
-            field: "policy/hosts.tsv:principals".to_owned(),
+            field: "policy/hosts.toml:principals".to_owned(),
             message: "at least one SSH server host principal is required".to_owned(),
         });
     }
