@@ -2815,7 +2815,7 @@ fn user_local_renewal_ready(
         && user_client_material_dir(user, host)?
             .join("provisioner.priv.json")
             .is_file()
-        && (!require_stored_credential || renewal_credential_path(user, host)?.is_file()))
+        && (!require_stored_credential || stored_renewal_credential_exists(user, host)?))
 }
 
 fn remote_provisioner_names(
@@ -3184,6 +3184,14 @@ fn ssh_certificate_needs_renewal(step_bin: &str, certificate: &Path) -> grafhome
     }
 }
 
+#[cfg(target_os = "macos")]
+fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
+    store_macos_keychain_password(user, host, password)?;
+    eprintln!("Stored the renewal password in macOS Keychain.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
     let stored_in_keyring = try_store_secret_service(user, host, password)?;
     store_systemd_credential(user, host, password)?;
@@ -3197,6 +3205,7 @@ fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn try_store_secret_service(user: &str, host: &str, password: &str) -> grafhome_ca::Result<bool> {
     let child = process("secret-tool")
         .arg("store")
@@ -3237,6 +3246,12 @@ fn try_store_secret_service(user: &str, host: &str, password: &str) -> grafhome_
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
+fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String> {
+    lookup_macos_keychain_password(user, host)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String> {
     if let Some(password) = lookup_secret_service(user, host)? {
         return Ok(password);
@@ -3244,6 +3259,7 @@ fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String
     lookup_systemd_credential(user, host)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<String>> {
     let output = process("secret-tool")
         .arg("lookup")
@@ -3268,10 +3284,12 @@ fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<S
     Ok(Some(password))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn renewal_credential_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
     Ok(user_client_material_dir(user, host)?.join("renewal-password.cred"))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn store_systemd_credential(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
     let path = renewal_credential_path(user, host)?;
     let parent = path.parent().expect("credential path has a parent");
@@ -3318,6 +3336,7 @@ fn store_systemd_credential(user: &str, host: &str, password: &str) -> grafhome_
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn lookup_systemd_credential(user: &str, host: &str) -> grafhome_ca::Result<String> {
     let path = renewal_credential_path(user, host)?;
     let output = process("systemd-creds")
@@ -3341,6 +3360,103 @@ fn lookup_systemd_credential(user: &str, host: &str) -> grafhome_ca::Result<Stri
         });
     }
     Ok(password)
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_KEYCHAIN_SERVICE: &str = "net.grafhome.ca.renewal";
+
+#[cfg(target_os = "macos")]
+fn renewal_credential_account(user: &str, host: &str) -> String {
+    format!("{user}@{host}")
+}
+
+#[cfg(target_os = "macos")]
+fn store_macos_keychain_password(
+    user: &str,
+    host: &str,
+    password: &str,
+) -> grafhome_ca::Result<()> {
+    let account = renewal_credential_account(user, host);
+    let password_hex = password
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // Interactive mode keeps the secret out of argv. Using Apple's stable
+    // security tool as the creator also keeps unattended access valid when
+    // the grafhome-ca binary is replaced by a later unsigned release.
+    let command = format!(
+        "add-generic-password -U -a {account} -s {MACOS_KEYCHAIN_SERVICE} -X {password_hex}\n"
+    );
+    let mut child = process("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| grafhome_ca::Error::io("security", source))?;
+    child
+        .stdin
+        .as_mut()
+        .expect("piped security stdin")
+        .write_all(command.as_bytes())
+        .map_err(|source| grafhome_ca::Error::io("security stdin", source))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|source| grafhome_ca::Error::io("security", source))?;
+    if !output.status.success() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "renewal credential storage".to_owned(),
+            message: format!(
+                "macOS Keychain could not store the renewal password: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let stored = lookup_macos_keychain_password(user, host)?;
+    if stored != password {
+        return Err(grafhome_ca::Error::Validation {
+            field: "renewal credential storage".to_owned(),
+            message: "macOS Keychain did not return the password that was just stored".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn lookup_macos_keychain_password(user: &str, host: &str) -> grafhome_ca::Result<String> {
+    let account = renewal_credential_account(user, host);
+    let output = process("security")
+        .arg("find-generic-password")
+        .arg("-a")
+        .arg(&account)
+        .arg("-s")
+        .arg(MACOS_KEYCHAIN_SERVICE)
+        .arg("-w")
+        .output()
+        .map_err(|source| grafhome_ca::Error::io("security", source))?;
+    let password = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    if !output.status.success() || password.is_empty() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "renewal credential storage".to_owned(),
+            message: format!(
+                "no usable renewal password found in macOS Keychain for {user}@{host}; rerun enrollment or use --password-file"
+            ),
+        });
+    }
+    Ok(password)
+}
+
+#[cfg(target_os = "macos")]
+fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
+    Ok(lookup_macos_keychain_password(user, host).is_ok())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
+    Ok(renewal_credential_path(user, host)?.is_file())
 }
 
 fn with_password_file<T>(

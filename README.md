@@ -165,9 +165,10 @@ root and `grafhome-ca renew user --if-enrolled --quiet` as the enrolled user.
 Both commands infer the local identity, skip fresh certificates, and return
 successfully without output when enrollment or local renewal material is
 absent. Grafhome's private dotfiles install these jobs every eight hours. User
-enrollment stores the password in an encrypted systemd user credential for
-unattended renewal, in addition to Secret Service when available. Other
-deployments must provide equivalent scheduling.
+enrollment stores the password in macOS Keychain on macOS. On Linux it uses an
+encrypted systemd user credential and also stores the password in Secret
+Service when available. `renew user` reads the corresponding platform store
+for unattended renewal. Other deployments must provide equivalent scheduling.
 
 `enroll user` generates the SSH and renewal keys, stores the renewal password,
 prints the public request, and waits for the grant. After the grant is pasted,

@@ -282,6 +282,35 @@ case "$1" in
 esac
 "#,
     );
+    write_executable(
+        &fake_bin.join("security"),
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+  -i)
+    command=$(cat)
+    printf 'security interactive store\n' >> "$FAKE_LOG"
+    case "$command" in
+      *"-a alice@ca-host -s net.grafhome.ca.renewal -X 757365722d6f776e65642d70617373776f7264"*)
+        printf 'user-owned-password' > "$FAKE_LOG.keychain"
+        ;;
+      *)
+        printf 'unexpected interactive security command\n' >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  find-generic-password)
+    printf 'security find args=%s\n' "$*" >> "$FAKE_LOG"
+    test -f "$FAKE_LOG.keychain"
+    cat "$FAKE_LOG.keychain"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+    );
 
     (
         dir,
@@ -1500,7 +1529,7 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
     assert!(log.contains("ca health --ca-url https://ca.example.test"));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn enroll_user_falls_back_to_systemd_user_credential() {
     let (dir, fixture) = exec_fixture();
@@ -1574,7 +1603,7 @@ fn enroll_user_falls_back_to_systemd_user_credential() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn enroll_user_stores_an_unattended_credential_when_secret_service_succeeds() {
     let (dir, fixture) = exec_fixture();
@@ -1612,6 +1641,114 @@ fn enroll_user_stores_an_unattended_credential_when_secret_service_succeeds() {
         home.join(".config/grafhome-ca/users/alice/hosts/ca-host/renewal-password.cred")
             .is_file()
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn enroll_and_renew_user_with_macos_keychain_credential() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let grant = serde_json::json!({
+        "version": 1,
+        "kind": "grafhome-user-enrollment-grant",
+        "user": "alice",
+        "host": "ca-host",
+        "ssh_public_key": "ssh-ed25519 AAAApublic test@fixture",
+        "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
+        "ca_url": "https://ca.example.test",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "token": "user-token"
+    });
+
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .args(["enroll", "user"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin(format!("user-owned-password\nGRANT:{grant}\n"))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Stored the renewal password in macOS Keychain",
+        ));
+
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .args(["renew", "user"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .args(["status", "--renewable"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env(
+            "FAKE_PROVISIONER_LIST",
+            r#"[{"name":"grafhome-user-616c696365-63612d686f7374"}]"#,
+        )
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("security interactive store"));
+    assert!(log.contains(
+        "security find args=find-generic-password -a alice@ca-host -s net.grafhome.ca.renewal -w"
+    ));
+    assert!(!log.contains("user-owned-password"));
+    assert!(!log.contains("757365722d6f776e65642d70617373776f7264"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn renew_user_reports_missing_macos_keychain_credential() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    fs::create_dir_all(&material).unwrap();
+    fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .expect("binary exists")
+        .args(["renew", "user"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no usable renewal password found in macOS Keychain for alice@ca-host",
+        ));
 }
 
 #[cfg(unix)]
