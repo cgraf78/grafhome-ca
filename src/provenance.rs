@@ -163,7 +163,13 @@ mod tests {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
         let uid = fs::metadata(dir.path()).unwrap().uid();
-        let untrusted_uid = uid.checked_add(1).expect("test uid has a successor");
+        let untrusted_uid = if uid == 0 {
+            let input = root.join("policy/user-hosts.tsv");
+            rustix::fs::chown(&input, Some(rustix::fs::Uid::from_raw(1)), None).unwrap();
+            2
+        } else {
+            uid.checked_add(1).expect("test uid has a successor")
+        };
 
         let error = validate_config_root(&root, untrusted_uid)
             .unwrap_err()
