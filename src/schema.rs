@@ -66,6 +66,14 @@ pub fn validate_config_root(config_root: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+/// Return every file that defines the site configuration and policy model.
+///
+/// Security checks and schema validation share this inventory so a newly added
+/// policy input cannot accidentally bypass privileged-command provenance checks.
+pub fn config_input_paths() -> impl Iterator<Item = &'static str> {
+    std::iter::once("config/deployment.env").chain(policy_specs().iter().map(|spec| spec.path))
+}
+
 struct PolicySpec {
     path: &'static str,
     schema: &'static str,

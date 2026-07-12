@@ -9,6 +9,7 @@ pub mod enrollment;
 pub mod error;
 pub mod model;
 pub mod policy;
+pub mod provenance;
 pub mod public_material;
 pub mod render;
 pub mod runtime_provisioners;

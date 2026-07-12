@@ -424,7 +424,7 @@ fn run() -> grafhome_ca::Result<()> {
                     dry_run,
                 },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_privileged_model(config_root)?;
             let host = resolve_host(None)?;
             apply_host_policy(&model, &host, dry_run)
         }
@@ -438,7 +438,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_privileged_model(config_root)?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -517,7 +517,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_privileged_model(config_root)?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -539,13 +539,13 @@ fn run() -> grafhome_ca::Result<()> {
                     host,
                 },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_privileged_model(config_root)?;
             revoke_user(&model, &user, host.as_deref())
         }
         Command::Revoke {
             command: RevokeCommand::Host { config_root, host },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_privileged_model(config_root)?;
             revoke_host(&model, &host)
         }
         Command::Status {
@@ -606,8 +606,22 @@ fn resolve_config_root(config_root: Option<PathBuf>) -> grafhome_ca::Result<Path
 
 fn load_valid_model(config_root: Option<PathBuf>) -> grafhome_ca::Result<SiteModel> {
     let config_root = resolve_config_root(config_root)?;
-    let model = SiteModel::load(&config_root)?;
-    grafhome_ca::schema::validate_config_root(&config_root)?;
+    load_valid_model_from_root(&config_root)
+}
+
+fn load_privileged_model(config_root: Option<PathBuf>) -> grafhome_ca::Result<SiteModel> {
+    let config_root = resolve_config_root(config_root)?;
+    #[cfg(unix)]
+    let trusted_uid = rustix::process::geteuid().as_raw();
+    #[cfg(not(unix))]
+    let trusted_uid = 0;
+    grafhome_ca::provenance::validate_config_root(&config_root, trusted_uid)?;
+    load_valid_model_from_root(&config_root)
+}
+
+fn load_valid_model_from_root(config_root: &Path) -> grafhome_ca::Result<SiteModel> {
+    let model = SiteModel::load(config_root)?;
+    grafhome_ca::schema::validate_config_root(config_root)?;
     Ok(model)
 }
 
