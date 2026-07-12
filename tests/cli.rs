@@ -188,6 +188,7 @@ case "$1 $2" in
 esac
 "#,
     );
+    write_executable(&fake_bin.join("grafhome-ca"), "#!/bin/sh\nexit 0\n");
     write_executable(
         &fake_bin.join("ssh-keygen"),
         r#"#!/bin/sh
@@ -405,6 +406,35 @@ fn help_exposes_only_supported_commands() {
         for noun in ["host", "user"] {
             assert!(text.contains(noun), "missing `{verb} {noun}` command");
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn system_host_and_ca_commands_reject_non_root_callers() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let config_root = example_config_root();
+    let commands: &[&[&str]] = &[
+        &["apply", "host", "--dry-run"],
+        &["approve", "host", "--yes"],
+        &["approve", "user", "--yes"],
+        &["enroll", "host", "--request-only"],
+        &["renew", "host"],
+        &["revoke", "host", "--host", "proxy-host"],
+        &["revoke", "user", "--user", "alice"],
+    ];
+
+    for args in commands {
+        Command::cargo_bin("grafhome-ca")
+            .unwrap()
+            .args(*args)
+            .arg("--config-root")
+            .arg(&config_root)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("must be run as root"));
     }
 }
 
@@ -1149,6 +1179,7 @@ fn approve_host_rejects_malformed_ttl_before_step_runs() {
         .arg("--yes")
         .arg("--ttl")
         .arg(".")
+        .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
         .write_stdin(format!("REQUEST:{request}\n"))
         .assert()
@@ -1705,7 +1736,7 @@ fn enroll_user_rejects_grant_for_a_substituted_renewal_jwk() {
 #[cfg(unix)]
 #[test]
 fn enroll_host_redacts_token_from_failed_step_error() {
-    let (_dir, fixture) = exec_fixture();
+    let (dir, fixture) = exec_fixture();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.args(["enroll", "host"])
@@ -1735,6 +1766,7 @@ fn enroll_host_redacts_token_from_failed_step_error() {
         .arg(&fixture.config_root)
         .arg("--host")
         .arg("proxy-host")
+        .env("GRAFHOME_CA_INSTALL_ROOT", dir.path().join("install-root"))
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
         .env("FAKE_STEP_FAIL", "ssh-certificate")

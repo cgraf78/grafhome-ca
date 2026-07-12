@@ -231,6 +231,14 @@ local account from substituting policy for a privileged invocation. On the
 documented root-run workflows, the invoking account is root, so the complete
 input chain must be root-owned.
 
+System host lifecycle commands (`enroll host`, `renew host`, and `apply host`)
+and CA mutation commands (`approve host`, `approve user`, `revoke host`, and
+`revoke user`) enforce an effective UID of root. A non-root invocation fails
+before reading enrollment input or changing state. The test suite may exercise
+these paths without root only when configuration, CA state, keys, helper tools,
+and any redirected installation targets are all confined beneath one protected
+temporary sandbox; normal site configuration cannot use that exception.
+
 This release replaces the old direct `user-login` and shared SSHPOP renewal
 flows. Site policy should use
 the `user_enrollment` provisioner role and point users at that provisioner name;

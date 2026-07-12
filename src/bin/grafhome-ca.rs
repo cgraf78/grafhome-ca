@@ -424,7 +424,7 @@ fn run() -> grafhome_ca::Result<()> {
                     dry_run,
                 },
         } => {
-            let model = load_privileged_model(config_root)?;
+            let model = load_root_model(config_root, "apply host", true)?;
             let host = resolve_host(None)?;
             apply_host_policy(&model, &host, dry_run)
         }
@@ -438,7 +438,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_privileged_model(config_root)?;
+            let model = load_root_model(config_root, "approve host", false)?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -461,7 +461,7 @@ fn run() -> grafhome_ca::Result<()> {
                     request_only,
                 },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_root_model(config_root, "enroll host", !request_only)?;
             enroll_host_flow(&model, host.as_deref(), grant_file.as_deref(), request_only)
         }
         Command::Renew {
@@ -473,7 +473,7 @@ fn run() -> grafhome_ca::Result<()> {
                     quiet,
                 },
         } => {
-            let model = load_valid_model(config_root)?;
+            let model = load_root_model(config_root, "renew host", false)?;
             let host = resolve_host(host.as_deref())?;
             if if_enrolled && !status(&model, None, Some(&host), true, true)? {
                 return Ok(());
@@ -517,7 +517,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_privileged_model(config_root)?;
+            let model = load_root_model(config_root, "approve user", false)?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -539,13 +539,13 @@ fn run() -> grafhome_ca::Result<()> {
                     host,
                 },
         } => {
-            let model = load_privileged_model(config_root)?;
+            let model = load_root_model(config_root, "revoke user", false)?;
             revoke_user(&model, &user, host.as_deref())
         }
         Command::Revoke {
             command: RevokeCommand::Host { config_root, host },
         } => {
-            let model = load_privileged_model(config_root)?;
+            let model = load_root_model(config_root, "revoke host", false)?;
             revoke_host(&model, &host)
         }
         Command::Status {
@@ -609,14 +609,123 @@ fn load_valid_model(config_root: Option<PathBuf>) -> grafhome_ca::Result<SiteMod
     load_valid_model_from_root(&config_root)
 }
 
-fn load_privileged_model(config_root: Option<PathBuf>) -> grafhome_ca::Result<SiteModel> {
+fn load_root_model(
+    config_root: Option<PathBuf>,
+    command: &str,
+    requires_install_root: bool,
+) -> grafhome_ca::Result<SiteModel> {
     let config_root = resolve_config_root(config_root)?;
     #[cfg(unix)]
     let trusted_uid = rustix::process::geteuid().as_raw();
     #[cfg(not(unix))]
     let trusted_uid = 0;
     grafhome_ca::provenance::validate_config_root(&config_root, trusted_uid)?;
+    require_root_or_isolated_test(&config_root, trusted_uid, command, requires_install_root)?;
     load_valid_model_from_root(&config_root)
+}
+
+fn require_root_or_isolated_test(
+    config_root: &Path,
+    trusted_uid: u32,
+    command: &str,
+    requires_install_root: bool,
+) -> grafhome_ca::Result<()> {
+    if trusted_uid == 0 {
+        return Ok(());
+    }
+    let config_parent = config_root.parent().ok_or_else(|| root_required(command))?;
+    let sandbox = if requires_install_root {
+        let install_root = std::env::var_os("GRAFHOME_CA_INSTALL_ROOT")
+            .map(PathBuf::from)
+            .ok_or_else(|| root_required(command))?;
+        install_root
+            .parent()
+            .ok_or_else(|| root_required(command))?
+            .to_path_buf()
+    } else {
+        config_parent.to_path_buf()
+    };
+    let sandbox = std::fs::canonicalize(&sandbox).map_err(|_| root_required(command))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = std::fs::metadata(&sandbox).map_err(|_| root_required(command))?;
+        if metadata.uid() != trusted_uid || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(root_required(command));
+        }
+    }
+
+    let config_root = std::fs::canonicalize(config_root).map_err(|_| root_required(command))?;
+    if !config_root.starts_with(&sandbox) {
+        return Err(root_required(command));
+    }
+    let deployment =
+        grafhome_ca::config::Deployment::load(config_root.join("config/deployment.env"))?;
+    for key in [
+        "GRAFHOME_CA_STATE_DIR",
+        "GRAFHOME_CA_SERVER_STEPPATH",
+        "GRAFHOME_CA_ROOT_STEP_BIN",
+        "GRAFHOME_CA_HELPER_BIN",
+        "GRAFHOME_CA_HOST_KEY_PATH",
+        "GRAFHOME_CA_PASSWORD_FILE",
+    ] {
+        let path = Path::new(&deployment.values[key]);
+        if !path.is_absolute() {
+            return Err(root_required(command));
+        }
+        let resolved = resolve_location(path).map_err(|_| root_required(command))?;
+        if !resolved.starts_with(&sandbox) {
+            return Err(root_required(command));
+        }
+    }
+    for executable in ["chmod", "chown", "ssh-keygen", "sshd", "systemctl"] {
+        let resolved = resolve_executable(executable).ok_or_else(|| root_required(command))?;
+        if !resolved.starts_with(&sandbox) {
+            return Err(root_required(command));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_executable(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+}
+
+fn resolve_location(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "path has no existing ancestor",
+            )
+        })?;
+        missing.push(name.to_owned());
+        existing = existing.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "path has no existing ancestor",
+            )
+        })?;
+    }
+    let mut resolved = std::fs::canonicalize(existing)?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn root_required(command: &str) -> grafhome_ca::Error {
+    grafhome_ca::Error::Validation {
+        field: command.to_owned(),
+        message: "must be run as root".to_owned(),
+    }
 }
 
 fn load_valid_model_from_root(config_root: &Path) -> grafhome_ca::Result<SiteModel> {
