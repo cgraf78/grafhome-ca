@@ -75,7 +75,7 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 
 Policy lives in typed TOML documents under `policy/`. Each file contains one
 array of tables named after the file with hyphens replaced by underscores. For
-example, `policy/user-hosts.toml` contains `[[user_hosts]]` entries. TOML
+example, `policy/user-remotes.toml` contains `[[user_remotes]]` entries. TOML
 comments are supported, booleans are written as `true` or `false`, endpoint
 ports are integers, and host principals are arrays:
 
@@ -83,16 +83,37 @@ ports are integers, and host principals are arrays:
 # This host accepts and initiates certificate-authenticated SSH connections.
 [[hosts]]
 host = "server-a"
-kind = "server"
 ssh_server = true
 ssh_client = true
-renewal_owner = "dot-cron"
 principals = ["server-a", "server-a.example.test"]
 ```
+
+The executable policy surface contains six files:
+
+- `endpoints.toml`: the public and origin CA endpoints
+- `hosts.toml`: enrolled machines and their host certificate principals
+- `users.toml`: certificate users and their certificate settings
+- `provisioners.toml`: CA provisioner roles and certificate lifetimes
+- `user-clients.toml`: hosts where each user may enroll and renew a certificate
+- `user-remotes.toml`: remote accounts each user may access over SSH
+
+Operational inventories such as schedulers, static keys, emergency access, and
+CA operators are intentionally outside Grafhome CA policy. The CLI does not
+enforce them, so keeping them beside executable authorization policy would give
+a misleading impression that changing them affects the CA.
 
 The schemas in `schemas/policy/` validate the complete TOML documents. Run
 `grafhome-ca check` after editing policy; commands that mutate CA or host state
 also validate policy and its filesystem provenance before proceeding.
+
+`policy/user-remotes.toml` is the sole source of SSH login authorization. Each
+active row maps one active policy user's principal to one Unix account on one
+host. A user whose `status` is `planned` or `disabled` is omitted from rendered
+authorized-principals files even if historical access rows remain active.
+
+`users.principal` and `hosts.principals` directly own the user and host
+certificate namespaces. `grafhome-ca check` rejects duplicate principals,
+including collisions between user and host certificates.
 
 `ca_origin`
 : The private CA service endpoint hosted on the CA origin host.
@@ -147,17 +168,12 @@ also validate policy and its filesystem provenance before proceeding.
 
 `root_fingerprint`
 : Public SHA-256 fingerprint of the X.509 root CA certificate. Enrollment
-  grants carry it so `grafhome-ca` can bootstrap pinned trust internally.
+  grants carry it as exactly 64 hexadecimal characters so `grafhome-ca` can
+  bootstrap pinned trust internally. A grant's CA URL must exactly match the
+  configured `ca_api` URL before bootstrap begins.
 
 `principal`
 : A name embedded in an SSH certificate and later matched by OpenSSH policy.
-
-`host_ref`
-: A host name or endpoint-derived reference used to avoid repeating resolved
-network details in policy files.
-
-`renewal_owner`
-: The local scheduler expected to renew that host's certificates.
 
 `default_ttl`, `max_ttl`, and `cert_ttl`
 : Step duration strings rendered into `ca.json` or used for enrollment. Use

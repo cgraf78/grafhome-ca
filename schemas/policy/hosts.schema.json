@@ -11,22 +11,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["host", "kind", "ssh_server", "ssh_client", "renewal_owner", "principals"],
+        "required": ["host", "ssh_server", "ssh_client", "principals"],
         "properties": {
           "host": {
             "$ref": "#/definitions/name"
-          },
-          "kind": {
-            "enum": ["server", "personal-laptop", "workstation", "vm"]
           },
           "ssh_server": {
             "type": "boolean"
           },
           "ssh_client": {
             "type": "boolean"
-          },
-          "renewal_owner": {
-            "enum": ["systemd", "dot-cron", "manual", "none"]
           },
           "principals": {
             "type": "array",

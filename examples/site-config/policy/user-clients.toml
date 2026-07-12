@@ -1,0 +1,19 @@
+[[user_clients]]
+host = "ca-host"
+user = "alice"
+status = "active"
+
+[[user_clients]]
+host = "proxy-host"
+user = "alice"
+status = "active"
+
+[[user_clients]]
+host = "edge-host"
+user = "alice"
+status = "active"
+
+[[user_clients]]
+host = "laptop-a"
+user = "alice"
+status = "active"

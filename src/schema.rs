@@ -94,44 +94,19 @@ fn policy_specs() -> &'static [PolicySpec] {
             schema_text: include_str!("../schemas/policy/users.schema.json"),
         },
         PolicySpec {
-            path: "policy/operators.toml",
-            schema: "schemas/policy/operators.schema.json",
-            schema_text: include_str!("../schemas/policy/operators.schema.json"),
-        },
-        PolicySpec {
             path: "policy/provisioners.toml",
             schema: "schemas/policy/provisioners.schema.json",
             schema_text: include_str!("../schemas/policy/provisioners.schema.json"),
         },
         PolicySpec {
-            path: "policy/client-devices.toml",
-            schema: "schemas/policy/client-devices.schema.json",
-            schema_text: include_str!("../schemas/policy/client-devices.schema.json"),
+            path: "policy/user-clients.toml",
+            schema: "schemas/policy/user-clients.schema.json",
+            schema_text: include_str!("../schemas/policy/user-clients.schema.json"),
         },
         PolicySpec {
-            path: "policy/principals.toml",
-            schema: "schemas/policy/principals.schema.json",
-            schema_text: include_str!("../schemas/policy/principals.schema.json"),
-        },
-        PolicySpec {
-            path: "policy/user-hosts.toml",
-            schema: "schemas/policy/user-hosts.schema.json",
-            schema_text: include_str!("../schemas/policy/user-hosts.schema.json"),
-        },
-        PolicySpec {
-            path: "policy/automation.toml",
-            schema: "schemas/policy/automation.schema.json",
-            schema_text: include_str!("../schemas/policy/automation.schema.json"),
-        },
-        PolicySpec {
-            path: "policy/static-keys.toml",
-            schema: "schemas/policy/static-keys.schema.json",
-            schema_text: include_str!("../schemas/policy/static-keys.schema.json"),
-        },
-        PolicySpec {
-            path: "policy/emergency-access.toml",
-            schema: "schemas/policy/emergency-access.schema.json",
-            schema_text: include_str!("../schemas/policy/emergency-access.schema.json"),
+            path: "policy/user-remotes.toml",
+            schema: "schemas/policy/user-remotes.schema.json",
+            schema_text: include_str!("../schemas/policy/user-remotes.schema.json"),
         },
     ]
 }
@@ -158,8 +133,8 @@ mod tests {
         copy_dir(&example_config_root(), dir.path());
         let hosts = dir.path().join("policy/hosts.toml");
         let text = fs::read_to_string(&hosts).unwrap().replacen(
-            "kind = \"server\"",
-            "kind = \"server\"\nlegacy_flag = true",
+            "host = \"ca-host\"",
+            "host = \"ca-host\"\nlegacy_flag = true",
             1,
         );
         fs::write(hosts, text).unwrap();

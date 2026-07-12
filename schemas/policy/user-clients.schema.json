@@ -1,35 +1,26 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/operators.schema.json",
-  "title": "operators policy",
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/user-clients.schema.json",
+  "title": "user-clients policy",
   "type": "object",
   "additionalProperties": false,
-  "required": ["operators"],
+  "required": ["user_clients"],
   "properties": {
-    "operators": {
+    "user_clients": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["user", "host_ref", "unix_account", "privilege", "status", "notes"],
+        "required": ["user", "host", "status"],
         "properties": {
           "user": {
             "$ref": "#/definitions/account"
           },
-          "host_ref": {
-            "$ref": "#/definitions/ref"
-          },
-          "unix_account": {
-            "$ref": "#/definitions/account"
-          },
-          "privilege": {
-            "enum": ["sudo", "user", "read-only"]
+          "host": {
+            "$ref": "#/definitions/name"
           },
           "status": {
             "enum": ["active", "planned", "disabled"]
-          },
-          "notes": {
-            "type": "string"
           }
         }
       }
@@ -40,7 +31,7 @@
       "type": "string",
       "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
     },
-    "ref": {
+    "name": {
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]+$"
     }

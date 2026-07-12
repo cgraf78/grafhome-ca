@@ -1,9 +1,6 @@
 [[users]]
 user = "alice"
 principal = "alice"
-unix_account = "alice"
-root_ssh = false
 provisioner = "grafhome-user-enrollment"
 cert_ttl = "24h"
 status = "active"
-notes = "example human admin; no root SSH"

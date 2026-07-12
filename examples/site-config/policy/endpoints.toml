@@ -1,19 +1,15 @@
 [[endpoints]]
 role = "ca_api"
-name = "example-ca-api"
 dns_name = "ca.example.test"
 target = "proxy-host"
-interface = "eth0"
 address = "198.51.100.21"
 port = 443
 scheme = "https"
 
 [[endpoints]]
 role = "ca_origin"
-name = "example-ca-origin"
 dns_name = "ca-origin.example.test"
 target = "ca-host"
-interface = "eth0"
 address = "198.51.100.20"
 port = 8443
 scheme = "https"
