@@ -2527,7 +2527,14 @@ fn status_reports_host_and_user_clients_from_live_ca_state() {
     let renewal_dir = home.join(".config/grafhome-ca/users/alice/hosts/proxy-host");
     fs::create_dir_all(&renewal_dir).unwrap();
     fs::write(renewal_dir.join("provisioner.priv.json"), "private\n").unwrap();
+    #[cfg(target_os = "linux")]
     fs::write(renewal_dir.join("renewal-password.cred"), "credential\n").unwrap();
+    #[cfg(target_os = "macos")]
+    fs::write(
+        format!("{}.keychain", fixture.log.display()),
+        "credential\n",
+    )
+    .unwrap();
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args([
