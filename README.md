@@ -184,6 +184,8 @@ the request without waiting. `approve user --yes` skips operator confirmation.
 Pasted requests and grants may include or omit their `REQUEST:` or `GRANT:`
 label, and surrounding whitespace is ignored. At an interactive prompt, paste
 the REQUEST or GRANT document and press Enter; `Ctrl-D` is not required.
+Interactive input bypasses the terminal's canonical line-size limit, so long
+single-line grants paste completely on macOS and Linux.
 Redirected stdin and file inputs retain read-to-EOF behavior for automation and
 formatted multiline documents, and may include copied terminal output around a
 labeled document.
