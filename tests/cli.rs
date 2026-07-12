@@ -649,6 +649,108 @@ fn apply_host_rejects_non_file_in_managed_principals_directory() {
     assert!(!log.contains("systemctl args=reload"));
 }
 
+#[cfg(unix)]
+#[test]
+fn apply_host_rejects_locally_writable_policy() {
+    let (dir, fixture) = exec_fixture();
+    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
+
+    apply_host_command(&fixture, &dir.path().join("install"))
+        .arg("--dry-run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config provenance"))
+        .stderr(predicate::str::contains("user-hosts.tsv"))
+        .stderr(predicate::str::contains("permits group or world writes"));
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_host_rejects_locally_writable_policy() {
+    let (_dir, fixture) = exec_fixture();
+    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "host", "--yes", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config provenance"))
+        .stderr(predicate::str::contains("user-hosts.tsv"));
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_user_rejects_locally_writable_policy() {
+    let (_dir, fixture) = exec_fixture();
+    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "user", "--yes", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config provenance"))
+        .stderr(predicate::str::contains("user-hosts.tsv"));
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_host_rejects_locally_writable_policy() {
+    let (_dir, fixture) = exec_fixture();
+    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config provenance"))
+        .stderr(predicate::str::contains("user-hosts.tsv"));
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_user_rejects_locally_writable_policy() {
+    let (_dir, fixture) = exec_fixture();
+    let policy = fixture.config_root.join("policy/user-hosts.tsv");
+    fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "user", "--user", "alice", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("config provenance"))
+        .stderr(predicate::str::contains("user-hosts.tsv"));
+
+    assert!(!fixture.log.exists());
+}
+
 #[test]
 fn check_rejects_legacy_sshpop_policy() {
     let dir = tempdir().unwrap();

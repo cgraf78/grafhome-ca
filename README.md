@@ -221,6 +221,16 @@ key. Smallstep accepts signing tokens only as command arguments, so executor
 errors redact token values but process listings can briefly show the child
 `step` command while certificate signing is running.
 
+Before `apply`, `approve`, or `revoke` reads policy or performs side effects,
+it verifies the filesystem provenance of every config and policy input. Every
+lexical path component, symlink, resolved target component, and input file must
+be owned by root or the invoking account and must not permit group or world
+writes. Root-owned sticky directories such as `/tmp` retain their normal Unix
+exception. This accepts protected dot-managed symlinks while preventing another
+local account from substituting policy for a privileged invocation. On the
+documented root-run workflows, the invoking account is root, so the complete
+input chain must be root-owned.
+
 This release replaces the old direct `user-login` and shared SSHPOP renewal
 flows. Site policy should use
 the `user_enrollment` provisioner role and point users at that provisioner name;
