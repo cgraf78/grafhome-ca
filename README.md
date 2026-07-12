@@ -108,6 +108,21 @@ Smallstep client state is required: the approved grant carries the CA URL and
 root fingerprint, and `grafhome-ca` creates and verifies pinned trust in its
 dedicated Smallstep state directory.
 
+On macOS, install `step` with Homebrew as the normal administrator account.
+Before root-run host enrollment, install a root-owned copy in the standard
+system path; do not run Homebrew as root:
+
+```sh
+sudo install -d -o root -g wheel -m 0755 /usr/local/bin
+sudo install -o root -g wheel -m 0755 "$(command -v step)" /usr/local/bin/step
+```
+
+Privileged operations use the configured `GRAFHOME_CA_ROOT_STEP_BIN` when it is
+available, then trusted standard system locations and `PATH`. A root process
+rejects a `step` binary, or any directory containing it, when it is writable or
+owned by another user. This prevents host enrollment from executing a
+user-controlled binary.
+
 ```sh
 # Target host as root. Leave this running after copying its REQUEST line.
 grafhome-ca enroll host
@@ -178,7 +193,13 @@ verifies renewal, and removes pending state. If any default identity file
 already exists, enrollment lists the conflicting paths and asks before
 replacing the complete key and certificate set; declining leaves every file
 unchanged. A terminated process can resume from pending state by running
-`enroll user` again. File overrides exist for automation:
+`enroll user` again. If the pending request is lost or damaged, run
+`enroll user --restart` to rebuild and print it from the existing SSH and
+renewal public keys. Host enrollment supports the equivalent root-run
+`grafhome-ca enroll host --restart`. Restarting does not replace private keys;
+run ordinary enrollment from a fresh state when new keys are required.
+
+File overrides exist for automation:
 `--request-file`, `--grant-file`, and `--password-file`; `--request-only` emits
 the request without waiting. `approve user --yes` skips operator confirmation.
 Pasted requests and grants may include or omit their `REQUEST:` or `GRANT:`

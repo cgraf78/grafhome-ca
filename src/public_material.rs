@@ -10,6 +10,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::executable::root_step_bin;
 use crate::model::SiteModel;
 use crate::policy::Host;
 use crate::render::RenderedFile;
@@ -147,17 +148,13 @@ fn read_public_text(path: &Path) -> Result<String> {
 }
 
 fn root_fingerprint(model: &SiteModel, root_cert_path: &Path) -> Result<String> {
-    let output = Command::new(&model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"])
+    let step_bin = root_step_bin(model)?;
+    let output = Command::new(&step_bin)
         .arg("certificate")
         .arg("fingerprint")
         .arg(root_cert_path)
         .output()
-        .map_err(|source| {
-            Error::io(
-                &model.deployment.values["GRAFHOME_CA_ROOT_STEP_BIN"],
-                source,
-            )
-        })?;
+        .map_err(|source| Error::io(&step_bin, source))?;
     if !output.status.success() {
         return Err(Error::Validation {
             field: "step certificate fingerprint".to_owned(),
@@ -219,12 +216,24 @@ mod tests {
     use super::collect;
 
     #[cfg(unix)]
+    fn trusted_tempdir() -> tempfile::TempDir {
+        if rustix::process::geteuid().is_root() {
+            tempfile::Builder::new()
+                .prefix(".grafhome-ca-test-")
+                .tempdir_in("/root")
+                .unwrap()
+        } else {
+            tempdir().unwrap()
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn exports_only_public_trust_material() {
         use std::os::unix::fs::PermissionsExt;
 
         let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let ca_state = temp.path().join("state");
         let step_bin = temp.path().join("fake-step");
         fs::create_dir_all(ca_state.join("step/certs")).unwrap();
@@ -295,7 +304,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let ca_state = temp.path().join("state");
         let step_bin = temp.path().join("fake-step");
         fs::create_dir_all(ca_state.join("step/certs")).unwrap();

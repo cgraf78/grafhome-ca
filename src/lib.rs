@@ -7,6 +7,7 @@
 pub mod config;
 pub mod enrollment;
 pub mod error;
+pub mod executable;
 pub mod model;
 pub mod policy;
 pub mod provenance;
