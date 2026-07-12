@@ -1016,7 +1016,7 @@ fn read_document_or_file(
             .flush()
             .map_err(|source| grafhome_ca::Error::io("<stderr>", source))?;
         if interactive {
-            value = read_interactive_document(stdin)?;
+            value = read_interactive_terminal_document()?;
         } else {
             stdin
                 .read_to_string(&mut value)
@@ -1033,24 +1033,121 @@ fn read_document_or_file(
     Ok(value)
 }
 
-/// Read through the first complete enrollment document from a terminal.
-///
-/// Generated enrollment documents fit on one line, so normal paste-and-Enter
-/// input returns immediately. Continuing while JSON is incomplete preserves
-/// support for manually formatted multiline documents without requiring an EOF
-/// keystroke on the normal path.
-fn read_interactive_document(stdin: &mut impl BufRead) -> grafhome_ca::Result<String> {
-    let mut value = String::new();
+/// Read through the first complete enrollment document from a byte stream.
+#[cfg(test)]
+fn read_interactive_document(stdin: &mut impl Read) -> grafhome_ca::Result<String> {
+    read_terminal_document(stdin, None, None)
+}
+
+/// Read a pasted document without the kernel's canonical line-size limit.
+fn read_interactive_terminal_document() -> grafhome_ca::Result<String> {
+    let mut terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|source| grafhome_ca::Error::io("/dev/tty", source))?;
+    let mode = NoncanonicalTerminalMode::enter(&terminal)?;
+    let result = read_terminal_document(
+        &mut terminal,
+        Some(mode.interrupt_byte),
+        Some(mode.eof_byte),
+    );
+    drop(mode);
+    result
+}
+
+/// Restores terminal settings when document input finishes or unwinds.
+struct NoncanonicalTerminalMode {
+    terminal: rustix::fd::OwnedFd,
+    original: rustix::termios::Termios,
+    interrupt_byte: u8,
+    eof_byte: u8,
+}
+
+impl NoncanonicalTerminalMode {
+    fn enter(terminal: &std::fs::File) -> grafhome_ca::Result<Self> {
+        use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex};
+
+        let original = rustix::termios::tcgetattr(terminal)
+            .map_err(|source| grafhome_ca::Error::io("terminal attributes", source.into()))?;
+        let interrupt_byte = original.special_codes[SpecialCodeIndex::VINTR];
+        let eof_byte = original.special_codes[SpecialCodeIndex::VEOF];
+        let terminal = rustix::io::dup(terminal)
+            .map_err(|source| grafhome_ca::Error::io("/dev/tty", source.into()))?;
+        let mut noncanonical = original.clone();
+        noncanonical
+            .local_modes
+            .remove(LocalModes::ICANON | LocalModes::ISIG);
+        noncanonical.special_codes[SpecialCodeIndex::VMIN] = 1;
+        noncanonical.special_codes[SpecialCodeIndex::VTIME] = 0;
+        rustix::termios::tcsetattr(&terminal, OptionalActions::Now, &noncanonical)
+            .map_err(|source| grafhome_ca::Error::io("terminal attributes", source.into()))?;
+        Ok(Self {
+            terminal,
+            original,
+            interrupt_byte,
+            eof_byte,
+        })
+    }
+}
+
+impl Drop for NoncanonicalTerminalMode {
+    fn drop(&mut self) {
+        let _ = rustix::termios::tcsetattr(
+            &self.terminal,
+            rustix::termios::OptionalActions::Now,
+            &self.original,
+        );
+    }
+}
+
+fn read_terminal_document(
+    input: &mut impl Read,
+    interrupt_byte: Option<u8>,
+    eof_byte: Option<u8>,
+) -> grafhome_ca::Result<String> {
+    let mut value = Vec::new();
+    let mut complete = false;
+    // Avoid consuming bytes after the terminating Enter. They belong to the
+    // shell or to a later prompt, not to this document.
+    let mut buffer = [0_u8; 1];
     loop {
-        let bytes_read = stdin
-            .read_line(&mut value)
+        let bytes_read = input
+            .read(&mut buffer)
             .map_err(|source| grafhome_ca::Error::io("<stdin>", source))?;
-        if bytes_read == 0
-            || parse_enrollment_document::<serde_json::Value>(&value, "<stdin>").is_ok()
-        {
-            return Ok(value);
+        if bytes_read == 0 {
+            break;
+        }
+        for byte in &buffer[..bytes_read] {
+            if Some(*byte) == interrupt_byte {
+                return Err(grafhome_ca::Error::io(
+                    "<stdin>",
+                    std::io::Error::new(std::io::ErrorKind::Interrupted, "input interrupted"),
+                ));
+            }
+            if Some(*byte) == eof_byte {
+                return terminal_document_string(value);
+            }
+            if complete && matches!(*byte, b'\r' | b'\n') {
+                value.push(*byte);
+                return terminal_document_string(value);
+            }
+            value.push(*byte);
+            if *byte == b'}' {
+                complete = std::str::from_utf8(&value).is_ok_and(|text| {
+                    parse_enrollment_document::<serde_json::Value>(text, "<stdin>").is_ok()
+                });
+            }
         }
     }
+    terminal_document_string(value)
+}
+
+fn terminal_document_string(value: Vec<u8>) -> grafhome_ca::Result<String> {
+    String::from_utf8(value).map_err(|error| grafhome_ca::Error::Validation {
+        field: "<stdin>".to_owned(),
+        message: format!("input was not valid UTF-8: {error}"),
+    })
 }
 
 fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Result<&'a Endpoint> {
@@ -3588,15 +3685,16 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::io::{BufRead, Cursor};
+    use std::fs::{self, File};
+    use std::io::{BufRead, Cursor, Write};
     use std::path::PathBuf;
+    use std::thread;
 
     use tempfile::tempdir;
 
     use super::{
-        parse_enrollment_document, read_interactive_document, replace_existing_user_identity,
-        validate_grant_ca_url,
+        NoncanonicalTerminalMode, parse_enrollment_document, read_interactive_document,
+        read_terminal_document, replace_existing_user_identity, validate_grant_ca_url,
     };
 
     #[test]
@@ -3707,6 +3805,65 @@ mod tests {
         let document = read_interactive_document(&mut input).unwrap();
 
         assert_eq!(document, "copy this line:\nREQUEST: {\"version\": 1}\n");
+    }
+
+    #[test]
+    fn noncanonical_terminal_reads_document_larger_than_macos_line_limit() {
+        use rustix::termios::LocalModes;
+
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let mut terminal = File::from(pty.user);
+        let controller = File::from(pty.controller);
+        let mut original = rustix::termios::tcgetattr(&terminal).unwrap();
+        assert!(original.local_modes.contains(LocalModes::ICANON));
+        original.local_modes.remove(LocalModes::ECHO);
+        rustix::termios::tcsetattr(&terminal, rustix::termios::OptionalActions::Now, &original)
+            .unwrap();
+        let mode = NoncanonicalTerminalMode::enter(&terminal).unwrap();
+        let payload = "x".repeat(2_048);
+        let document = format!("GRANT:{{\"token\":\"{payload}\"}}");
+        let pasted = format!("{document}\n");
+        let mut writer = controller.try_clone().unwrap();
+        let pasted_for_writer = pasted.clone();
+        let writer = thread::spawn(move || writer.write_all(pasted_for_writer.as_bytes()).unwrap());
+
+        let actual = read_terminal_document(
+            &mut terminal,
+            Some(mode.interrupt_byte),
+            Some(mode.eof_byte),
+        )
+        .unwrap();
+        drop(mode);
+        writer.join().unwrap();
+
+        assert_eq!(actual, pasted);
+        let restored = rustix::termios::tcgetattr(&terminal).unwrap();
+        assert!(restored.local_modes.contains(LocalModes::ICANON));
+    }
+
+    #[test]
+    fn interrupted_noncanonical_terminal_restores_original_mode() {
+        use rustix::termios::LocalModes;
+
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let mut terminal = File::from(pty.user);
+        let mut controller = File::from(pty.controller);
+        let original = rustix::termios::tcgetattr(&terminal).unwrap();
+        assert!(original.local_modes.contains(LocalModes::ICANON));
+        let mode = NoncanonicalTerminalMode::enter(&terminal).unwrap();
+        controller.write_all(&[mode.interrupt_byte]).unwrap();
+
+        let error = read_terminal_document(
+            &mut terminal,
+            Some(mode.interrupt_byte),
+            Some(mode.eof_byte),
+        )
+        .unwrap_err();
+        drop(mode);
+
+        assert!(error.to_string().contains("input interrupted"));
+        let restored = rustix::termios::tcgetattr(&terminal).unwrap();
+        assert!(restored.local_modes.contains(LocalModes::ICANON));
     }
 
     #[test]
