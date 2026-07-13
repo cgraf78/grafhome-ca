@@ -1,11 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
-# Run the suite natively under Android/Bionic, then exercise the shipped CLI
-# against the public fixture tree rather than stopping at compile coverage.
-pkg update -y
-pkg install -y git rust
-export CARGO_BUILD_JOBS=1
-export RUST_MIN_STACK=268435456
-cargo test --locked --lib
-cargo run --locked --bin grafhome-ca -- check --config-root examples/site-config
+# The standard matrix owns the full test suite. Execute the NDK-built Android
+# binary against the public fixture tree inside the real Termux app sandbox.
+.termux-ci/grafhome-ca check --config-root examples/site-config

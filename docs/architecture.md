@@ -28,8 +28,9 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
   including Android/Bionic aarch64 builds for Termux.
 
 Hosted Linux CI checks Android archives structurally (AArch64 ELF plus the
-Bionic interpreter). Executing `version` and `help` remains a post-release
-Termux smoke because the hosted runner cannot launch Android binaries.
+Bionic interpreter). A separate x86_64 Android build runs `check` against the
+public fixture tree inside the official Termux app, while the AArch64 release
+artifact retains structural cross-build coverage.
 
 ## Safety Contract
 
