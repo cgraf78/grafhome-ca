@@ -10,6 +10,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// Policy sentinel for an effectively unlimited certificate lifetime.
+pub const UNLIMITED_TTL: &str = "unlimited";
+
+/// Largest whole-hour duration supported by Go's `time.Duration`.
+pub const STEP_EFFECTIVE_UNLIMITED_TTL: &str = "2562047h";
+
+/// Convert a policy maximum into the duration accepted by Smallstep.
+#[must_use]
+pub fn step_max_ttl(max_ttl: &str) -> &str {
+    if max_ttl == UNLIMITED_TTL {
+        STEP_EFFECTIVE_UNLIMITED_TTL
+    } else {
+        max_ttl
+    }
+}
+
 /// Endpoint entry from `policy/endpoints.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -308,12 +324,21 @@ impl Policy {
                 "default_ttl",
                 &provisioner.default_ttl,
             )?;
-            validate_step_duration(
-                "policy/provisioners.toml",
-                &provisioner.role,
-                "max_ttl",
-                &provisioner.max_ttl,
-            )?;
+            if provisioner.max_ttl == UNLIMITED_TTL {
+                if provisioner.role != "user_enrollment" {
+                    return Err(Error::Validation {
+                        field: format!("policy/provisioners.toml:{}.max_ttl", provisioner.role),
+                        message: "unlimited is supported only for user_enrollment".to_owned(),
+                    });
+                }
+            } else {
+                validate_step_duration(
+                    "policy/provisioners.toml",
+                    &provisioner.role,
+                    "max_ttl",
+                    &provisioner.max_ttl,
+                )?;
+            }
         }
 
         // Certificate principals share one Smallstep namespace. A collision
@@ -698,6 +723,21 @@ mod tests {
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
         assert!(error.contains("step-ca durations must use Go-style"));
+    }
+
+    #[test]
+    fn rejects_unlimited_maximum_for_non_user_provisioner() {
+        let (dir, policy_dir) = copy_policy();
+        let provisioners = policy_dir.join("provisioners.toml");
+        let text = fs::read_to_string(&provisioners).unwrap().replacen(
+            "max_ttl = \"720h\"",
+            "max_ttl = \"unlimited\"",
+            1,
+        );
+        fs::write(&provisioners, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("unlimited is supported only for user_enrollment"));
     }
 
     fn copy_policy() -> (tempfile::TempDir, std::path::PathBuf) {

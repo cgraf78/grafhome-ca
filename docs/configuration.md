@@ -185,3 +185,7 @@ including collisions between user and host certificates.
 `default_ttl`, `max_ttl`, and `cert_ttl`
 : Step duration strings rendered into `ca.json` or used for enrollment. Use
   Go-style `s`, `m`, or `h` units such as `24h`, `168h`, or `720h`; do not use `d`.
+  `max_ttl` may be `unlimited` only for the `user_enrollment` provisioner.
+  Smallstep requires a positive finite maximum, so Grafhome renders this as
+  `2562047h`, the largest whole-hour Go duration (roughly 292 years). The
+  configured user `cert_ttl` remains the default lifetime for normal issuance.

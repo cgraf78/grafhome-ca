@@ -11,7 +11,7 @@ role = "user_enrollment"
 name = "grafhome-user-enrollment"
 type = "JWK"
 default_ttl = "24h"
-max_ttl = "168h"
+max_ttl = "unlimited"
 status = "active"
 
 [[provisioners]]
