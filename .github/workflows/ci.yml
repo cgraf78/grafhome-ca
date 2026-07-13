@@ -19,13 +19,21 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
       clippy-command: cargo clippy --locked --all-targets --all-features -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
+      termux-command: scripts/termux-ci.sh
+      termux-host-command: |
+        target_dir="$RUNNER_TEMP/grafhome-ca-termux-target"
+        cargo build --release --locked --target "$RUST_TARGET" --target-dir "$target_dir"
+        mkdir -p .termux-ci
+        install -m 0755 \
+          "$target_dir/$RUST_TARGET/release/grafhome-ca" \
+          .termux-ci/grafhome-ca
       package-smoke-setup-command: |
         if [[ "$RUNNER_OS" == "Linux" ]]; then
           rustup target add x86_64-unknown-linux-musl
@@ -37,7 +45,7 @@ jobs:
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       profiles: base,shellcheck
       test-command: tests/shell/release-scripts-test
