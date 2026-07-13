@@ -144,6 +144,55 @@ fn reconcile_object(current: &mut Map<String, Value>, desired: Map<String, Value
     changed
 }
 
+/// Install the exact constrained state for one Grafhome-owned scoped provisioner.
+fn upsert_scoped_provisioner(
+    provisioners: &mut Vec<Value>,
+    desired: Value,
+    ca_json: &Path,
+) -> Result<()> {
+    let name = desired
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: "desired scoped provisioner must have a string name".to_owned(),
+        })?
+        .to_owned();
+    let matching = provisioners
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.get("name").and_then(Value::as_str) == Some(&name))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    let index = match matching.as_slice() {
+        [] => {
+            provisioners.push(desired);
+            return Ok(());
+        }
+        [index] => *index,
+        _ => {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("provisioner {name} appears more than once"),
+            });
+        }
+    };
+    let existing = &mut provisioners[index];
+
+    if existing.get("key") != desired.get("key") {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("provisioner {name} already exists with a different public key"),
+        });
+    }
+
+    // Public-key equality proves this is the same scoped identity. Replace the full object so
+    // stale claims, encrypted signing keys, webhooks, or templates cannot broaden its authority.
+    *existing = desired;
+    Ok(())
+}
+
 /// Replace rendered JWK placeholders with runtime-generated provisioner objects.
 pub fn materialize(
     model: &SiteModel,
@@ -209,7 +258,10 @@ pub fn materialize(
     })
 }
 
-/// Add one constrained per-user/per-host JWK provisioner to an existing CA config.
+/// Add or reconcile one constrained user/client-host JWK provisioner.
+///
+/// An existing provisioner with the same name and key is replaced with exact managed state.
+/// Different keys or duplicate names are rejected without changing the serialized config.
 pub fn add_user_client(
     ca_json: impl AsRef<Path>,
     public_key: impl AsRef<Path>,
@@ -223,31 +275,9 @@ pub fn add_user_client(
     let mut config = read_json(ca_json)?;
     let key = read_public_jwk(public_key)?;
     let template = read_text(Path::new(template_file))?;
-    let provisioners = config
-        .pointer_mut("/authority/provisioners")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| Error::Validation {
-            field: format!("{}:authority.provisioners", ca_json.display()),
-            message: "expected provisioners array".to_owned(),
-        })?;
+    let provisioners = provisioners_mut(&mut config, ca_json)?;
 
-    if let Some(existing) = provisioners
-        .iter()
-        .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
-    {
-        if existing.get("key") == Some(&key) {
-            return serde_json::to_string_pretty(&config).map_err(|source| Error::Json {
-                path: ca_json.to_path_buf(),
-                source,
-            });
-        }
-        return Err(Error::Validation {
-            field: format!("{}:authority.provisioners", ca_json.display()),
-            message: format!("provisioner {name} already exists with a different public key"),
-        });
-    }
-
-    provisioners.push(json!({
+    let desired = json!({
         "type": "JWK",
         "name": name,
         "key": key,
@@ -264,15 +294,16 @@ pub fn add_user_client(
                 "template": template,
             },
         },
-    }));
+    });
+    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
 
-    serde_json::to_string_pretty(&config).map_err(|source| Error::Json {
-        path: ca_json.to_path_buf(),
-        source,
-    })
+    serialize_config(config, ca_json)
 }
 
-/// Add one constrained per-host JWK provisioner to an existing CA config.
+/// Add or reconcile one constrained host JWK provisioner.
+///
+/// An existing provisioner with the same name and key is replaced with exact managed state.
+/// Different keys or duplicate names are rejected without changing the serialized config.
 pub fn add_host(
     ca_json: impl AsRef<Path>,
     public_key: impl AsRef<Path>,
@@ -290,20 +321,7 @@ pub fn add_host(
     // A retained SSHPOP provisioner would bypass host-scoped revocation.
     provisioners.retain(|item| item.get("type").and_then(Value::as_str) != Some("SSHPOP"));
 
-    if let Some(existing) = provisioners
-        .iter()
-        .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
-    {
-        if existing.get("key") == Some(&key) {
-            return serialize_config(config, ca_json);
-        }
-        return Err(Error::Validation {
-            field: format!("{}:authority.provisioners", ca_json.display()),
-            message: format!("provisioner {name} already exists with a different public key"),
-        });
-    }
-
-    provisioners.push(json!({
+    let desired = json!({
         "type": "JWK",
         "name": name,
         "key": key,
@@ -316,7 +334,8 @@ pub fn add_host(
             "x509": { "template": HOST_X509_DENY_TEMPLATE },
             "ssh": { "template": template },
         },
-    }));
+    });
+    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
 }
@@ -735,6 +754,127 @@ mod tests {
     }
 
     #[test]
+    fn replaces_existing_user_client_provisioner_with_same_key() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        fs::write(
+            &ca_json,
+            serde_json::to_vec_pretty(&json!({
+                "authority": {
+                    "provisioners": [
+                        {"type": "ACME", "name": "preserve-before", "claims": {"x": 1}},
+                        {
+                            "type": "JWK",
+                            "name": "grafhome-user-alice-ca-host",
+                            "key": {"kid": "client-kid", "kty": "EC"},
+                            "claims": {
+                                "defaultUserSSHCertDuration": "12h",
+                                "maxUserSSHCertDuration": "168h",
+                                "enableSSHCA": false,
+                                "disableRenewal": true
+                            },
+                            "options": {
+                                "x509": {"template": "stale-x509", "webhooks": ["remove"]},
+                                "ssh": {"template": "stale-ssh", "templateFile": "remove.tpl"}
+                            },
+                            "encryptedKey": "remove-step-state"
+                        },
+                        {"type": "OIDC", "name": "preserve-after", "options": {"x": 2}}
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
+
+        let text = add_user_client(
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+            "24h",
+            "unlimited",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let provisioners = value["authority"]["provisioners"].as_array().unwrap();
+        let provisioner = provisioners
+            .iter()
+            .find(|item| item["name"] == "grafhome-user-alice-ca-host")
+            .unwrap();
+
+        assert_eq!(provisioners.len(), 3);
+        assert_eq!(
+            provisioners[0],
+            json!({"type": "ACME", "name": "preserve-before", "claims": {"x": 1}})
+        );
+        assert_eq!(
+            provisioners[2],
+            json!({"type": "OIDC", "name": "preserve-after", "options": {"x": 2}})
+        );
+        assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
+        assert_eq!(
+            provisioner["claims"]["maxUserSSHCertDuration"],
+            crate::policy::STEP_EFFECTIVE_UNLIMITED_TTL
+        );
+        assert_eq!(provisioner["claims"]["enableSSHCA"], true);
+        assert!(
+            provisioner["claims"]
+                .as_object()
+                .unwrap()
+                .get("disableRenewal")
+                .is_none()
+        );
+        assert_eq!(
+            provisioner["options"]["x509"]["template"],
+            USER_CLIENT_X509_DENY_TEMPLATE
+        );
+        assert!(
+            provisioner["options"]["x509"]
+                .as_object()
+                .unwrap()
+                .get("webhooks")
+                .is_none()
+        );
+        assert_eq!(
+            provisioner["options"]["ssh"]["template"],
+            r#"{"type":"user","principals":["alice"]}"#
+        );
+        assert!(
+            provisioner["options"]["ssh"]
+                .as_object()
+                .unwrap()
+                .get("templateFile")
+                .is_none()
+        );
+        assert!(
+            provisioner
+                .as_object()
+                .unwrap()
+                .get("encryptedKey")
+                .is_none()
+        );
+
+        fs::write(&ca_json, &text).unwrap();
+        assert_eq!(
+            add_user_client(
+                &ca_json,
+                &public_key,
+                "grafhome-user-alice-ca-host",
+                template.to_str().unwrap(),
+                "24h",
+                "unlimited",
+            )
+            .unwrap(),
+            text
+        );
+    }
+
+    #[test]
     fn adds_host_provisioner_without_user_ssh_claims() {
         let dir = tempdir().unwrap();
         let ca_json = dir.path().join("ca.json");
@@ -772,6 +912,153 @@ mod tests {
             provisioner["options"]["x509"]["template"],
             HOST_X509_DENY_TEMPLATE
         );
+    }
+
+    #[test]
+    fn replaces_existing_host_provisioner_with_same_key() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        fs::write(
+            &ca_json,
+            serde_json::to_vec_pretty(&json!({
+                "authority": {
+                    "provisioners": [{
+                        "type": "JWK",
+                        "name": "grafhome-host-edge",
+                        "key": {"kid": "host-kid", "kty": "EC"},
+                        "claims": {
+                            "defaultHostSSHCertDuration": "24h",
+                            "maxHostSSHCertDuration": "168h",
+                            "enableSSHCA": false,
+                            "disableRenewal": true
+                        },
+                        "options": {
+                            "x509": {"template": "stale-x509"},
+                            "ssh": {"template": "stale-ssh", "webhooks": ["preserve"]}
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"host-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("host.tpl");
+        fs::write(&template, r#"{"type":"host","principals":["edge"]}"#).unwrap();
+
+        let text = add_host(
+            &ca_json,
+            &public_key,
+            "grafhome-host-edge",
+            template.to_str().unwrap(),
+            "168h",
+            "720h",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let provisioner = &value["authority"]["provisioners"][0];
+
+        assert_eq!(provisioner["claims"]["defaultHostSSHCertDuration"], "168h");
+        assert_eq!(provisioner["claims"]["maxHostSSHCertDuration"], "720h");
+        assert_eq!(provisioner["claims"]["enableSSHCA"], true);
+        assert!(
+            provisioner["claims"]
+                .as_object()
+                .unwrap()
+                .get("disableRenewal")
+                .is_none()
+        );
+        assert_eq!(
+            provisioner["options"]["x509"]["template"],
+            HOST_X509_DENY_TEMPLATE
+        );
+        assert_eq!(
+            provisioner["options"]["ssh"]["template"],
+            r#"{"type":"host","principals":["edge"]}"#
+        );
+        assert!(
+            provisioner["options"]["ssh"]
+                .as_object()
+                .unwrap()
+                .get("webhooks")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_existing_user_client_provisioner_with_different_key() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"other","kty":"EC"}}]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, "user-template").unwrap();
+
+        let error = add_user_client(
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+            "24h",
+            "unlimited",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("different public key"));
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+    }
+
+    #[test]
+    fn rejects_existing_host_provisioner_with_different_key() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-edge","key":{"kid":"other","kty":"EC"}}]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"host-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("host.tpl");
+        fs::write(&template, "host-template").unwrap();
+
+        let error = add_host(
+            &ca_json,
+            &public_key,
+            "grafhome-host-edge",
+            template.to_str().unwrap(),
+            "168h",
+            "720h",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("different public key"));
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+    }
+
+    #[test]
+    fn rejects_duplicate_scoped_provisioner_names() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"client-kid","kty":"EC"}},{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"client-kid","kty":"EC"}}]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, "user-template").unwrap();
+
+        let error = add_user_client(
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+            "24h",
+            "unlimited",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("appears more than once"));
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
     }
 
     #[test]
