@@ -199,8 +199,13 @@ successfully without output when enrollment or local renewal material is
 absent. Grafhome's private dotfiles install these jobs every eight hours. User
 enrollment stores the password in macOS Keychain on macOS. On Linux it uses an
 encrypted systemd user credential and also stores the password in Secret
-Service when available. `renew user` reads the corresponding platform store
-for unattended renewal. Other deployments must provide equivalent scheduling.
+Service when available. On Android/Termux it uses an owner-only file within
+Termux's app-private data directory, which Android isolates from other apps and
+Termux excludes from Android backup. This Android credential is not separately
+application-encrypted; processes already running as the Termux app user can
+read it, just as they can use the unencrypted OpenSSH identity stored beside
+it. `renew user` reads the corresponding platform store for unattended renewal.
+Other deployments must provide equivalent scheduling.
 
 `enroll user` generates the SSH and renewal keys, stores the renewal password,
 prints the public request, and waits for the grant. After the grant is pasted,
