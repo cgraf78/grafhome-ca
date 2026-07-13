@@ -50,5 +50,13 @@ test -d "$smoke/schemas"
 test -d "$smoke/templates"
 test -d "$smoke/examples"
 
+if [[ "$asset_platform" == "android-aarch64" ]]; then
+  # The Android artifact is cross-built on an x86_64 runner. Validate its
+  # architecture and Bionic loader without trying to execute it on glibc.
+  readelf -h "$smoke/bin/grafhome-ca" | grep -Eq 'Machine:[[:space:]]+AArch64'
+  readelf -l "$smoke/bin/grafhome-ca" | grep -Fq '/system/bin/linker64'
+  exit 0
+fi
+
 "$smoke/bin/grafhome-ca" version
 "$smoke/bin/grafhome-ca" help >/dev/null

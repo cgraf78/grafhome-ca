@@ -48,3 +48,40 @@ if "$repo_root/scripts/smoke-release.sh" x86_64-unknown-linux-musl >/dev/null 2>
   exit 1
 fi
 assert_contains 'public release label' "$tmp/smoke.err"
+
+android_smoke="$tmp/android-smoke"
+mkdir -p "$android_smoke/scripts" "$android_smoke/dist" \
+  "$android_smoke/stage/bin" "$android_smoke/stage/schemas" \
+  "$android_smoke/stage/templates" "$android_smoke/stage/examples"
+cp "$repo_root/scripts/smoke-release.sh" "$android_smoke/scripts/smoke-release.sh"
+cat >"$android_smoke/scripts/release-tag.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'unused\n'
+SH
+chmod +x "$android_smoke/scripts/release-tag.sh"
+printf '#!/system/bin/sh\n' >"$android_smoke/stage/bin/grafhome-ca"
+chmod +x "$android_smoke/stage/bin/grafhome-ca"
+printf '{}\n' >"$android_smoke/stage/.grafhome-ca-install.json"
+android_tag=20990207-080910-abcdef12
+printf '%s\n' "$android_tag" >"$android_smoke/dist/.grafhome-ca-release-version"
+tar -C "$android_smoke/stage" -czf \
+  "$android_smoke/dist/grafhome-ca-${android_tag}-android-aarch64.tar.gz" .
+android_bin="$tmp/android-bin"
+mkdir -p "$android_bin"
+cat >"$android_bin/readelf" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$ANDROID_READELF_LOG"
+case "$1" in
+  -h) printf '  Machine:                           AArch64\n' ;;
+  -l) printf '      [Requesting program interpreter: /system/bin/linker64]\n' ;;
+  *) exit 2 ;;
+esac
+SH
+chmod +x "$android_bin/readelf"
+(
+  cd "$android_smoke"
+  ANDROID_READELF_LOG="$android_smoke/readelf.log" \
+    PATH="$android_bin:$PATH" scripts/smoke-release.sh android-aarch64
+)
+assert_contains '-h' "$android_smoke/readelf.log"
+assert_contains '-l' "$android_smoke/readelf.log"
