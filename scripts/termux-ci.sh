@@ -6,6 +6,6 @@ set -euo pipefail
 pkg update -y
 pkg install -y git rust
 export CARGO_BUILD_JOBS=1
-export RUST_MIN_STACK=67108864
+export RUST_MIN_STACK=268435456
 cargo test --locked --lib
 cargo run --locked --bin grafhome-ca -- check --config-root examples/site-config
