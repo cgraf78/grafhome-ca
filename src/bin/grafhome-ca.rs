@@ -1574,17 +1574,7 @@ fn validate_user_identity_pair(private_key: &Path, public_key: &Path) -> grafhom
     let derived = run_capture(process("ssh-keygen").arg("-y").arg("-f").arg(private_key))?;
     let configured = std::fs::read_to_string(public_key)
         .map_err(|source| grafhome_ca::Error::io(public_key, source))?;
-    let derived_fields: Vec<_> = String::from_utf8_lossy(&derived)
-        .split_whitespace()
-        .take(2)
-        .map(ToOwned::to_owned)
-        .collect();
-    let configured_fields: Vec<_> = configured
-        .split_whitespace()
-        .take(2)
-        .map(ToOwned::to_owned)
-        .collect();
-    if derived_fields.len() != 2 || derived_fields != configured_fields {
+    if !ssh_public_keys_match(&String::from_utf8_lossy(&derived), &configured) {
         return Err(grafhome_ca::Error::Validation {
             field: "user enrollment SSH identity".to_owned(),
             message: format!(
@@ -1595,6 +1585,12 @@ fn validate_user_identity_pair(private_key: &Path, public_key: &Path) -> grafhom
         });
     }
     Ok(())
+}
+
+fn ssh_public_keys_match(derived: &str, configured: &str) -> bool {
+    let derived_fields: Vec<_> = derived.split_whitespace().take(2).collect();
+    let configured_fields: Vec<_> = configured.split_whitespace().take(2).collect();
+    derived_fields.len() == 2 && derived_fields == configured_fields
 }
 
 fn choose_existing_user_identity(
@@ -3949,7 +3945,6 @@ mod tests {
     use std::fs::{self, File};
     use std::io::{BufRead, Cursor, Write};
     use std::path::PathBuf;
-    use std::process::Command;
     use std::thread;
 
     use tempfile::tempdir;
@@ -3957,7 +3952,7 @@ mod tests {
     use super::{
         ExistingIdentityChoice, NoncanonicalTerminalMode, parse_enrollment_document,
         prepare_existing_user_identity, read_interactive_document, read_terminal_document,
-        validate_grant_ca_url, validate_user_identity_pair,
+        ssh_public_keys_match, validate_grant_ca_url,
     };
 
     #[test]
@@ -4076,41 +4071,20 @@ mod tests {
     }
 
     #[test]
-    fn identity_pair_validation_accepts_matching_openssh_keys() {
-        let dir = tempdir().unwrap();
-        let private = dir.path().join("id_ed25519");
-        assert!(
-            Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-                .arg(&private)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        validate_user_identity_pair(&private, &private.with_extension("pub")).unwrap();
+    fn identity_pair_validation_accepts_matching_keys_with_different_comments() {
+        assert!(ssh_public_keys_match(
+            "ssh-ed25519 AAAAkey derived-comment\n",
+            "ssh-ed25519 AAAAkey configured-comment\n"
+        ));
     }
 
     #[test]
-    fn identity_pair_validation_rejects_a_mismatched_public_key() {
-        let dir = tempdir().unwrap();
-        let private = dir.path().join("id_ed25519");
-        assert!(
-            Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-                .arg(&private)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let public = private.with_extension("pub");
-        fs::write(&public, "ssh-ed25519 AAAAmismatched test\n").unwrap();
-
-        let error = validate_user_identity_pair(&private, &public)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("does not match"));
+    fn identity_pair_validation_rejects_mismatched_or_malformed_keys() {
+        assert!(!ssh_public_keys_match(
+            "ssh-ed25519 AAAAderived\n",
+            "ssh-ed25519 AAAAconfigured\n"
+        ));
+        assert!(!ssh_public_keys_match("ssh-ed25519", "ssh-ed25519"));
     }
 
     #[test]
