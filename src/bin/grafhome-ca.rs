@@ -17,11 +17,10 @@ use grafhome_ca::enrollment::{
     parse_host_provisioner_name, parse_user_provisioner_name, user_provisioner_host_suffix,
     user_provisioner_name, user_provisioner_prefix,
 };
-use grafhome_ca::executable::root_step_bin;
+use grafhome_ca::executable::{root_step_bin, user_step_bin};
 use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{Endpoint, Host, Provisioner, User, UserClient};
 
-const USER_STEP_BIN: &str = "step";
 const USER_KEY_NAME: &str = "id_ed25519";
 const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
 const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
@@ -1672,9 +1671,10 @@ fn ensure_user_keys(
     let public_jwk = material_dir.join("provisioner.pub.json");
     let private_jwk = material_dir.join("provisioner.priv.json");
     if !private_jwk.exists() {
+        let step_bin = user_step_bin()?;
         with_password_file(&material_dir, password, |password_file| {
             run_status(
-                process(USER_STEP_BIN)
+                process(&step_bin)
                     .arg("crypto")
                     .arg("jwk")
                     .arg("create")
@@ -1745,10 +1745,11 @@ fn validate_renewal_password(
     private_jwk: &Path,
     password: &str,
 ) -> grafhome_ca::Result<()> {
+    let step_bin = user_step_bin()?;
     with_password_file(material_dir, password, |password_file| {
         let input = std::fs::File::open(private_jwk)
             .map_err(|source| grafhome_ca::Error::io(private_jwk, source))?;
-        let output = process(USER_STEP_BIN)
+        let output = process(&step_bin)
             .arg("crypto")
             .arg("jwe")
             .arg("decrypt")
@@ -1756,7 +1757,7 @@ fn validate_renewal_password(
             .arg(password_file)
             .stdin(Stdio::from(input))
             .output()
-            .map_err(|source| grafhome_ca::Error::io(USER_STEP_BIN, source))?;
+            .map_err(|source| grafhome_ca::Error::io(&step_bin, source))?;
         if !output.status.success() {
             return Err(grafhome_ca::Error::Validation {
                 field: "renewal password".to_owned(),
@@ -1878,8 +1879,9 @@ fn enroll_user_flow(
         });
     }
     validate_grant_ca_url(model, &grant.ca_url, "user enrollment grant")?;
+    let step_bin = user_step_bin()?;
     bootstrap_trust(
-        USER_STEP_BIN,
+        &step_bin,
         &user_steppath(model)?,
         &grant.ca_url,
         &grant.root_fingerprint,
@@ -2824,13 +2826,14 @@ fn issue_user_certificate(
     host: &str,
     token: &str,
 ) -> grafhome_ca::Result<()> {
+    let step_bin = user_step_bin()?;
     let user = active_user(model, user_name)?;
     required_user_client(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let public_key = user_public_key_path()?;
     let cert = user_cert_path()?;
     run_status_redacted(
-        process(USER_STEP_BIN)
+        process(&step_bin)
             .env("STEPPATH", user_steppath(model)?)
             .arg("ssh")
             .arg("certificate")
@@ -3188,7 +3191,7 @@ fn remote_provisioner_names(
         });
     };
     let step_bin = if user_owned {
-        USER_STEP_BIN.to_owned()
+        user_step_bin()?
     } else {
         root_step_bin(model)?
     };
@@ -3442,6 +3445,7 @@ fn renew_user(
     password: &str,
     quiet: bool,
 ) -> grafhome_ca::Result<()> {
+    let step_bin = user_step_bin()?;
     let user = active_user(model, user_name)?;
     let client = match host {
         Some(host) => required_user_client(model, &user.user, host)?,
@@ -3454,7 +3458,7 @@ fn renew_user(
     let certificate = user_cert_path()?;
     let token = with_password_file(&material_dir, password, |password_file| {
         run_capture(
-            process(USER_STEP_BIN)
+            process(&step_bin)
                 .env("STEPPATH", user_steppath(model)?)
                 .arg("ca")
                 .arg("token")
@@ -3483,7 +3487,7 @@ fn renew_user(
         message: format!("token output was not UTF-8: {error}"),
     })?;
     run_status_quiet(
-        process(USER_STEP_BIN)
+        process(&step_bin)
             .env("STEPPATH", user_steppath(model)?)
             .arg("ssh")
             .arg("certificate")
@@ -3515,7 +3519,8 @@ fn user_certificate_needs_renewal(
 ) -> grafhome_ca::Result<bool> {
     let user = active_user(model, user_name)?;
     required_user_client(model, &user.user, host)?;
-    ssh_certificate_needs_renewal(USER_STEP_BIN, &user_cert_path()?)
+    let step_bin = user_step_bin()?;
+    ssh_certificate_needs_renewal(&step_bin, &user_cert_path()?)
 }
 
 fn ssh_certificate_needs_renewal(step_bin: &str, certificate: &Path) -> grafhome_ca::Result<bool> {

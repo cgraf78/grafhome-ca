@@ -100,8 +100,10 @@ cargo run --bin grafhome-ca -- materialize \
 
 Host enrollment uses the same request-and-approval shape as user enrollment:
 
-Before enrollment, install `grafhome-ca` and the Smallstep `step` CLI (commonly
-packaged as `step-cli`) and provision the private site config under
+Before enrollment, install `grafhome-ca` and the Smallstep CLI. Grafhome uses
+the standard `step` executable on desktop platforms; Android builds prefer
+`step-cli`, the unambiguous name used by Termux's official package. Provision
+the private site config under
 `${XDG_CONFIG_HOME:-~/.config}/grafhome-ca`. The CA origin additionally needs
 the `step-ca` server package. No client CA fingerprint file or previous
 Smallstep client state is required: the approved grant carries the CA URL and

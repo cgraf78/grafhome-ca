@@ -1822,6 +1822,45 @@ fn enroll_user_first_run_creates_public_request_and_pending_state() {
 
 #[cfg(unix)]
 #[test]
+fn enroll_user_accepts_termux_step_cli_name() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let password_file = dir.path().join("password");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&password_file, "user-owned-password\n").unwrap();
+    fs::rename(
+        fixture.fake_bin.join("step"),
+        fixture.fake_bin.join("step-cli"),
+    )
+    .unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.args(["enroll", "user"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--user")
+        .arg("alice")
+        .arg("--host")
+        .arg("ca-host")
+        .arg("--password-file")
+        .arg(&password_file)
+        .arg("--request-only")
+        .env("HOME", &home)
+        .env("PATH", &fixture.fake_bin)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("REQUEST:{\"version\":1"));
+
+    assert!(
+        fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("crypto jwk create")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn enroll_user_restart_rebuilds_request_without_replacing_keys() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");

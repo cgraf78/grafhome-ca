@@ -20,7 +20,7 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 ## Non-Rust Responsibilities
 
 - `step-ca`: CA server and signing authority.
-- `step`: Smallstep client operations.
+- `step` (or Termux's `step-cli` package): Smallstep client operations.
 - Apache or another HTTPS reverse proxy: proxy to the CA origin when a site
   chooses that topology.
 - Dotfiles cron/systemd: scheduling idempotent host and user renewal commands.
