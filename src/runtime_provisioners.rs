@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 use crate::model::SiteModel;
-use crate::policy::Provisioner;
+use crate::policy::{Provisioner, step_max_ttl};
 
 const USER_CLIENT_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome user/client-host provisioner" }}"#;
@@ -130,7 +130,7 @@ pub fn add_user_client(
         "key": key,
         "claims": {
             "defaultUserSSHCertDuration": default_ttl,
-            "maxUserSSHCertDuration": max_ttl,
+            "maxUserSSHCertDuration": step_max_ttl(max_ttl),
             "enableSSHCA": true,
         },
         "options": {
@@ -186,7 +186,7 @@ pub fn add_host(
         "key": key,
         "claims": {
             "defaultHostSSHCertDuration": default_ttl,
-            "maxHostSSHCertDuration": max_ttl,
+            "maxHostSSHCertDuration": step_max_ttl(max_ttl),
             "enableSSHCA": true,
         },
         "options": {
@@ -493,7 +493,7 @@ mod tests {
             "grafhome-user-alice-ca-host",
             template.to_str().unwrap(),
             "24h",
-            "168h",
+            "unlimited",
         )
         .unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -502,7 +502,10 @@ mod tests {
         assert_eq!(provisioner["name"], "grafhome-user-alice-ca-host");
         assert_eq!(provisioner["key"]["kid"], "client-kid");
         assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
-        assert_eq!(provisioner["claims"]["maxUserSSHCertDuration"], "168h");
+        assert_eq!(
+            provisioner["claims"]["maxUserSSHCertDuration"],
+            crate::policy::STEP_EFFECTIVE_UNLIMITED_TTL
+        );
         assert_eq!(provisioner["claims"]["enableSSHCA"], true);
         assert!(provisioner["claims"]["defaultHostSSHCertDuration"].is_null());
         assert!(provisioner["claims"]["maxHostSSHCertDuration"].is_null());

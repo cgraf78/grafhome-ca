@@ -146,6 +146,24 @@ mod tests {
         assert!(error.contains("legacy_flag"));
     }
 
+    #[test]
+    fn schema_rejects_unlimited_maximum_for_host_provisioner() {
+        let dir = tempdir().unwrap();
+        copy_dir(&example_config_root(), dir.path());
+        let provisioners = dir.path().join("policy/provisioners.toml");
+        let text = fs::read_to_string(&provisioners).unwrap().replacen(
+            "max_ttl = \"720h\"",
+            "max_ttl = \"unlimited\"",
+            1,
+        );
+        fs::write(provisioners, text).unwrap();
+
+        let error = crate::schema::validate_config_root(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("user_enrollment"));
+    }
+
     fn copy_dir(source: &std::path::Path, destination: &std::path::Path) {
         for entry in fs::read_dir(source).unwrap() {
             let entry = entry.unwrap();

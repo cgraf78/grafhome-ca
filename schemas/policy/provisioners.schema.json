@@ -26,12 +26,27 @@
             "$ref": "#/definitions/ttl"
           },
           "max_ttl": {
-            "$ref": "#/definitions/ttl"
+            "oneOf": [{ "$ref": "#/definitions/ttl" }, { "const": "unlimited" }]
           },
           "status": {
             "enum": ["active", "planned", "disabled"]
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "max_ttl": { "const": "unlimited" }
+              },
+              "required": ["max_ttl"]
+            },
+            "then": {
+              "properties": {
+                "role": { "const": "user_enrollment" }
+              }
+            }
+          }
+        ]
       }
     }
   },

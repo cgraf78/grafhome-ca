@@ -2363,6 +2363,8 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
     cmd.args(["approve", "user"])
         .arg("--config-root")
         .arg(&fixture.config_root)
+        .arg("--cert-ttl")
+        .arg("8760h")
         .arg("--yes")
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
@@ -2381,6 +2383,7 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
         "grafhome-user-616c696365-63612d686f7374"
     );
     assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
+    assert_eq!(provisioner["claims"]["maxUserSSHCertDuration"], "2562047h");
     assert!(
         provisioner["options"]["ssh"]["template"]
             .as_str()
@@ -2402,6 +2405,7 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
     assert!(log.contains("systemctl args=restart step-ca.service"));
     assert!(log.contains("systemctl args=is-active step-ca.service"));
     assert!(log.contains("ca health"));
+    assert!(log.contains("--cert-not-after 8760h"));
 }
 
 #[cfg(unix)]
