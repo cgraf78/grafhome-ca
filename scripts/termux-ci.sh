@@ -24,9 +24,12 @@ credential="$tmp/home/.config/grafhome-ca/users/alice/hosts/ca-host/renewal-pass
 test -s "$credential"
 test "$(stat -c '%a' "$credential")" = 600
 
-# Removing only the pending request exercises unattended lookup while retaining
-# the same SSH and renewal key material created by the first enrollment.
+# Remove the throwaway SSH identity as well as the pending request so the
+# noninteractive test does not need /dev/tty for the existing-key prompt. The
+# renewal key remains, so this second pass must load the stored password to
+# validate and reuse it.
 rm "$tmp/home/.config/grafhome-ca/users/alice/hosts/ca-host/pending-enrollment.json"
+rm "$tmp/home/.ssh/id_ed25519" "$tmp/home/.ssh/id_ed25519.pub"
 HOME="$tmp/home" .termux-ci/grafhome-ca enroll user \
   --config-root examples/site-config \
   --user alice \
