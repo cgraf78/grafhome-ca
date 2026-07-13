@@ -10,13 +10,14 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@46a41d60a847142da203b8a283112160662bd260
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     permissions:
       contents: write
     with:
+      android-aarch64: true
       tag-command: scripts/release-tag.sh
       setup-command: |
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
+        if [[ "$RUST_TARGET" == *-musl ]]; then
           sudo apt-get update
           sudo apt-get install -y musl-tools
         fi

@@ -24,7 +24,12 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 - Apache or another HTTPS reverse proxy: proxy to the CA origin when a site
   chooses that topology.
 - Dotfiles cron/systemd: scheduling idempotent host and user renewal commands.
-- Shell release scripts: package and smoke-test static release archives.
+- Shell release scripts: package and smoke-test platform release archives,
+  including Android/Bionic aarch64 builds for Termux.
+
+Hosted Linux CI checks Android archives structurally (AArch64 ELF plus the
+Bionic interpreter). Executing `version` and `help` remains a post-release
+Termux smoke because the hosted runner cannot launch Android binaries.
 
 ## Safety Contract
 

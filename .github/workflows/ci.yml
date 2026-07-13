@@ -19,8 +19,11 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@46a41d60a847142da203b8a283112160662bd260
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
+      android-package-smoke-command: |
+        scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
       clippy-command: cargo clippy --locked --all-targets --all-features -- -D warnings
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
       package-smoke-setup-command: |
@@ -34,7 +37,7 @@ jobs:
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@46a41d60a847142da203b8a283112160662bd260
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
       profiles: base,shellcheck
       test-command: tests/shell/release-scripts-test
