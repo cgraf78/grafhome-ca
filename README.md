@@ -154,10 +154,21 @@ fails, the command restores the previous files and reloads that configuration.
 Removing an authorization row therefore removes its stale principals file on
 the affected host. This changes login authorization; it does not revoke an
 enrollment or an already-issued certificate, which remains the responsibility
-of `revoke host` or `revoke user`. Changes to CA issuance policy or an enrolled
-identity's certificate principals require the corresponding CA bootstrap,
-revocation, or re-enrollment workflow; `apply host` intentionally does not
-rewrite live CA state.
+of `revoke host` or `revoke user`.
+
+After changing CA issuance policy, reconcile the live provisioners on the CA
+origin:
+
+```sh
+# CA origin as root. Dry-run lists provisioners whose managed claims differ.
+grafhome-ca apply ca --dry-run
+grafhome-ca apply ca
+```
+
+`apply ca` updates only Grafhome-owned duration and SSH-CA claims. It preserves
+provisioner keys, templates, options, unknown claims, and operator-owned
+provisioners. A change is installed with the same backup, restart, health-check,
+and rollback path used by enrollment; a no-op does not restart the CA.
 
 User enrollment requires one public request copied to the CA and one secret
 grant copied back. User and host default to the current account and short
@@ -174,6 +185,10 @@ grafhome-ca approve user
 # Normal use after enrollment.
 ssh ca-host
 ```
+
+If the standard `~/.ssh/id_ed25519` identity already exists, enrollment offers
+to use it (the default), replace it, or cancel. Reuse verifies that the public
+key matches the private key before creating the Grafhome renewal credential.
 
 Scheduled renewal should run `grafhome-ca renew host --if-enrolled --quiet` as
 root and `grafhome-ca renew user --if-enrolled --quiet` as the enrolled user.
@@ -259,12 +274,13 @@ documented root-run workflows, the invoking account is root, so the complete
 input chain must be root-owned.
 
 System host lifecycle commands (`enroll host`, `renew host`, and `apply host`)
-and CA mutation commands (`approve host`, `approve user`, `revoke host`, and
-`revoke user`) enforce an effective UID of root. A non-root invocation fails
-before reading enrollment input or changing state. The test suite may exercise
-these paths without root only when configuration, CA state, keys, helper tools,
-and any redirected installation targets are all confined beneath one protected
-temporary sandbox; normal site configuration cannot use that exception.
+and CA mutation commands (`apply ca`, `approve host`, `approve user`,
+`revoke host`, and `revoke user`) enforce an effective UID of root. A non-root
+invocation fails before reading enrollment input or changing state. The test
+suite may exercise these paths without root only when configuration, CA state,
+keys, helper tools, and any redirected installation targets are all confined
+beneath one protected temporary sandbox; normal site configuration cannot use
+that exception.
 
 This release replaces the old direct `user-login` and shared SSHPOP renewal
 flows. Site policy should use

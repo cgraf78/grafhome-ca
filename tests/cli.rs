@@ -364,6 +364,57 @@ fn prepare_apply_host(fixture: &ExecFixture) {
 }
 
 #[cfg(unix)]
+fn prepare_apply_ca(fixture: &ExecFixture) -> PathBuf {
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "authority": {
+                "provisioners": [
+                    {
+                        "type": "JWK",
+                        "name": "grafhome-user-enrollment",
+                        "key": {"kid": "static"},
+                        "encryptedKey": "preserve-secret",
+                        "claims": {
+                            "defaultUserSSHCertDuration": "12h",
+                            "maxUserSSHCertDuration": "168h"
+                        }
+                    },
+                    {
+                        "type": "JWK",
+                        "name": "grafhome-user-616c696365-63612d686f7374",
+                        "key": {"kid": "client"},
+                        "claims": {"maxUserSSHCertDuration": "168h"}
+                    },
+                    {
+                        "type": "JWK",
+                        "name": "operator-owned",
+                        "claims": {"maxUserSSHCertDuration": "1h"}
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    ca_json
+}
+
+#[cfg(unix)]
+fn apply_ca_command(fixture: &ExecFixture) -> Command {
+    let mut command = Command::cargo_bin("grafhome-ca").unwrap();
+    command
+        .args(["apply", "ca", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("HOSTNAME", "ca-host.example.test")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log);
+    command
+}
+
+#[cfg(unix)]
 fn apply_host_command(fixture: &ExecFixture, install_root: &Path) -> Command {
     let mut command = Command::cargo_bin("grafhome-ca").unwrap();
     command
@@ -483,6 +534,7 @@ fn system_host_and_ca_commands_reject_non_root_callers() {
     }
     let config_root = example_config_root();
     let commands: &[&[&str]] = &[
+        &["apply", "ca", "--dry-run"],
         &["apply", "host", "--dry-run"],
         &["approve", "host", "--yes"],
         &["approve", "user", "--yes"],
@@ -579,12 +631,13 @@ fn apply_host_silently_falls_back_to_ssh_service() {
 
 #[cfg(unix)]
 #[test]
-fn apply_host_exposes_only_the_local_host_noun() {
+fn apply_exposes_only_supported_local_nouns() {
     Command::cargo_bin("grafhome-ca")
         .unwrap()
         .args(["apply", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("ca"))
         .stdout(predicate::str::contains("host"));
 
     Command::cargo_bin("grafhome-ca")
@@ -595,11 +648,118 @@ fn apply_host_exposes_only_the_local_host_noun() {
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
+        .args(["apply", "ca", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"));
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
         .args(["apply", "host", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--host").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_dry_run_reports_changes_without_writing_or_restarting() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    let original = fs::read(&ca_json).unwrap();
+
+    apply_ca_command(&fixture)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Would apply CA policy to 2 provisioner(s)",
+        ));
+
+    assert_eq!(fs::read(ca_json).unwrap(), original);
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_updates_live_claims_and_skips_a_second_restart() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied CA policy to 2 provisioner(s)",
+        ));
+
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
+    let provisioners = value["authority"]["provisioners"].as_array().unwrap();
+    for provisioner in &provisioners[..2] {
+        assert_eq!(provisioner["claims"]["maxUserSSHCertDuration"], "2562047h");
+        assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
+    }
+    assert_eq!(provisioners[2]["claims"]["maxUserSSHCertDuration"], "1h");
+    assert_eq!(provisioners[0]["encryptedKey"], "preserve-secret");
+    let first_log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        first_log
+            .matches("systemctl args=restart step-ca.service")
+            .count(),
+        1
+    );
+
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CA policy already current"));
+
+    let second_log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        second_log
+            .matches("systemctl args=restart step-ca.service")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_restores_previous_policy_when_restart_fails() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    let original = fs::read(&ca_json).unwrap();
+
+    apply_ca_command(&fixture)
+        .env("FAKE_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("restored previous ca.json"));
+
+    assert_eq!(fs::read(ca_json).unwrap(), original);
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        log.matches("systemctl args=restart step-ca.service")
+            .count(),
+        2
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_rejects_a_non_origin_host() {
+    let (_dir, fixture) = exec_fixture();
+    prepare_apply_ca(&fixture);
+
+    apply_ca_command(&fixture)
+        .env("HOSTNAME", "proxy-host.example.test")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be run on CA origin ca-host"));
+
+    assert!(!fixture.log.exists());
 }
 
 #[cfg(unix)]

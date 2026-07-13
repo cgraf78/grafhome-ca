@@ -10,8 +10,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
+use crate::enrollment::{parse_host_provisioner_name, parse_user_provisioner_name};
 use crate::error::{Error, Result};
 use crate::model::SiteModel;
 use crate::policy::{Provisioner, step_max_ttl};
@@ -20,6 +21,128 @@ const USER_CLIENT_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome user/client-host provisioner" }}"#;
 const HOST_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome host provisioner" }}"#;
+
+/// Result of reconciling managed Smallstep claims against policy.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ClaimsReconciliation {
+    /// Updated serialized CA configuration.
+    pub config: String,
+    /// Provisioner names whose managed claims changed.
+    pub updated: Vec<String>,
+}
+
+/// Reconcile duration claims for every live Grafhome provisioner.
+pub fn reconcile_claims(
+    model: &SiteModel,
+    ca_json: impl AsRef<Path>,
+) -> Result<ClaimsReconciliation> {
+    let ca_json = ca_json.as_ref();
+    let mut config = read_json(ca_json)?;
+    let user = active_provisioner(model, "user_enrollment")?;
+    let host = active_provisioner(model, "host_bootstrap")?;
+    let proxy = active_provisioner(model, "proxy_x509")?;
+    let provisioners = provisioners_mut(&mut config, ca_json)?;
+    let mut updated = Vec::new();
+
+    for item in provisioners {
+        let Some(name) = item.get("name").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let desired = if name == user.name || parse_user_provisioner_name(&name).is_some() {
+            user_claims(user)
+        } else if name == host.name || parse_host_provisioner_name(&name).is_some() {
+            host_claims(host)
+        } else if name == proxy.name {
+            proxy_claims(proxy)
+        } else {
+            continue;
+        };
+        let object = item.as_object_mut().ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("provisioner {name} must be an object"),
+        })?;
+        let claims = object
+            .entry("claims")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("provisioner {name} claims must be an object"),
+            })?;
+        if reconcile_object(claims, desired) {
+            updated.push(name);
+        }
+    }
+
+    Ok(ClaimsReconciliation {
+        config: serialize_config(config, ca_json)?,
+        updated,
+    })
+}
+
+fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provisioner> {
+    model
+        .policy
+        .provisioners
+        .iter()
+        .find(|provisioner| provisioner.role == role && provisioner.status == "active")
+        .ok_or_else(|| Error::Validation {
+            field: format!("policy/provisioners.toml:{role}"),
+            message: "missing active provisioner".to_owned(),
+        })
+}
+
+fn user_claims(provisioner: &Provisioner) -> Map<String, Value> {
+    Map::from_iter([
+        (
+            "defaultUserSSHCertDuration".to_owned(),
+            Value::String(provisioner.default_ttl.clone()),
+        ),
+        (
+            "maxUserSSHCertDuration".to_owned(),
+            Value::String(step_max_ttl(&provisioner.max_ttl).to_owned()),
+        ),
+        ("enableSSHCA".to_owned(), Value::Bool(true)),
+    ])
+}
+
+fn host_claims(provisioner: &Provisioner) -> Map<String, Value> {
+    Map::from_iter([
+        (
+            "defaultHostSSHCertDuration".to_owned(),
+            Value::String(provisioner.default_ttl.clone()),
+        ),
+        (
+            "maxHostSSHCertDuration".to_owned(),
+            Value::String(step_max_ttl(&provisioner.max_ttl).to_owned()),
+        ),
+        ("enableSSHCA".to_owned(), Value::Bool(true)),
+    ])
+}
+
+fn proxy_claims(provisioner: &Provisioner) -> Map<String, Value> {
+    Map::from_iter([
+        (
+            "defaultTLSCertDuration".to_owned(),
+            Value::String(provisioner.default_ttl.clone()),
+        ),
+        (
+            "maxTLSCertDuration".to_owned(),
+            Value::String(step_max_ttl(&provisioner.max_ttl).to_owned()),
+        ),
+    ])
+}
+
+fn reconcile_object(current: &mut Map<String, Value>, desired: Map<String, Value>) -> bool {
+    let mut changed = false;
+    for (key, value) in desired {
+        if current.get(&key) != Some(&value) {
+            current.insert(key, value);
+            changed = true;
+        }
+    }
+    changed
+}
 
 /// Replace rendered JWK placeholders with runtime-generated provisioner objects.
 pub fn materialize(
@@ -395,6 +518,98 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn reconciles_live_managed_claims_without_replacing_other_state() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let ca_json = dir.path().join("ca.json");
+        fs::write(
+            &ca_json,
+            serde_json::to_vec_pretty(&json!({
+                "authority": {
+                    "provisioners": [
+                        {
+                            "type": "JWK",
+                            "name": "grafhome-user-enrollment",
+                            "key": {"kid": "static-user"},
+                            "encryptedKey": "preserve-static-secret",
+                            "claims": {
+                                "defaultUserSSHCertDuration": "12h",
+                                "maxUserSSHCertDuration": "168h",
+                                "disableRenewal": true
+                            }
+                        },
+                        {
+                            "type": "JWK",
+                            "name": crate::enrollment::user_provisioner_name("alice", "ca-host"),
+                            "key": {"kid": "client"},
+                            "options": {"ssh": {"templateFile": "preserve.tpl"}},
+                            "claims": {"maxUserSSHCertDuration": "168h"}
+                        },
+                        {
+                            "type": "JWK",
+                            "name": crate::enrollment::host_provisioner_name("proxy-host"),
+                            "key": {"kid": "host"},
+                            "claims": {"maxHostSSHCertDuration": "24h"}
+                        },
+                        {
+                            "type": "ACME",
+                            "name": "grafhome-x509-ca-proxy",
+                            "claims": {"maxTLSCertDuration": "24h"}
+                        },
+                        {
+                            "type": "JWK",
+                            "name": "operator-owned",
+                            "claims": {"maxUserSSHCertDuration": "1h"}
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = reconcile_claims(&model, &ca_json).unwrap();
+        assert_eq!(result.updated.len(), 4);
+        let value: Value = serde_json::from_str(&result.config).unwrap();
+        let provisioners = value["authority"]["provisioners"].as_array().unwrap();
+        let by_name = provisioners
+            .iter()
+            .map(|item| (item["name"].as_str().unwrap(), item))
+            .collect::<BTreeMap<_, _>>();
+        let user = by_name["grafhome-user-enrollment"];
+        assert_eq!(user["key"]["kid"], "static-user");
+        assert_eq!(user["encryptedKey"], "preserve-static-secret");
+        assert_eq!(user["claims"]["disableRenewal"], true);
+        assert_eq!(user["claims"]["defaultUserSSHCertDuration"], "24h");
+        assert_eq!(user["claims"]["maxUserSSHCertDuration"], "2562047h");
+        let client_name = crate::enrollment::user_provisioner_name("alice", "ca-host");
+        let client = by_name[client_name.as_str()];
+        assert_eq!(client["options"]["ssh"]["templateFile"], "preserve.tpl");
+        assert_eq!(client["claims"]["maxUserSSHCertDuration"], "2562047h");
+        let host_name = crate::enrollment::host_provisioner_name("proxy-host");
+        assert_eq!(
+            by_name[host_name.as_str()]["claims"]["maxHostSSHCertDuration"],
+            "720h"
+        );
+        assert_eq!(
+            by_name["grafhome-x509-ca-proxy"]["claims"]["maxTLSCertDuration"],
+            "720h"
+        );
+        assert_eq!(
+            by_name["operator-owned"]["claims"]["maxUserSSHCertDuration"],
+            "1h"
+        );
+
+        fs::write(&ca_json, result.config).unwrap();
+        assert!(
+            reconcile_claims(&model, &ca_json)
+                .unwrap()
+                .updated
+                .is_empty()
+        );
+    }
 
     #[test]
     fn materializes_runtime_jwks_without_admin_api_inputs() {
