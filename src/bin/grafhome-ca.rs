@@ -22,6 +22,8 @@ use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{Endpoint, Host, Provisioner, User, UserClient};
 
 const USER_KEY_NAME: &str = "id_ed25519";
+#[cfg(target_os = "android")]
+const ANDROID_RENEWAL_CREDENTIAL_NAME: &str = "renewal-password.secret";
 const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
 const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
 const CA_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -3550,7 +3552,7 @@ fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
     let stored_in_keyring = try_store_secret_service(user, host, password)?;
     store_systemd_credential(user, host, password)?;
@@ -3564,7 +3566,17 @@ fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "android")]
+fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
+    let path = renewal_credential_path(user, host)?;
+    store_app_private_credential(&path, password)?;
+    eprintln!(
+        "Stored the renewal password in an owner-only file inside Termux's Android app sandbox."
+    );
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn try_store_secret_service(user: &str, host: &str, password: &str) -> grafhome_ca::Result<bool> {
     let child = process("secret-tool")
         .arg("store")
@@ -3610,7 +3622,7 @@ fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String
     lookup_macos_keychain_password(user, host)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String> {
     if let Some(password) = lookup_secret_service(user, host)? {
         return Ok(password);
@@ -3618,7 +3630,18 @@ fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String
     lookup_systemd_credential(user, host)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "android")]
+fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String> {
+    let path = renewal_credential_path(user, host)?;
+    read_app_private_credential(&path)?.ok_or_else(|| grafhome_ca::Error::Validation {
+        field: "renewal credential storage".to_owned(),
+        message: format!(
+            "no usable renewal password found for {user}@{host}; rerun enrollment or use --password-file"
+        ),
+    })
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<String>> {
     let output = process("secret-tool")
         .arg("lookup")
@@ -3643,12 +3666,91 @@ fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<S
     Ok(Some(password))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn renewal_credential_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
     Ok(user_client_material_dir(user, host)?.join("renewal-password.cred"))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "android")]
+fn renewal_credential_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
+    Ok(user_client_material_dir(user, host)?.join(ANDROID_RENEWAL_CREDENTIAL_NAME))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn store_app_private_credential(path: &Path, password: &str) -> grafhome_ca::Result<()> {
+    if password.is_empty() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "renewal credential storage".to_owned(),
+            message: "refusing to store an empty renewal password".to_owned(),
+        });
+    }
+    write_secret_file_atomic(path, password.as_bytes())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn read_app_private_credential(path: &Path) -> grafhome_ca::Result<Option<String>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let descriptor = match rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP) => {
+            return Err(grafhome_ca::Error::Validation {
+                field: "renewal credential storage".to_owned(),
+                message: format!(
+                    "{} must be a regular file, not a symbolic link",
+                    path.display()
+                ),
+            });
+        }
+        Err(source) => {
+            return Err(grafhome_ca::Error::io(
+                path,
+                std::io::Error::from_raw_os_error(source.raw_os_error()),
+            ));
+        }
+    };
+    let mut file = std::fs::File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    if !metadata.file_type().is_file() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "renewal credential storage".to_owned(),
+            message: format!("{} must be a regular file", path.display()),
+        });
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != rustix::process::geteuid().as_raw() || mode & 0o077 != 0 {
+            return Err(grafhome_ca::Error::Validation {
+                field: "renewal credential storage".to_owned(),
+                message: format!(
+                    "{} must be owned by the current user and inaccessible to group and other users",
+                    path.display()
+                ),
+            });
+        }
+    }
+    let mut password = String::new();
+    file.read_to_string(&mut password)
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    if password.is_empty() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "renewal credential storage".to_owned(),
+            message: format!("{} contains an empty renewal password", path.display()),
+        });
+    }
+    Ok(Some(password))
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn store_systemd_credential(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
     let path = renewal_credential_path(user, host)?;
     let parent = path.parent().expect("credential path has a parent");
@@ -3695,7 +3797,7 @@ fn store_systemd_credential(user: &str, host: &str, password: &str) -> grafhome_
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn lookup_systemd_credential(user: &str, host: &str) -> grafhome_ca::Result<String> {
     let path = renewal_credential_path(user, host)?;
     let output = process("systemd-creds")
@@ -3813,9 +3915,14 @@ fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Resu
     Ok(lookup_macos_keychain_password(user, host).is_ok())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
     Ok(renewal_credential_path(user, host)?.is_file())
+}
+
+#[cfg(target_os = "android")]
+fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
+    Ok(read_app_private_credential(&renewal_credential_path(user, host)?)?.is_some())
 }
 
 fn with_password_file<T>(
@@ -3949,6 +4056,8 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
 mod tests {
     use std::fs::{self, File};
     use std::io::{BufRead, Cursor, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::thread;
 
@@ -3956,9 +4065,95 @@ mod tests {
 
     use super::{
         ExistingIdentityChoice, NoncanonicalTerminalMode, parse_enrollment_document,
-        prepare_existing_user_identity, read_interactive_document, read_terminal_document,
-        ssh_public_keys_match, validate_grant_ca_url,
+        prepare_existing_user_identity, read_app_private_credential, read_interactive_document,
+        read_terminal_document, ssh_public_keys_match, store_app_private_credential,
+        validate_grant_ca_url,
     };
+
+    #[test]
+    fn app_private_credential_round_trips_with_owner_only_permissions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("renewal-password.secret");
+
+        store_app_private_credential(&path, "first-password").unwrap();
+        store_app_private_credential(&path, "replacement-password").unwrap();
+
+        assert_eq!(
+            read_app_private_credential(&path).unwrap().as_deref(),
+            Some("replacement-password")
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn app_private_credential_reports_missing_file() {
+        let dir = tempdir().unwrap();
+
+        assert_eq!(
+            read_app_private_credential(&dir.path().join("missing")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn app_private_credential_rejects_empty_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("renewal-password.secret");
+
+        let error = store_app_private_credential(&path, "")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("empty renewal password"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn app_private_credential_rejects_empty_stored_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("renewal-password.secret");
+        fs::write(&path, "").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = read_app_private_credential(&path).unwrap_err().to_string();
+
+        assert!(error.contains("contains an empty renewal password"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_private_credential_rejects_group_readable_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("renewal-password.secret");
+        fs::write(&path, "password").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = read_app_private_credential(&path).unwrap_err().to_string();
+
+        assert!(error.contains("inaccessible to group and other users"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_private_credential_rejects_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("renewal-password.secret");
+        fs::write(&target, "password").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = read_app_private_credential(&path).unwrap_err().to_string();
+
+        assert!(error.contains("must be a regular file"));
+    }
 
     #[test]
     fn cancelling_identity_selection_preserves_every_file() {
