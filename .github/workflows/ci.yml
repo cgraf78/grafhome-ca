@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@cfe6a278c631d7f85cbc89cbcf728f96bc412ecc
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
@@ -38,7 +38,7 @@ jobs:
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@cfe6a278c631d7f85cbc89cbcf728f96bc412ecc
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
     with:
       profiles: base,shellcheck
       test-command: tests/shell/release-scripts-test
