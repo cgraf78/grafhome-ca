@@ -141,7 +141,7 @@ fn owner_is_trusted(owner: u32, invoking_uid: u32) -> bool {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::{
         ANDROID_USER_STEP_BINS, USER_STEP_BINS, owner_is_trusted, trusted_executable,
@@ -153,47 +153,65 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn trusted_tempdir() -> TempDir {
+        if rustix::process::geteuid().is_root() {
+            tempfile::Builder::new()
+                .prefix(".grafhome-ca-executable-test-")
+                .tempdir_in("/root")
+                .unwrap()
+        } else {
+            tempdir().unwrap()
+        }
+    }
+
+    fn canonical(path: &std::path::Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn resolves_termux_step_cli_fallback() {
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let step_cli = temp.path().join("step-cli");
         executable(&step_cli);
 
         assert_eq!(
             user_step_bin_in(Some(temp.path().as_os_str()), USER_STEP_BINS).unwrap(),
-            step_cli.to_string_lossy()
+            canonical(&step_cli)
         );
     }
 
     #[test]
     fn prefers_standard_step_name() {
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let step = temp.path().join("step");
         executable(&step);
         executable(&temp.path().join("step-cli"));
 
         assert_eq!(
             user_step_bin_in(Some(temp.path().as_os_str()), USER_STEP_BINS).unwrap(),
-            step.to_string_lossy()
+            canonical(&step)
         );
     }
 
     #[test]
     fn android_prefers_unambiguous_step_cli_name() {
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         executable(&temp.path().join("step"));
         let step_cli = temp.path().join("step-cli");
         executable(&step_cli);
 
         assert_eq!(
             user_step_bin_in(Some(temp.path().as_os_str()), ANDROID_USER_STEP_BINS).unwrap(),
-            step_cli.to_string_lossy()
+            canonical(&step_cli)
         );
     }
 
     #[test]
     fn respects_path_directory_order() {
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
         std::fs::create_dir_all(&first).unwrap();
@@ -205,13 +223,13 @@ mod tests {
 
         assert_eq!(
             user_step_bin_in(Some(&path), USER_STEP_BINS).unwrap(),
-            step_cli.to_string_lossy()
+            canonical(&step_cli)
         );
     }
 
     #[test]
     fn skips_unsafe_step_and_uses_step_cli() {
-        let temp = tempdir().unwrap();
+        let temp = trusted_tempdir();
         let unsafe_step = temp.path().join("step");
         executable(&unsafe_step);
         std::fs::set_permissions(&unsafe_step, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -220,7 +238,7 @@ mod tests {
 
         assert_eq!(
             user_step_bin_in(Some(temp.path().as_os_str()), USER_STEP_BINS).unwrap(),
-            step_cli.to_string_lossy()
+            canonical(&step_cli)
         );
     }
 
