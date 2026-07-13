@@ -2556,7 +2556,30 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "authority": {
+                "provisioners": [{
+                    "type": "JWK",
+                    "name": "grafhome-user-616c696365-63612d686f7374",
+                    "key": {"kid": "client-kid", "kty": "EC"},
+                    "claims": {
+                        "defaultUserSSHCertDuration": "12h",
+                        "maxUserSSHCertDuration": "168h",
+                        "enableSSHCA": true,
+                        "disableRenewal": true
+                    },
+                    "options": {
+                        "x509": {"template": "stale-x509"},
+                        "ssh": {"template": "stale-ssh"}
+                    }
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.args(["approve", "user"])
@@ -2584,6 +2607,13 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
     assert_eq!(provisioner["claims"]["defaultUserSSHCertDuration"], "24h");
     assert_eq!(provisioner["claims"]["maxUserSSHCertDuration"], "2562047h");
     assert!(
+        provisioner["claims"]
+            .as_object()
+            .unwrap()
+            .get("disableRenewal")
+            .is_none()
+    );
+    assert!(
         provisioner["options"]["ssh"]["template"]
             .as_str()
             .unwrap()
@@ -2605,6 +2635,43 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
     assert!(log.contains("systemctl args=is-active step-ca.service"));
     assert!(log.contains("ca health"));
     assert!(log.contains("--cert-not-after 8760h"));
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_user_rejects_existing_provisioner_with_different_key_before_restart() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    let original = serde_json::to_vec_pretty(&serde_json::json!({
+        "authority": {
+            "provisioners": [{
+                "type": "JWK",
+                "name": "grafhome-user-616c696365-63612d686f7374",
+                "key": {"kid": "different-client", "kty": "EC"}
+            }]
+        }
+    }))
+    .unwrap();
+    fs::write(&ca_json, &original).unwrap();
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+
+    cmd.args(["approve", "user"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--yes")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin(user_enrollment_request())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("different public key"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), original);
+    let log = fs::read_to_string(&fixture.log).unwrap_or_default();
+    assert!(!log.contains("systemctl args=restart step-ca.service"));
+    assert!(!log.contains("ca health"));
+    assert!(!log.contains("ca token"));
 }
 
 #[cfg(unix)]
