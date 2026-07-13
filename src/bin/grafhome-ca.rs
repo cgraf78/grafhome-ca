@@ -152,6 +152,15 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ApplyCommand {
+    /// Reconcile live Smallstep provisioner claims with site policy.
+    Ca {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Show affected provisioners without changing or restarting the CA.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Reconcile this host's Grafhome-managed OpenSSH policy.
     Host {
         /// Site config root containing config/ and policy/.
@@ -424,6 +433,16 @@ fn run() -> grafhome_ca::Result<()> {
             )?;
             write_secret_file(&out_file, text.as_bytes())?;
             Ok(())
+        }
+        Command::Apply {
+            command:
+                ApplyCommand::Ca {
+                    config_root,
+                    dry_run,
+                },
+        } => {
+            let model = load_root_model(config_root, "apply ca", false)?;
+            apply_ca_policy(&model, dry_run)
         }
         Command::Apply {
             command:
@@ -1495,10 +1514,18 @@ fn enrollment_request_path(user: &str, host: &str) -> grafhome_ca::Result<PathBu
     Ok(user_client_material_dir(user, host)?.join("pending-enrollment.json"))
 }
 
-fn replace_existing_user_identity(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingIdentityChoice {
+    Use,
+    Replace,
+    Cancel,
+}
+
+fn prepare_existing_user_identity(
     paths: &[PathBuf],
-    confirm: impl FnOnce(&[PathBuf]) -> grafhome_ca::Result<bool>,
-) -> grafhome_ca::Result<()> {
+    choose: impl FnOnce(&[PathBuf], bool) -> grafhome_ca::Result<ExistingIdentityChoice>,
+    validate: impl FnOnce(&Path, &Path) -> grafhome_ca::Result<()>,
+) -> grafhome_ca::Result<bool> {
     let mut existing = Vec::new();
     for path in paths {
         match std::fs::symlink_metadata(path) {
@@ -1515,32 +1542,97 @@ fn replace_existing_user_identity(
         }
     }
     if existing.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
-    if !confirm(&existing)? {
-        return Err(grafhome_ca::Error::Validation {
+    let reusable = paths.len() >= 2 && paths[0].is_file() && paths[1].is_file();
+    match choose(&existing, reusable)? {
+        ExistingIdentityChoice::Use if reusable => {
+            validate(&paths[0], &paths[1])?;
+            Ok(false)
+        }
+        ExistingIdentityChoice::Use => Err(grafhome_ca::Error::Validation {
+            field: "user enrollment SSH identity".to_owned(),
+            message: "cannot use the existing identity because both id_ed25519 and id_ed25519.pub are required"
+                .to_owned(),
+        }),
+        ExistingIdentityChoice::Replace => {
+            for path in existing {
+                std::fs::remove_file(&path)
+                    .map_err(|source| grafhome_ca::Error::io(&path, source))?;
+            }
+            Ok(true)
+        }
+        ExistingIdentityChoice::Cancel => Err(grafhome_ca::Error::Validation {
             field: "user enrollment SSH identity".to_owned(),
             message: "enrollment cancelled; existing SSH identity files were not changed"
                 .to_owned(),
-        });
+        }),
     }
-    for path in existing {
-        std::fs::remove_file(&path).map_err(|source| grafhome_ca::Error::io(&path, source))?;
+}
+
+fn validate_user_identity_pair(private_key: &Path, public_key: &Path) -> grafhome_ca::Result<()> {
+    let derived = run_capture(process("ssh-keygen").arg("-y").arg("-f").arg(private_key))?;
+    let configured = std::fs::read_to_string(public_key)
+        .map_err(|source| grafhome_ca::Error::io(public_key, source))?;
+    let derived_fields: Vec<_> = String::from_utf8_lossy(&derived)
+        .split_whitespace()
+        .take(2)
+        .map(ToOwned::to_owned)
+        .collect();
+    let configured_fields: Vec<_> = configured
+        .split_whitespace()
+        .take(2)
+        .map(ToOwned::to_owned)
+        .collect();
+    if derived_fields.len() != 2 || derived_fields != configured_fields {
+        return Err(grafhome_ca::Error::Validation {
+            field: "user enrollment SSH identity".to_owned(),
+            message: format!(
+                "{} does not match {}; replace the identity or repair the public key",
+                public_key.display(),
+                private_key.display()
+            ),
+        });
     }
     Ok(())
 }
 
-fn prepare_user_identity() -> grafhome_ca::Result<PathBuf> {
-    let paths = user_identity_paths()?;
-    replace_existing_user_identity(&paths, |existing| {
-        eprintln!("The default OpenSSH identity already exists:");
-        for path in existing {
-            eprintln!("  {}", path.display());
+fn choose_existing_user_identity(
+    existing: &[PathBuf],
+    reusable: bool,
+) -> grafhome_ca::Result<ExistingIdentityChoice> {
+    eprintln!("The default OpenSSH identity already exists:");
+    for path in existing {
+        eprintln!("  {}", path.display());
+    }
+    if !reusable {
+        eprintln!("Both id_ed25519 and id_ed25519.pub are required to reuse the identity.");
+    }
+    eprintln!("Replacing it may break unrelated SSH access that uses this key.");
+    loop {
+        let prompt = if reusable {
+            "Use existing, replace, or cancel? [U/r/c] "
+        } else {
+            "Replace or cancel? [r/C] "
+        };
+        let answer = prompt_tty(prompt)?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "u" | "use" if reusable => return Ok(ExistingIdentityChoice::Use),
+            "r" | "replace" => return Ok(ExistingIdentityChoice::Replace),
+            "" | "c" | "cancel" => return Ok(ExistingIdentityChoice::Cancel),
+            _ => eprintln!("Enter use, replace, or cancel."),
         }
-        eprintln!("Replacing it may break unrelated SSH access that uses this key.");
-        confirm_tty("Overwrite the existing id_ed25519 identity? [y/N] ")
-    })?;
-    Ok(paths[0].clone())
+    }
+}
+
+fn prepare_user_identity() -> grafhome_ca::Result<(PathBuf, bool)> {
+    let paths = user_identity_paths()?;
+    let generate = prepare_existing_user_identity(
+        &paths,
+        choose_existing_user_identity,
+        validate_user_identity_pair,
+    )?;
+    Ok((paths[0].clone(), generate))
 }
 
 fn ensure_user_keys(
@@ -1562,16 +1654,18 @@ fn ensure_user_keys(
     #[cfg(unix)]
     std::fs::set_permissions(ssh_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|source| grafhome_ca::Error::io(ssh_dir, source))?;
-    let private_key = prepare_user_identity()?;
-    run_status(
-        process("ssh-keygen")
-            .arg("-t")
-            .arg("ed25519")
-            .arg("-N")
-            .arg("")
-            .arg("-f")
-            .arg(&private_key),
-    )?;
+    let (private_key, generate) = prepare_user_identity()?;
+    if generate {
+        run_status(
+            process("ssh-keygen")
+                .arg("-t")
+                .arg("ed25519")
+                .arg("-N")
+                .arg("")
+                .arg("-f")
+                .arg(&private_key),
+        )?;
+    }
 
     let material_dir = user_client_material_dir(&user.user, &client.host)?;
     std::fs::create_dir_all(&material_dir)
@@ -1701,6 +1795,11 @@ fn confirm_approval(identity: &str, command: &str) -> grafhome_ca::Result<()> {
 }
 
 fn confirm_tty(prompt: &str) -> grafhome_ca::Result<bool> {
+    let answer = prompt_tty(prompt)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn prompt_tty(prompt: &str) -> grafhome_ca::Result<String> {
     eprint!("{prompt}");
     std::io::stderr()
         .flush()
@@ -1714,7 +1813,7 @@ fn confirm_tty(prompt: &str) -> grafhome_ca::Result<bool> {
     std::io::BufReader::new(&mut terminal)
         .read_line(&mut answer)
         .map_err(|source| grafhome_ca::Error::io("/dev/tty", source))?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+    Ok(answer)
 }
 
 fn enroll_user_flow(
@@ -2167,6 +2266,56 @@ fn desired_host_ssh_files(
         }
     }
     Ok(desired)
+}
+
+fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> {
+    let local_host = resolve_host(None)?;
+    let ca_origin = required_endpoint(model, "ca_origin")?;
+    if local_host != ca_origin.target {
+        return Err(grafhome_ca::Error::Validation {
+            field: "apply ca".to_owned(),
+            message: format!(
+                "must be run on CA origin {}; local host is {local_host}",
+                ca_origin.target
+            ),
+        });
+    }
+    let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+    if dry_run {
+        let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
+        print_ca_policy_changes(&result.updated, true)?;
+        return Ok(());
+    }
+
+    with_ca_lock(model, || {
+        let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
+        if result.updated.is_empty() {
+            outln!("CA policy already current.");
+            return Ok(());
+        }
+        install_ca_json_with_rollback(
+            model,
+            &ca_json,
+            result.config.as_bytes(),
+            required_endpoint(model, "ca_api")?.url(),
+            || Ok(()),
+        )?;
+        print_ca_policy_changes(&result.updated, false)?;
+        Ok(())
+    })
+}
+
+fn print_ca_policy_changes(updated: &[String], dry_run: bool) -> grafhome_ca::Result<()> {
+    if updated.is_empty() {
+        outln!("CA policy already current.");
+        return Ok(());
+    }
+    for name in updated {
+        outln!("update\t{name}");
+    }
+    let action = if dry_run { "Would apply" } else { "Applied" };
+    outln!("{action} CA policy to {} provisioner(s).", updated.len());
+    Ok(())
 }
 
 fn apply_host_policy(model: &SiteModel, host_name: &str, dry_run: bool) -> grafhome_ca::Result<()> {
@@ -3800,17 +3949,19 @@ mod tests {
     use std::fs::{self, File};
     use std::io::{BufRead, Cursor, Write};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::thread;
 
     use tempfile::tempdir;
 
     use super::{
-        NoncanonicalTerminalMode, parse_enrollment_document, read_interactive_document,
-        read_terminal_document, replace_existing_user_identity, validate_grant_ca_url,
+        ExistingIdentityChoice, NoncanonicalTerminalMode, parse_enrollment_document,
+        prepare_existing_user_identity, read_interactive_document, read_terminal_document,
+        validate_grant_ca_url, validate_user_identity_pair,
     };
 
     #[test]
-    fn declining_identity_overwrite_preserves_every_file() {
+    fn cancelling_identity_selection_preserves_every_file() {
         let dir = tempdir().unwrap();
         let paths = [
             dir.path().join("id_ed25519"),
@@ -3821,9 +3972,13 @@ mod tests {
             fs::write(path, format!("original-{index}")).unwrap();
         }
 
-        let error = replace_existing_user_identity(&paths, |_| Ok(false))
-            .unwrap_err()
-            .to_string();
+        let error = prepare_existing_user_identity(
+            &paths,
+            |_, _| Ok(ExistingIdentityChoice::Cancel),
+            |_, _| unreachable!(),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("existing SSH identity files were not changed"));
         for (index, path) in paths.iter().enumerate() {
@@ -3835,7 +3990,7 @@ mod tests {
     }
 
     #[test]
-    fn confirming_identity_overwrite_removes_the_existing_set() {
+    fn replacing_identity_removes_the_existing_set() {
         let dir = tempdir().unwrap();
         let paths = [
             dir.path().join("id_ed25519"),
@@ -3846,26 +4001,133 @@ mod tests {
             fs::write(path, "original").unwrap();
         }
 
-        replace_existing_user_identity(&paths, |existing| {
-            assert_eq!(existing, paths);
-            Ok(true)
-        })
+        let generate = prepare_existing_user_identity(
+            &paths,
+            |existing, reusable| {
+                assert_eq!(existing, paths);
+                assert!(reusable);
+                Ok(ExistingIdentityChoice::Replace)
+            },
+            |_, _| unreachable!(),
+        )
         .unwrap();
 
+        assert!(generate);
         assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[test]
-    fn identity_overwrite_rejects_a_directory() {
+    fn using_identity_preserves_files_and_validates_the_pair() {
+        let dir = tempdir().unwrap();
+        let paths = [
+            dir.path().join("id_ed25519"),
+            dir.path().join("id_ed25519.pub"),
+            dir.path().join("id_ed25519-cert.pub"),
+        ];
+        for path in &paths {
+            fs::write(path, "original").unwrap();
+        }
+        let mut validated = false;
+
+        let generate = prepare_existing_user_identity(
+            &paths,
+            |existing, reusable| {
+                assert_eq!(existing, paths);
+                assert!(reusable);
+                Ok(ExistingIdentityChoice::Use)
+            },
+            |private, public| {
+                assert_eq!(private, paths[0]);
+                assert_eq!(public, paths[1]);
+                validated = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!generate);
+        assert!(validated);
+        assert!(paths.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn using_identity_requires_both_key_files() {
+        let dir = tempdir().unwrap();
+        let paths = [
+            dir.path().join("id_ed25519"),
+            dir.path().join("id_ed25519.pub"),
+            dir.path().join("id_ed25519-cert.pub"),
+        ];
+        fs::write(&paths[0], "private").unwrap();
+
+        let error = prepare_existing_user_identity(
+            &paths,
+            |_, reusable| {
+                assert!(!reusable);
+                Ok(ExistingIdentityChoice::Use)
+            },
+            |_, _| unreachable!(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("both id_ed25519 and id_ed25519.pub are required"));
+        assert!(paths[0].exists());
+    }
+
+    #[test]
+    fn identity_pair_validation_accepts_matching_openssh_keys() {
+        let dir = tempdir().unwrap();
+        let private = dir.path().join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&private)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        validate_user_identity_pair(&private, &private.with_extension("pub")).unwrap();
+    }
+
+    #[test]
+    fn identity_pair_validation_rejects_a_mismatched_public_key() {
+        let dir = tempdir().unwrap();
+        let private = dir.path().join("id_ed25519");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&private)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let public = private.with_extension("pub");
+        fs::write(&public, "ssh-ed25519 AAAAmismatched test\n").unwrap();
+
+        let error = validate_user_identity_pair(&private, &public)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn identity_selection_rejects_a_directory() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("id_ed25519");
         fs::create_dir(&path).unwrap();
         let mut prompted = false;
 
-        let error = replace_existing_user_identity(&[path], |_| {
-            prompted = true;
-            Ok(true)
-        })
+        let error = prepare_existing_user_identity(
+            &[path],
+            |_, _| {
+                prompted = true;
+                Ok(ExistingIdentityChoice::Replace)
+            },
+            |_, _| unreachable!(),
+        )
         .unwrap_err()
         .to_string();
 
