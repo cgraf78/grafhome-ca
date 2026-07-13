@@ -97,21 +97,34 @@ fn rendered_config_can_start_throwaway_step_ca() {
         &jwk_dir,
     )
     .unwrap();
-    let config: serde_json::Value = serde_json::from_str(&materialized).unwrap();
+    let mut config: serde_json::Value = serde_json::from_str(&materialized).unwrap();
+    let user_enrollment = config["authority"]["provisioners"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["name"] == "grafhome-user-enrollment")
+        .unwrap();
+    user_enrollment["claims"]["defaultUserSSHCertDuration"] = serde_json::json!("12h");
+    user_enrollment["claims"]["maxUserSSHCertDuration"] = serde_json::json!("168h");
     std::fs::create_dir_all(temp.path().join("step/valuedb")).unwrap();
 
     let config_path = steppath.join("config/rendered-ca.json");
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-    add_test_user_client_provisioner(temp.path(), &config_path, &password);
-    let child = Command::new("step-ca")
-        .arg(&config_path)
-        .arg("--password-file")
-        .arg(&password)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut child = StepCaChild::new(child);
+    {
+        let mut child = start_step_ca(&config_path, &password);
+        wait_for_health(
+            child.as_mut(),
+            config["address"].as_str().unwrap(),
+            &steppath,
+        );
+        assert_long_user_enrollment_rejected(
+            temp.path(),
+            config["address"].as_str().unwrap(),
+            &password,
+        );
+    }
+    add_test_user_client_provisioner(&model, temp.path(), &config_path, &password);
+    let mut child = start_step_ca(&config_path, &password);
     wait_for_health(
         child.as_mut(),
         config["address"].as_str().unwrap(),
@@ -133,6 +146,18 @@ fn assert_command_available(command: &str) {
             panic!("{command} is required for GRAFHOME_CA_RUN_STEP_CA_INTEGRATION=1: {err}")
         });
     assert!(status.success(), "{command} version failed");
+}
+
+fn start_step_ca(config: &std::path::Path, password: &std::path::Path) -> StepCaChild {
+    let child = Command::new("step-ca")
+        .arg(config)
+        .arg("--password-file")
+        .arg(password)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    StepCaChild::new(child)
 }
 
 fn run(command: &mut Command) {
@@ -218,6 +243,69 @@ fn wait_for_health(child: &mut Child, address: &str, steppath: &std::path::Path)
         thread::sleep(Duration::from_millis(250));
     }
     panic!("step-ca did not become healthy");
+}
+
+fn assert_long_user_enrollment_rejected(
+    temp: &std::path::Path,
+    address: &str,
+    password: &std::path::Path,
+) {
+    let key = temp.join("stale-limit-user");
+    run(Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(&key));
+    let enrollment_token = token(
+        Command::new("step")
+            .env("STEPPATH", temp.join("step"))
+            .arg("ca")
+            .arg("token")
+            .arg("alice")
+            .arg("--ssh")
+            .arg("--principal")
+            .arg("alice")
+            .arg("--not-after")
+            .arg("15m")
+            .arg("--cert-not-after")
+            .arg("8760h")
+            .arg("--provisioner")
+            .arg("grafhome-user-enrollment")
+            .arg("--provisioner-password-file")
+            .arg(password)
+            .arg("--ca-url")
+            .arg(format!("https://{address}"))
+            .arg("--root")
+            .arg(temp.join("step/certs/root_ca.crt")),
+    );
+    let output = Command::new("step")
+        .env("STEPPATH", temp.join("stale-client-step"))
+        .arg("ssh")
+        .arg("certificate")
+        .arg("alice")
+        .arg(key.with_extension("pub"))
+        .arg("--sign")
+        .arg("--token")
+        .arg(enrollment_token.trim())
+        .arg("--ca-url")
+        .arg(format!("https://{address}"))
+        .arg("--root")
+        .arg(temp.join("step/certs/root_ca.crt"))
+        .arg("--force")
+        .arg("--no-agent")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "stale enrollment issuer unexpectedly accepted an 8760h certificate"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("greater than maximum accepted duration"),
+        "unexpected stale-limit error:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn exercise_public_export_and_host_certificate_lifecycle(
@@ -318,7 +406,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
             .arg("--not-after")
             .arg("15m")
             .arg("--cert-not-after")
-            .arg("24h")
+            .arg("8760h")
             .arg("--provisioner")
             .arg("grafhome-user-enrollment")
             .arg("--provisioner-password-file")
@@ -357,7 +445,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
             .arg("--not-after")
             .arg("5m")
             .arg("--cert-not-after")
-            .arg("24h")
+            .arg("8760h")
             .arg("--issuer")
             .arg("grafhome-user-616c696365-63612d686f7374")
             .arg("--key")
@@ -482,6 +570,7 @@ fn exercise_public_export_and_host_certificate_lifecycle(
 }
 
 fn add_test_user_client_provisioner(
+    model: &grafhome_ca::model::SiteModel,
     temp: &std::path::Path,
     config_path: &std::path::Path,
     password: &std::path::Path,
@@ -509,13 +598,12 @@ fn add_test_user_client_provisioner(
 "#,
     )
     .unwrap();
-    let text = grafhome_ca::runtime_provisioners::add_user_client(
+    let text = grafhome_ca::runtime_provisioners::reconcile_user_client(
+        model,
         config_path,
         &public_jwk,
         "grafhome-user-616c696365-63612d686f7374",
         template.to_str().unwrap(),
-        "24h",
-        "168h",
     )
     .unwrap();
     let config: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -527,6 +615,16 @@ fn add_test_user_client_provisioner(
         .unwrap();
     assert!(provisioner["claims"]["defaultHostSSHCertDuration"].is_null());
     assert!(provisioner["claims"]["maxHostSSHCertDuration"].is_null());
+    let user_enrollment = config["authority"]["provisioners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "grafhome-user-enrollment")
+        .unwrap();
+    assert_eq!(
+        user_enrollment["claims"]["maxUserSSHCertDuration"],
+        "2562047h"
+    );
     std::fs::write(config_path, text).unwrap();
 }
 

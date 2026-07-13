@@ -7,6 +7,11 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+const USER_ENROLLMENT_CA_JSON: &str = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-enrollment","key":{"kid":"enrollment-kid","kty":"EC"},"encryptedKey":"encrypted-enrollment","claims":{"defaultUserSSHCertDuration":"24h","maxUserSSHCertDuration":"2562047h","enableSSHCA":true}}]}}"#;
+#[cfg(unix)]
+const HOST_BOOTSTRAP_CA_JSON: &str = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-bootstrap","key":{"kid":"bootstrap-kid","kty":"EC"},"encryptedKey":"encrypted-bootstrap","claims":{"defaultHostSSHCertDuration":"168h","maxHostSSHCertDuration":"720h","enableSSHCA":true}}]}}"#;
+
 fn example_config_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config")
 }
@@ -1370,7 +1375,11 @@ fn approve_host_prints_one_complete_grant() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-bootstrap","key":{"kid":"bootstrap-kid"},"encryptedKey":"preserve-bootstrap-secret","claims":{"defaultHostSSHCertDuration":"24h","maxHostSSHCertDuration":"168h","disableRenewal":true}}]}}"#,
+    )
+    .unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
     let request = serde_json::json!({
         "version": 1,
@@ -1404,9 +1413,23 @@ fn approve_host_prints_one_complete_grant() {
     assert!(log.contains("--principal ca.example.test"));
     assert!(log.contains("--not-after 15m"));
     assert!(log.contains("--cert-not-after 168h"));
-    let config = fs::read_to_string(ca_json).unwrap();
-    assert!(config.contains("grafhome-host-70726f78792d686f7374"));
-    assert!(config.contains("defaultHostSSHCertDuration"));
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(ca_json).unwrap()).unwrap();
+    let provisioners = config["authority"]["provisioners"].as_array().unwrap();
+    let bootstrap = provisioners
+        .iter()
+        .find(|item| item["name"] == "grafhome-host-bootstrap")
+        .unwrap();
+    assert_eq!(bootstrap["key"]["kid"], "bootstrap-kid");
+    assert_eq!(bootstrap["encryptedKey"], "preserve-bootstrap-secret");
+    assert_eq!(bootstrap["claims"]["defaultHostSSHCertDuration"], "168h");
+    assert_eq!(bootstrap["claims"]["maxHostSSHCertDuration"], "720h");
+    assert_eq!(bootstrap["claims"]["disableRenewal"], true);
+    assert!(
+        provisioners
+            .iter()
+            .any(|item| item["name"] == "grafhome-host-70726f78792d686f7374")
+    );
 }
 
 #[cfg(unix)]
@@ -1446,7 +1469,7 @@ fn approve_host_token_failure_leaves_ca_state_untouched() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    let original = r#"{"authority":{"provisioners":[{"name":"keep-me"}]}}"#;
+    let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-bootstrap","key":{"kid":"bootstrap-kid"},"encryptedKey":"encrypted-bootstrap","claims":{"defaultHostSSHCertDuration":"168h","maxHostSSHCertDuration":"720h","enableSSHCA":true}},{"name":"keep-me"}]}}"#;
     fs::write(&ca_json, original).unwrap();
     let request = serde_json::json!({
         "version": 1,
@@ -1483,7 +1506,7 @@ fn approve_user_token_failure_leaves_ca_state_untouched() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    let original = r#"{"authority":{"provisioners":[{"name":"keep-me"}]}}"#;
+    let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-enrollment","key":{"kid":"enrollment-kid"},"encryptedKey":"encrypted-enrollment","claims":{"defaultUserSSHCertDuration":"24h","maxUserSSHCertDuration":"2562047h","enableSSHCA":true}},{"name":"keep-me"}]}}"#;
     fs::write(&ca_json, original).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -2560,21 +2583,34 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
         &ca_json,
         serde_json::to_vec_pretty(&serde_json::json!({
             "authority": {
-                "provisioners": [{
-                    "type": "JWK",
-                    "name": "grafhome-user-616c696365-63612d686f7374",
-                    "key": {"kid": "client-kid", "kty": "EC"},
-                    "claims": {
-                        "defaultUserSSHCertDuration": "12h",
-                        "maxUserSSHCertDuration": "168h",
-                        "enableSSHCA": true,
-                        "disableRenewal": true
+                "provisioners": [
+                    {
+                        "type": "JWK",
+                        "name": "grafhome-user-enrollment",
+                        "key": {"kid": "enrollment-kid", "kty": "EC"},
+                        "encryptedKey": "preserve-enrollment-secret",
+                        "claims": {
+                            "defaultUserSSHCertDuration": "12h",
+                            "maxUserSSHCertDuration": "168h",
+                            "disableRenewal": true
+                        }
                     },
-                    "options": {
-                        "x509": {"template": "stale-x509"},
-                        "ssh": {"template": "stale-ssh"}
+                    {
+                        "type": "JWK",
+                        "name": "grafhome-user-616c696365-63612d686f7374",
+                        "key": {"kid": "client-kid", "kty": "EC"},
+                        "claims": {
+                            "defaultUserSSHCertDuration": "12h",
+                            "maxUserSSHCertDuration": "168h",
+                            "enableSSHCA": true,
+                            "disableRenewal": true
+                        },
+                        "options": {
+                            "x509": {"template": "stale-x509"},
+                            "ssh": {"template": "stale-ssh"}
+                        }
                     }
-                }]
+                ]
             }
         }))
         .unwrap(),
@@ -2599,7 +2635,20 @@ fn approve_user_authorizes_renewal_and_prints_complete_grant() {
 
     let ca_config: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
-    let provisioner = &ca_config["authority"]["provisioners"][0];
+    let provisioners = ca_config["authority"]["provisioners"].as_array().unwrap();
+    let enrollment = provisioners
+        .iter()
+        .find(|item| item["name"] == "grafhome-user-enrollment")
+        .unwrap();
+    assert_eq!(enrollment["key"]["kid"], "enrollment-kid");
+    assert_eq!(enrollment["encryptedKey"], "preserve-enrollment-secret");
+    assert_eq!(enrollment["claims"]["defaultUserSSHCertDuration"], "24h");
+    assert_eq!(enrollment["claims"]["maxUserSSHCertDuration"], "2562047h");
+    assert_eq!(enrollment["claims"]["disableRenewal"], true);
+    let provisioner = provisioners
+        .iter()
+        .find(|item| item["name"] == "grafhome-user-616c696365-63612d686f7374")
+        .unwrap();
     assert_eq!(
         provisioner["name"],
         "grafhome-user-616c696365-63612d686f7374"
@@ -2645,11 +2694,24 @@ fn approve_user_rejects_existing_provisioner_with_different_key_before_restart()
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     let original = serde_json::to_vec_pretty(&serde_json::json!({
         "authority": {
-            "provisioners": [{
-                "type": "JWK",
-                "name": "grafhome-user-616c696365-63612d686f7374",
-                "key": {"kid": "different-client", "kty": "EC"}
-            }]
+            "provisioners": [
+                {
+                    "type": "JWK",
+                    "name": "grafhome-user-enrollment",
+                    "key": {"kid": "enrollment-kid", "kty": "EC"},
+                    "encryptedKey": "encrypted-enrollment",
+                    "claims": {
+                        "defaultUserSSHCertDuration": "24h",
+                        "maxUserSSHCertDuration": "2562047h",
+                        "enableSSHCA": true
+                    }
+                },
+                {
+                    "type": "JWK",
+                    "name": "grafhome-user-616c696365-63612d686f7374",
+                    "key": {"kid": "different-client", "kty": "EC"}
+                }
+            ]
         }
     }))
     .unwrap();
@@ -2680,7 +2742,7 @@ fn approve_user_retries_transient_health_failure_after_restart() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    fs::write(&ca_json, USER_ENROLLMENT_CA_JSON).unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.args(["approve", "user"])
@@ -2700,9 +2762,12 @@ fn approve_user_retries_transient_health_failure_after_restart() {
     assert_eq!(log.matches("ca health").count(), 3);
     let ca_config: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
-    assert_eq!(
-        ca_config["authority"]["provisioners"][0]["name"],
-        "grafhome-user-616c696365-63612d686f7374"
+    assert!(
+        ca_config["authority"]["provisioners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "grafhome-user-616c696365-63612d686f7374")
     );
 }
 
@@ -2712,7 +2777,7 @@ fn concurrent_approvals_preserve_both_scoped_provisioners() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    fs::write(&ca_json, USER_ENROLLMENT_CA_JSON).unwrap();
     let path = prepend_path(&fixture.fake_bin);
     let requests = ["ca-host", "proxy-host"].map(|host| {
         format!(
@@ -2764,7 +2829,7 @@ fn approve_user_rolls_back_ca_json_if_restart_fails() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    let original = r#"{"authority":{"provisioners":[]}}"#;
+    let original = USER_ENROLLMENT_CA_JSON;
     fs::write(&ca_json, original).unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
@@ -3276,7 +3341,7 @@ fn fresh_user_enrollment_then_revocation_disables_scoped_renewal() {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(&password_file, "user-owned-password\n").unwrap();
-    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    fs::write(&ca_json, USER_ENROLLMENT_CA_JSON).unwrap();
     assert!(!home.join(".config/grafhome-ca").exists());
     assert!(
         !fixture
@@ -3499,7 +3564,7 @@ fn fresh_host_enrollment_then_revocation_disables_scoped_renewal() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    fs::write(&ca_json, HOST_BOOTSTRAP_CA_JSON).unwrap();
     assert!(
         !fixture
             .config_root

@@ -2878,7 +2878,6 @@ fn authorize_user_locked<T>(
     let user = active_user(model, user_name)?;
     let client = required_user_client(model, &user.user, host)?;
     let ca_api = required_endpoint(model, "ca_api")?;
-    let user_enrollment = required_provisioner(model, "user_enrollment")?;
     let provisioner = user_provisioner_name(&user.user, &client.host);
     let template_dir = PathBuf::from(model.deployment.ca_steppath()).join("templates/ssh");
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
@@ -2888,13 +2887,12 @@ fn authorize_user_locked<T>(
         .map_err(|source| grafhome_ca::Error::io(&template_file, source))?;
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
     let result = with_temp_file(&template_dir, public_key.as_bytes(), |public_key_file| {
-        let text = grafhome_ca::runtime_provisioners::add_user_client(
+        let text = grafhome_ca::runtime_provisioners::reconcile_user_client(
+            model,
             &ca_json,
             public_key_file,
             &provisioner,
             &template_file.display().to_string(),
-            &user_enrollment.default_ttl,
-            &user_enrollment.max_ttl,
         )?;
         install_ca_json_with_rollback(
             model,
@@ -2935,7 +2933,6 @@ fn authorize_host_locked<T>(
 ) -> grafhome_ca::Result<T> {
     let host = required_host(model, host_name)?;
     let ca_api = required_endpoint(model, "ca_api")?;
-    let host_policy = required_provisioner(model, "host_bootstrap")?;
     let provisioner = host_provisioner_name(&host.host);
     let template_dir = PathBuf::from(model.deployment.ca_steppath()).join("templates/ssh");
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
@@ -2945,13 +2942,12 @@ fn authorize_host_locked<T>(
         .map_err(|source| grafhome_ca::Error::io(&template_file, source))?;
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
     let result = with_temp_file(&template_dir, public_key.as_bytes(), |public_key_file| {
-        let text = grafhome_ca::runtime_provisioners::add_host(
+        let text = grafhome_ca::runtime_provisioners::reconcile_host(
+            model,
             &ca_json,
             public_key_file,
             &provisioner,
             &template_file.display().to_string(),
-            &host_policy.default_ttl,
-            &host_policy.max_ttl,
         )?;
         install_ca_json_with_rollback(
             model,
