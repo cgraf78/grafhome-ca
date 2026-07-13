@@ -57,19 +57,7 @@ pub fn reconcile_claims(
         } else {
             continue;
         };
-        let object = item.as_object_mut().ok_or_else(|| Error::Validation {
-            field: format!("{}:authority.provisioners", ca_json.display()),
-            message: format!("provisioner {name} must be an object"),
-        })?;
-        let claims = object
-            .entry("claims")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| Error::Validation {
-                field: format!("{}:authority.provisioners", ca_json.display()),
-                message: format!("provisioner {name} claims must be an object"),
-            })?;
-        if reconcile_object(claims, desired) {
+        if reconcile_provisioner_claims(item, &name, desired, ca_json)? {
             updated.push(name);
         }
     }
@@ -93,28 +81,36 @@ fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provis
 }
 
 fn user_claims(provisioner: &Provisioner) -> Map<String, Value> {
+    user_claims_for(&provisioner.default_ttl, &provisioner.max_ttl)
+}
+
+fn user_claims_for(default_ttl: &str, max_ttl: &str) -> Map<String, Value> {
     Map::from_iter([
         (
             "defaultUserSSHCertDuration".to_owned(),
-            Value::String(provisioner.default_ttl.clone()),
+            Value::String(default_ttl.to_owned()),
         ),
         (
             "maxUserSSHCertDuration".to_owned(),
-            Value::String(step_max_ttl(&provisioner.max_ttl).to_owned()),
+            Value::String(step_max_ttl(max_ttl).to_owned()),
         ),
         ("enableSSHCA".to_owned(), Value::Bool(true)),
     ])
 }
 
 fn host_claims(provisioner: &Provisioner) -> Map<String, Value> {
+    host_claims_for(&provisioner.default_ttl, &provisioner.max_ttl)
+}
+
+fn host_claims_for(default_ttl: &str, max_ttl: &str) -> Map<String, Value> {
     Map::from_iter([
         (
             "defaultHostSSHCertDuration".to_owned(),
-            Value::String(provisioner.default_ttl.clone()),
+            Value::String(default_ttl.to_owned()),
         ),
         (
             "maxHostSSHCertDuration".to_owned(),
-            Value::String(step_max_ttl(&provisioner.max_ttl).to_owned()),
+            Value::String(step_max_ttl(max_ttl).to_owned()),
         ),
         ("enableSSHCA".to_owned(), Value::Bool(true)),
     ])
@@ -142,6 +138,91 @@ fn reconcile_object(current: &mut Map<String, Value>, desired: Map<String, Value
         }
     }
     changed
+}
+
+fn reconcile_provisioner_claims(
+    provisioner: &mut Value,
+    name: &str,
+    desired: Map<String, Value>,
+    ca_json: &Path,
+) -> Result<bool> {
+    let object = provisioner
+        .as_object_mut()
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("provisioner {name} must be an object"),
+        })?;
+    let claims = object
+        .entry("claims")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("provisioner {name} claims must be an object"),
+        })?;
+    Ok(reconcile_object(claims, desired))
+}
+
+/// Reconcile one required policy issuer without replacing its runtime key material.
+fn reconcile_required_provisioner(
+    provisioners: &mut [Value],
+    provisioner: &Provisioner,
+    desired: Map<String, Value>,
+    ca_json: &Path,
+) -> Result<()> {
+    let matching = provisioners
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.get("name").and_then(Value::as_str) == Some(&provisioner.name))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let index = match matching.as_slice() {
+        [index] => *index,
+        [] => {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("required live provisioner {} is missing", provisioner.name),
+            });
+        }
+        _ => {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("provisioner {} appears more than once", provisioner.name),
+            });
+        }
+    };
+    let live = &provisioners[index];
+    if live.get("type").and_then(Value::as_str) != Some(&provisioner.r#type) {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!(
+                "provisioner {} must have type {}",
+                provisioner.name, provisioner.r#type
+            ),
+        });
+    }
+    if live.get("key").and_then(Value::as_object).is_none() {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("provisioner {} key must be an object", provisioner.name),
+        });
+    }
+    if live.get("encryptedKey").and_then(Value::as_str).is_none() {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!(
+                "provisioner {} encryptedKey must be a string",
+                provisioner.name
+            ),
+        });
+    }
+    reconcile_provisioner_claims(
+        &mut provisioners[index],
+        &provisioner.name,
+        desired,
+        ca_json,
+    )?;
+    Ok(())
 }
 
 /// Install the exact constrained state for one Grafhome-owned scoped provisioner.
@@ -191,6 +272,41 @@ fn upsert_scoped_provisioner(
     // stale claims, encrypted signing keys, webhooks, or templates cannot broaden its authority.
     *existing = desired;
     Ok(())
+}
+
+fn user_client_provisioner(
+    key: Value,
+    name: &str,
+    template: String,
+    claims: Map<String, Value>,
+) -> Value {
+    json!({
+        "type": "JWK",
+        "name": name,
+        "key": key,
+        "claims": claims,
+        "options": {
+            "x509": {
+                "template": USER_CLIENT_X509_DENY_TEMPLATE,
+            },
+            "ssh": {
+                "template": template,
+            },
+        },
+    })
+}
+
+fn host_provisioner(key: Value, name: &str, template: String, claims: Map<String, Value>) -> Value {
+    json!({
+        "type": "JWK",
+        "name": name,
+        "key": key,
+        "claims": claims,
+        "options": {
+            "x509": { "template": HOST_X509_DENY_TEMPLATE },
+            "ssh": { "template": template },
+        },
+    })
 }
 
 /// Replace rendered JWK placeholders with runtime-generated provisioner objects.
@@ -258,11 +374,8 @@ pub fn materialize(
     })
 }
 
-/// Add or reconcile one constrained user/client-host JWK provisioner.
-///
-/// An existing provisioner with the same name and key is replaced with exact managed state.
-/// Different keys or duplicate names are rejected without changing the serialized config.
-pub fn add_user_client(
+#[cfg(test)]
+fn add_user_client(
     ca_json: impl AsRef<Path>,
     public_key: impl AsRef<Path>,
     name: &str,
@@ -277,34 +390,42 @@ pub fn add_user_client(
     let template = read_text(Path::new(template_file))?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
 
-    let desired = json!({
-        "type": "JWK",
-        "name": name,
-        "key": key,
-        "claims": {
-            "defaultUserSSHCertDuration": default_ttl,
-            "maxUserSSHCertDuration": step_max_ttl(max_ttl),
-            "enableSSHCA": true,
-        },
-        "options": {
-            "x509": {
-                "template": USER_CLIENT_X509_DENY_TEMPLATE,
-            },
-            "ssh": {
-                "template": template,
-            },
-        },
-    });
+    let desired =
+        user_client_provisioner(key, name, template, user_claims_for(default_ttl, max_ttl));
     upsert_scoped_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
 }
 
-/// Add or reconcile one constrained host JWK provisioner.
+/// Reconcile the user enrollment issuer and one constrained user/client-host issuer.
 ///
-/// An existing provisioner with the same name and key is replaced with exact managed state.
-/// Different keys or duplicate names are rejected without changing the serialized config.
-pub fn add_host(
+/// The static enrollment issuer authorizes the first certificate while the scoped issuer
+/// authorizes later renewals. Updating both in one serialized configuration keeps issuance and
+/// renewal on the same policy before the caller activates the CA state.
+pub fn reconcile_user_client(
+    model: &SiteModel,
+    ca_json: impl AsRef<Path>,
+    public_key: impl AsRef<Path>,
+    name: &str,
+    template_file: &str,
+) -> Result<String> {
+    let ca_json = ca_json.as_ref();
+    let public_key = public_key.as_ref();
+    let mut config = read_json(ca_json)?;
+    let key = read_public_jwk(public_key)?;
+    let template = read_text(Path::new(template_file))?;
+    let policy = active_provisioner(model, "user_enrollment")?;
+    let provisioners = provisioners_mut(&mut config, ca_json)?;
+
+    reconcile_required_provisioner(provisioners, policy, user_claims(policy), ca_json)?;
+    let desired = user_client_provisioner(key, name, template, user_claims(policy));
+    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
+
+    serialize_config(config, ca_json)
+}
+
+#[cfg(test)]
+fn add_host(
     ca_json: impl AsRef<Path>,
     public_key: impl AsRef<Path>,
     name: &str,
@@ -321,20 +442,36 @@ pub fn add_host(
     // A retained SSHPOP provisioner would bypass host-scoped revocation.
     provisioners.retain(|item| item.get("type").and_then(Value::as_str) != Some("SSHPOP"));
 
-    let desired = json!({
-        "type": "JWK",
-        "name": name,
-        "key": key,
-        "claims": {
-            "defaultHostSSHCertDuration": default_ttl,
-            "maxHostSSHCertDuration": step_max_ttl(max_ttl),
-            "enableSSHCA": true,
-        },
-        "options": {
-            "x509": { "template": HOST_X509_DENY_TEMPLATE },
-            "ssh": { "template": template },
-        },
-    });
+    let desired = host_provisioner(key, name, template, host_claims_for(default_ttl, max_ttl));
+    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
+
+    serialize_config(config, ca_json)
+}
+
+/// Reconcile the host bootstrap issuer and one constrained host issuer.
+///
+/// The static bootstrap issuer authorizes the first certificate while the scoped issuer
+/// authorizes later renewals. Updating both in one serialized configuration keeps issuance and
+/// renewal on the same policy before the caller activates the CA state.
+pub fn reconcile_host(
+    model: &SiteModel,
+    ca_json: impl AsRef<Path>,
+    public_key: impl AsRef<Path>,
+    name: &str,
+    template_file: &str,
+) -> Result<String> {
+    let ca_json = ca_json.as_ref();
+    let public_key = public_key.as_ref();
+    let mut config = read_json(ca_json)?;
+    let key = read_public_jwk(public_key)?;
+    let template = read_text(Path::new(template_file))?;
+    let policy = active_provisioner(model, "host_bootstrap")?;
+    let provisioners = provisioners_mut(&mut config, ca_json)?;
+    // A retained SSHPOP provisioner would bypass host-scoped revocation.
+    provisioners.retain(|item| item.get("type").and_then(Value::as_str) != Some("SSHPOP"));
+
+    reconcile_required_provisioner(provisioners, policy, host_claims(policy), ca_json)?;
+    let desired = host_provisioner(key, name, template, host_claims(policy));
     upsert_scoped_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
@@ -628,6 +765,122 @@ mod tests {
                 .updated
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reconcile_user_client_rejects_missing_enrollment_issuer() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, "user-template").unwrap();
+
+        let error = reconcile_user_client(
+            &model,
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("required live provisioner grafhome-user-enrollment is missing")
+        );
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+    }
+
+    #[test]
+    fn reconcile_user_client_rejects_duplicate_enrollment_issuers() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[{"name":"grafhome-user-enrollment"},{"name":"grafhome-user-enrollment"}]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, "user-template").unwrap();
+
+        let error = reconcile_user_client(
+            &model,
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("provisioner grafhome-user-enrollment appears more than once")
+        );
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+    }
+
+    #[test]
+    fn reconcile_user_client_rejects_wrong_enrollment_issuer_type() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[{"type":"ACME","name":"grafhome-user-enrollment","key":{},"encryptedKey":"encrypted"}]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, "user-template").unwrap();
+
+        let error = reconcile_user_client(
+            &model,
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("provisioner grafhome-user-enrollment must have type JWK")
+        );
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
+    }
+
+    #[test]
+    fn reconcile_user_client_rejects_missing_enrollment_issuer_secret() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-enrollment","key":{}}]}}"#;
+        fs::write(&ca_json, original).unwrap();
+        let public_key = dir.path().join("provisioner.pub.json");
+        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        let template = dir.path().join("user.tpl");
+        fs::write(&template, "user-template").unwrap();
+
+        let error = reconcile_user_client(
+            &model,
+            &ca_json,
+            &public_key,
+            "grafhome-user-alice-ca-host",
+            template.to_str().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("provisioner grafhome-user-enrollment encryptedKey must be a string")
+        );
+        assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
     }
 
     #[test]
