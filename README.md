@@ -261,10 +261,22 @@ configured CA address cannot be established; configuration, trust, and renewal
 errors remain visible. An advisory per-scope lock prevents overlapping renewal
 runs. Grafhome's private dotfiles install these jobs hourly. User enrollment
 stores the password in macOS Keychain on macOS. On Linux it uses an encrypted
-systemd user credential and also stores the password in Secret Service when
-available. On Android/Termux it uses an owner-only file within Termux's
-app-private data directory, which Android isolates from other apps and Termux
-excludes from Android backup. This Android credential is not separately
+systemd credential and also stores the password in Secret Service when
+available. It first attempts a user-scoped credential, supported by systemd 256
+and newer. If that is unavailable, `grafhome-ca` falls back to encryption bound
+to the machine's TPM without fixed PCR binding, so routine firmware and Secure
+Boot database updates do not strand the credential. The user must be able to
+open the TPM resource manager; on distributions that restrict `/dev/tpmrm0` to
+the `tss` group, add the enrolled user to that group and start a new login
+session before enrollment. The
+credential file remains owner-only, and copied home-directory data cannot be
+decrypted away from the original TPM. `grafhome-ca` tries both formats while
+reading, so upgrading systemd does not require reenrollment. It never silently
+falls back to a plaintext Linux password file.
+
+On Android/Termux it uses an owner-only file within Termux's app-private data
+directory, which Android isolates from other apps and Termux excludes from
+Android backup. This Android credential is not separately
 application-encrypted; processes already running as the Termux app user can
 read it, just as they can use the unencrypted OpenSSH identity stored beside
 it. `renew user` reads the corresponding platform store for unattended renewal.

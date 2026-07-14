@@ -355,12 +355,35 @@ printf 'chmod args=%s\n' "$*" >> "$FAKE_LOG"
         &fake_bin.join("systemd-creds"),
         r#"#!/bin/sh
 set -eu
+printf 'systemd-creds args=%s\n' "$*" >> "$FAKE_LOG"
+has_user=0
+has_tpm=0
+for arg in "$@"; do
+  if [ "$arg" = "--user" ]; then has_user=1; fi
+  if [ "$arg" = "--with-key=tpm2" ]; then has_tpm=1; fi
+done
+if [ "${FAKE_SYSTEMD_CREDS_REJECT_USER:-}" = "1" ] && [ "$has_user" = "1" ]; then
+  printf "systemd-creds: unrecognized option '--user'\n" >&2
+  exit 2
+fi
+if [ "${FAKE_SYSTEMD_CREDS_REJECT_TPM:-}" = "1" ] && [ "$has_tpm" = "1" ]; then
+  printf 'Failed to create TPM2 context: Permission denied\n' >&2
+  exit 3
+fi
 case "$1" in
   encrypt)
     for output in "$@"; do :; done
     cat > "$output"
     ;;
   decrypt)
+    if [ "${FAKE_SYSTEMD_CREDS_REJECT_DECRYPT:-}" = "1" ]; then
+      printf 'Credential decryption unavailable\n' >&2
+      exit 5
+    fi
+    if [ "${FAKE_SYSTEMD_CREDS_USER_DECRYPT_FAIL:-}" = "1" ] && [ "$has_user" = "1" ]; then
+      printf 'Credential scope does not match\n' >&2
+      exit 4
+    fi
     for input in "$@"; do
       if [ -f "$input" ]; then cat "$input"; exit 0; fi
     done
@@ -418,6 +441,55 @@ fn configure_unreachable_ca(fixture: &ExecFixture) {
         .replacen("address = \"198.51.100.21\"", "address = \"127.0.0.1\"", 1)
         .replacen("port = 443", "port = 1", 1);
     fs::write(path, text).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn user_enroll_request_command(fixture: &ExecFixture, home: &Path) -> Command {
+    let mut command = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    command
+        .args([
+            "enroll",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--request-only",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn user_renew_command(fixture: &ExecFixture, home: &Path) -> Command {
+    let mut command = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    command
+        .args([
+            "renew",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn reset_user_enrollment_request(home: &Path) {
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    fs::remove_file(material.join("pending-enrollment.json")).unwrap();
+    fs::remove_file(home.join(".ssh/id_ed25519")).unwrap();
+    fs::remove_file(home.join(".ssh/id_ed25519.pub")).unwrap();
 }
 
 #[cfg(unix)]
@@ -2503,6 +2575,207 @@ fn enroll_user_falls_back_to_systemd_user_credential() {
         !fs::read_to_string(&fixture.log)
             .unwrap()
             .contains("user-owned-password")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unavailable_secret_service_does_not_block_systemd_credentials() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let secret_tool = fixture.fake_bin.join("secret-tool");
+    fs::write(&secret_tool, "not executable\n").unwrap();
+    fs::set_permissions(&secret_tool, fs::Permissions::from_mode(0o644)).unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .write_stdin("user-owned-password\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Stored the renewal password as an encrypted systemd user credential",
+        ));
+
+    reset_user_enrollment_request(&home);
+
+    user_enroll_request_command(&fixture, &home)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Using the stored renewal credential for alice@ca-host",
+        ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_credential_precedes_and_recovers_through_secret_service() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    write_executable(
+        &fixture.fake_bin.join("secret-tool"),
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+  store) cat > "$FAKE_LOG.keyring" ;;
+  lookup) cat "$FAKE_LOG.keyring" ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+
+    user_enroll_request_command(&fixture, &home)
+        .write_stdin("user-owned-password\n")
+        .assert()
+        .success();
+    reset_user_enrollment_request(&home);
+    fs::write(
+        format!("{}.keyring", fixture.log.display()),
+        "stale-password",
+    )
+    .unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Using the stored renewal credential for alice@ca-host",
+        ));
+    reset_user_enrollment_request(&home);
+    fs::write(
+        format!("{}.keyring", fixture.log.display()),
+        "user-owned-password",
+    )
+    .unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_REJECT_DECRYPT", "1")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Using the stored renewal credential for alice@ca-host",
+        ));
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("user-owned-password")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn enroll_user_falls_back_to_tpm_credential_on_pre_256_systemd() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_REJECT_USER", "1")
+        .write_stdin("user-owned-password\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Stored the renewal password as an encrypted TPM-bound systemd credential",
+        ));
+
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    let credential = material.join("renewal-password.cred");
+    assert!(credential.is_file());
+    assert_eq!(
+        fs::metadata(&credential).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    reset_user_enrollment_request(&home);
+
+    user_enroll_request_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_REJECT_USER", "1")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Using the stored renewal credential for alice@ca-host",
+        ));
+
+    user_renew_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_REJECT_USER", "1")
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("systemd-creds args=encrypt --user"));
+    assert!(log.contains("--with-key=tpm2 --tpm2-pcrs="));
+    assert!(log.contains("systemd-creds args=decrypt --user"));
+    assert!(!log.contains("user-owned-password"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn upgraded_systemd_reads_an_existing_tpm_credential() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_REJECT_USER", "1")
+        .write_stdin("user-owned-password\n")
+        .assert()
+        .success();
+
+    reset_user_enrollment_request(&home);
+    fs::write(&fixture.log, "").unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_USER_DECRYPT_FAIL", "1")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Using the stored renewal credential for alice@ca-host",
+        ));
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("systemd-creds args=decrypt --user"));
+    assert!(log.contains("systemd-creds args=decrypt --quiet"));
+    assert!(!log.contains("user-owned-password"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn enroll_user_reports_modern_and_tpm_credential_failures() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    user_enroll_request_command(&fixture, &home)
+        .env("FAKE_SYSTEMD_CREDS_REJECT_USER", "1")
+        .env("FAKE_SYSTEMD_CREDS_REJECT_TPM", "1")
+        .write_stdin("user-owned-password\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "user-scoped credential: systemd-creds: unrecognized option '--user'",
+        ))
+        .stderr(predicate::str::contains(
+            "legacy TPM credential: Failed to create TPM2 context: Permission denied",
+        ))
+        .stderr(predicate::str::contains(
+            "commonly by adding it to the tss group",
+        ))
+        .stderr(predicate::str::contains("user-owned-password").not());
+
+    let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+    assert!(!material.join("renewal-password.cred").exists());
+    assert!(!material.join("pending-enrollment.json").exists());
+    assert_eq!(
+        fs::read_dir(&material)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".renewal-password.cred-")
+            })
+            .count(),
+        0
     );
 }
 
