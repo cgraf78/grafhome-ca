@@ -67,10 +67,21 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
   `HostCertificate`.
 
 `GRAFHOME_CA_PASSWORD_FILE`
-: Absolute path to the root-readable `step-ca` key password file. The file path
-  is non-secret; the password file content must never be committed. This path
-  must be inside `GRAFHOME_CA_STATE_DIR` so the `step-ca` service user can
-  traverse its parent directories.
+: Absolute path to the root-readable intermediate CA key password file. The
+  file path is non-secret; the password file content must never be committed.
+  This path must be inside `GRAFHOME_CA_STATE_DIR` so the `step-ca` service user
+  can traverse its parent directories.
+
+Enrollment provisioner credentials are derived rather than configured. For an
+enrollment provisioner named `<name>`, the CA origin stores
+`${GRAFHOME_CA_STATE_DIR}/secrets/provisioners/<name>.pub.json`,
+`<name>.priv.json`, and `<name>.password`. The private JWK and password must be
+owner-only regular files, and the enrollment password must differ from
+`GRAFHOME_CA_PASSWORD_FILE`. `grafhome-ca migrate enrollment-provisioner-keys`
+creates this layout for an existing CA without changing provisioner identities.
+Upgrade every policy-consuming binary before distributing policy with the new
+renewal or effectively-infinite fields; older binaries reject unknown policy
+fields. New binaries continue to accept the previous policy shape.
 
 `GRAFHOME_CA_SERVICE_USER`
 : Unix service account and primary service group that run the CA server.
@@ -147,15 +158,23 @@ including collisions between user and host certificates.
   by step-ca so the client-facing proxy name and the private backend serving
   name are both explicit issuance policy.
 
+The renderer also derives authority-wide SSH allow-lists directly from active
+`users.principal` values and every `hosts.principals` value. These are generated
+template variables rather than deployment settings. The CA rejects SSH user or
+host principals outside those policy-owned sets even if a provisioner token or
+template is misconfigured.
+
 `GRAFHOME_CA_PROVISIONERS_JSON`
 : Template variable derived from active rows in `policy/provisioners.toml`.
   JWK rows render as whole-object runtime placeholders until a deployment step
-  replaces them with complete Smallstep-generated provisioner objects containing
-  both the public `key` and encrypted private-key material. Non-secret
-  provisioner types that do not require generated key material render directly.
+  replaces them with complete Smallstep provisioner objects containing the
+  public `key`, claims, and issuance templates. Private enrollment keys remain
+  in the server-local provisioner directory and `encryptedKey` is omitted.
+  Non-secret provisioner types that do not require generated key material
+  render directly.
   The supported first-bootstrap path is `materialize`: it
-  copies the bootstrap JWK from the live `step ca init` output, loads additional
-  encrypted JWK files from a private operator directory, and reapplies
+  copies public bootstrap state from the live `step ca init` output, loads other
+  public JWK files from a private operator directory, and reapplies
   policy-derived claims before the staged `ca.json` is installed.
 
 `GRAFHOME_CA_HOST_CERT_PATH`
@@ -182,10 +201,25 @@ including collisions between user and host certificates.
 `principal`
 : A name embedded in an SSH certificate and later matched by OpenSSH policy.
 
-`default_ttl`, `max_ttl`, and `cert_ttl`
+`default_ttl`, `max_ttl`, `renewal_default_ttl`, `renewal_max_ttl`, and `cert_ttl`
 : Step duration strings rendered into `ca.json` or used for enrollment. Use
   Go-style `s`, `m`, or `h` units such as `24h`, `168h`, or `720h`; do not use `d`.
   `max_ttl` may be `unlimited` only for the `user_enrollment` provisioner.
   Smallstep requires a positive finite maximum, so Grafhome renders this as
   `2562047h`, the largest whole-hour Go duration (roughly 292 years). The
   configured user `cert_ttl` remains the default lifetime for normal issuance.
+  Device-bound renewal provisioners use the finite `renewal_*` values instead
+  of inheriting an unlimited enrollment maximum. Older policy files remain
+  readable: an omitted renewal default uses `default_ttl`; when the old
+  enrollment maximum is unlimited, the omitted renewal maximum becomes the
+  largest finite active-user `cert_ttl` or renewal default. This preserves
+  previously valid finite lifetimes without letting inactive historical rows
+  inflate routine renewal authority.
+
+`allow_effectively_infinite_cert`
+: Optional `user-clients.toml` boolean, defaulting to `false`. When true on the
+  exact active user/client-host row, a root operator may use `approve user
+  --effectively-infinite`. The flag and allow-list entry are both required;
+  routine renewal remains finite. Upgrade the target client before issuing this
+  exceptional grant. It uses enrollment document version 2 so older clients
+  reject it before issuance; ordinary grants remain version 1.

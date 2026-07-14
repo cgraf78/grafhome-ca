@@ -4,6 +4,8 @@ name = "grafhome-host-bootstrap"
 type = "JWK"
 default_ttl = "168h"
 max_ttl = "720h"
+renewal_default_ttl = "168h"
+renewal_max_ttl = "720h"
 status = "active"
 
 [[provisioners]]
@@ -12,6 +14,8 @@ name = "grafhome-user-enrollment"
 type = "JWK"
 default_ttl = "24h"
 max_ttl = "unlimited"
+renewal_default_ttl = "24h"
+renewal_max_ttl = "48h"
 status = "active"
 
 [[provisioners]]

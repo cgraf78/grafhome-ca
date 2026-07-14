@@ -5,6 +5,7 @@
 //! separate operator-controlled phase.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -365,10 +366,52 @@ fn variables(model: &SiteModel) -> Result<BTreeMap<String, String>> {
         x509_allowed_dns_json(ca_api, ca_origin)?,
     );
     variables.insert(
+        "GRAFHOME_CA_SSH_USER_ALLOWED_PRINCIPALS_JSON".to_owned(),
+        ssh_user_allowed_principals_json(model)?,
+    );
+    let (host_dns, host_ips) = ssh_host_allowed_principals_json(model)?;
+    variables.insert("GRAFHOME_CA_SSH_HOST_ALLOWED_DNS_JSON".to_owned(), host_dns);
+    variables.insert("GRAFHOME_CA_SSH_HOST_ALLOWED_IPS_JSON".to_owned(), host_ips);
+    variables.insert(
         "GRAFHOME_CA_PROVISIONERS_JSON".to_owned(),
         provisioners_json(&model.policy.provisioners)?,
     );
     Ok(variables)
+}
+
+fn ssh_user_allowed_principals_json(model: &SiteModel) -> Result<String> {
+    let mut principals = model
+        .policy
+        .users
+        .iter()
+        .filter(|user| user.status == "active")
+        .map(|user| user.principal.as_str())
+        .collect::<Vec<_>>();
+    principals.sort_unstable();
+    principals.dedup();
+    serde_json::to_string(&principals).map_err(|source| Error::Json {
+        path: PathBuf::from("policy/users.toml"),
+        source,
+    })
+}
+
+fn ssh_host_allowed_principals_json(model: &SiteModel) -> Result<(String, String)> {
+    let mut dns = BTreeSet::new();
+    let mut ips = BTreeSet::new();
+    for principal in model.policy.hosts.iter().flat_map(|host| &host.principals) {
+        if principal.parse::<IpAddr>().is_ok() {
+            ips.insert(principal.as_str());
+        } else {
+            dns.insert(principal.as_str());
+        }
+    }
+    let path = PathBuf::from("policy/hosts.toml");
+    let dns = serde_json::to_string(&dns).map_err(|source| Error::Json {
+        path: path.clone(),
+        source,
+    })?;
+    let ips = serde_json::to_string(&ips).map_err(|source| Error::Json { path, source })?;
+    Ok((dns, ips))
 }
 
 fn x509_allowed_dns_json(ca_api: &Endpoint, ca_origin: &Endpoint) -> Result<String> {
@@ -838,6 +881,42 @@ mod tests {
         assert_eq!(
             value["authority"]["policy"]["x509"]["allowWildcardNames"],
             false
+        );
+    }
+
+    #[test]
+    fn rendered_ssh_policy_allows_only_configured_principals() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let ca_json = files
+            .iter()
+            .find(|file| {
+                file.path
+                    == std::path::Path::new("hosts/ca-host/srv/example-ca/step/config/ca.json")
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&ca_json.content).unwrap();
+
+        assert_eq!(
+            value["authority"]["policy"]["ssh"]["user"]["allow"]["principal"],
+            serde_json::json!(["alice"])
+        );
+        assert_eq!(
+            value["authority"]["policy"]["ssh"]["host"]["allow"]["dns"],
+            serde_json::json!([
+                "ca-host",
+                "ca-origin.example.test",
+                "ca.example.test",
+                "edge-host",
+                "edge-host.example.test",
+                "laptop-a",
+                "laptop-a.example.test",
+                "proxy-host"
+            ])
+        );
+        assert_eq!(
+            value["authority"]["policy"]["ssh"]["host"]["allow"]["ip"],
+            serde_json::json!([])
         );
     }
 

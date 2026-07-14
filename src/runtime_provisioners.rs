@@ -1,14 +1,17 @@
 //! Materialize runtime-only Smallstep JWK provisioners.
 //!
-//! The normal renderer cannot include encrypted JWK private material because the
-//! public repository must stay secret-free. During first bootstrap, `step ca
-//! init` creates the host-bootstrap JWK object offline, and operators generate
-//! any additional JWK keypairs with `step crypto jwk create`. This module owns
-//! the deterministic merge from those runtime inputs into the rendered
-//! placeholder-bearing `ca.json`.
+//! The normal renderer cannot include runtime-generated JWK public keys. During
+//! first bootstrap, `step ca init` creates the host-bootstrap JWK object, and
+//! operators generate any additional JWK keypairs with `step crypto jwk
+//! create`. This module owns the deterministic merge from those public inputs
+//! into rendered `ca.json` while preserving existing device-bound renewal
+//! provisioners. Encrypted private keys remain server-local files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use serde_json::{Map, Value, json};
 
@@ -18,9 +21,29 @@ use crate::model::SiteModel;
 use crate::policy::{Provisioner, step_max_ttl};
 
 const USER_CLIENT_X509_DENY_TEMPLATE: &str =
-    r#"{{ fail "x509 issuance disabled for Grafhome user/client-host provisioner" }}"#;
+    r#"{{ fail "x509 issuance disabled for Grafhome user renewal provisioner" }}"#;
 const HOST_X509_DENY_TEMPLATE: &str =
-    r#"{{ fail "x509 issuance disabled for Grafhome host provisioner" }}"#;
+    r#"{{ fail "x509 issuance disabled for Grafhome host renewal provisioner" }}"#;
+const USER_ENROLLMENT_X509_DENY_TEMPLATE: &str =
+    r#"{{ fail "x509 issuance disabled for Grafhome user enrollment provisioner" }}"#;
+const HOST_BOOTSTRAP_X509_DENY_TEMPLATE: &str =
+    r#"{{ fail "x509 issuance disabled for Grafhome host bootstrap provisioner" }}"#;
+const USER_ENROLLMENT_SSH_TEMPLATE: &str = r#"{
+  "type": "user",
+  "keyId": {{ toJson .KeyID }},
+  "principals": {{ toJson .Principals }},
+  "criticalOptions": {{ toJson .CriticalOptions }},
+  "extensions": {{ toJson .Extensions }}
+}
+"#;
+const HOST_BOOTSTRAP_SSH_TEMPLATE: &str = r#"{
+  "type": "host",
+  "keyId": {{ toJson .KeyID }},
+  "principals": {{ toJson .Principals }},
+  "criticalOptions": {{ toJson .CriticalOptions }},
+  "extensions": {{ toJson .Extensions }}
+}
+"#;
 
 /// Result of reconciling managed Smallstep claims against policy.
 #[derive(Debug, Eq, PartialEq)]
@@ -48,16 +71,28 @@ pub fn reconcile_claims(
         let Some(name) = item.get("name").and_then(Value::as_str).map(str::to_owned) else {
             continue;
         };
-        let desired = if name == user.name || parse_user_provisioner_name(&name).is_some() {
+        let desired = if name == user.name {
             user_claims(user)
-        } else if name == host.name || parse_host_provisioner_name(&name).is_some() {
+        } else if parse_user_provisioner_name(&name).is_some() {
+            user_renewal_claims(model, user)
+        } else if name == host.name {
             host_claims(host)
+        } else if parse_host_provisioner_name(&name).is_some() {
+            host_renewal_claims(model, host)
         } else if name == proxy.name {
             proxy_claims(proxy)
         } else {
             continue;
         };
-        if reconcile_provisioner_claims(item, &name, desired, ca_json)? {
+        let claims_changed = reconcile_provisioner_claims(item, &name, desired, ca_json)?;
+        let options_changed = if name == user.name {
+            reconcile_enrollment_options(item, user, ca_json)?
+        } else if name == host.name {
+            reconcile_enrollment_options(item, host, ca_json)?
+        } else {
+            false
+        };
+        if claims_changed || options_changed {
             updated.push(name);
         }
     }
@@ -84,6 +119,13 @@ fn user_claims(provisioner: &Provisioner) -> Map<String, Value> {
     user_claims_for(&provisioner.default_ttl, &provisioner.max_ttl)
 }
 
+fn user_renewal_claims(model: &SiteModel, provisioner: &Provisioner) -> Map<String, Value> {
+    user_claims_for(
+        provisioner.renewal_default_ttl(),
+        model.policy.renewal_max_ttl(provisioner),
+    )
+}
+
 fn user_claims_for(default_ttl: &str, max_ttl: &str) -> Map<String, Value> {
     Map::from_iter([
         (
@@ -100,6 +142,13 @@ fn user_claims_for(default_ttl: &str, max_ttl: &str) -> Map<String, Value> {
 
 fn host_claims(provisioner: &Provisioner) -> Map<String, Value> {
     host_claims_for(&provisioner.default_ttl, &provisioner.max_ttl)
+}
+
+fn host_renewal_claims(model: &SiteModel, provisioner: &Provisioner) -> Map<String, Value> {
+    host_claims_for(
+        provisioner.renewal_default_ttl(),
+        model.policy.renewal_max_ttl(provisioner),
+    )
 }
 
 fn host_claims_for(default_ttl: &str, max_ttl: &str) -> Map<String, Value> {
@@ -207,26 +256,56 @@ fn reconcile_required_provisioner(
             message: format!("provisioner {} key must be an object", provisioner.name),
         });
     }
-    if live.get("encryptedKey").and_then(Value::as_str).is_none() {
-        return Err(Error::Validation {
-            field: format!("{}:authority.provisioners", ca_json.display()),
-            message: format!(
-                "provisioner {} encryptedKey must be a string",
-                provisioner.name
-            ),
-        });
-    }
     reconcile_provisioner_claims(
         &mut provisioners[index],
         &provisioner.name,
         desired,
         ca_json,
     )?;
+    reconcile_enrollment_options(&mut provisioners[index], provisioner, ca_json)?;
     Ok(())
 }
 
-/// Install the exact constrained state for one Grafhome-owned scoped provisioner.
-fn upsert_scoped_provisioner(
+fn enrollment_options(provisioner: &Provisioner) -> Option<Value> {
+    let (x509, ssh) = match provisioner.role.as_str() {
+        "user_enrollment" => (
+            USER_ENROLLMENT_X509_DENY_TEMPLATE,
+            USER_ENROLLMENT_SSH_TEMPLATE,
+        ),
+        "host_bootstrap" => (
+            HOST_BOOTSTRAP_X509_DENY_TEMPLATE,
+            HOST_BOOTSTRAP_SSH_TEMPLATE,
+        ),
+        _ => return None,
+    };
+    Some(json!({
+        "x509": {"template": x509},
+        "ssh": {"template": ssh},
+    }))
+}
+
+fn reconcile_enrollment_options(
+    live: &mut Value,
+    provisioner: &Provisioner,
+    ca_json: &Path,
+) -> Result<bool> {
+    let Some(options) = enrollment_options(provisioner) else {
+        return Ok(false);
+    };
+    let object = live.as_object_mut().ok_or_else(|| Error::Validation {
+        field: format!("{}:authority.provisioners", ca_json.display()),
+        message: format!("provisioner {} must be an object", provisioner.name),
+    })?;
+    if object.get("options") == Some(&options) {
+        Ok(false)
+    } else {
+        object.insert("options".to_owned(), options);
+        Ok(true)
+    }
+}
+
+/// Install the exact constrained state for one Grafhome-owned renewal provisioner.
+fn upsert_renewal_provisioner(
     provisioners: &mut Vec<Value>,
     desired: Value,
     ca_json: &Path,
@@ -236,7 +315,7 @@ fn upsert_scoped_provisioner(
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Validation {
             field: format!("{}:authority.provisioners", ca_json.display()),
-            message: "desired scoped provisioner must have a string name".to_owned(),
+            message: "desired renewal provisioner must have a string name".to_owned(),
         })?
         .to_owned();
     let matching = provisioners
@@ -268,7 +347,7 @@ fn upsert_scoped_provisioner(
         });
     }
 
-    // Public-key equality proves this is the same scoped identity. Replace the full object so
+    // Public-key equality proves this is the same renewal identity. Replace the full object so
     // stale claims, encrypted signing keys, webhooks, or templates cannot broaden its authority.
     *existing = desired;
     Ok(())
@@ -309,16 +388,49 @@ fn host_provisioner(key: Value, name: &str, template: String, claims: Map<String
     })
 }
 
-/// Replace rendered JWK placeholders with runtime-generated provisioner objects.
+/// Validate enrollment credentials and replace rendered JWK placeholders.
 pub fn materialize(
     model: &SiteModel,
     live_ca_json: impl AsRef<Path>,
     staged_ca_json: impl AsRef<Path>,
     jwk_dir: impl AsRef<Path>,
+    step_bin: impl AsRef<Path>,
 ) -> Result<String> {
     let live_ca_json = live_ca_json.as_ref();
     let staged_ca_json = staged_ca_json.as_ref();
     let jwk_dir = jwk_dir.as_ref();
+    let live = read_json(live_ca_json)?;
+    let live_jwks = live_jwk_provisioners(&live, live_ca_json)?;
+    for role in ["host_bootstrap", "user_enrollment"] {
+        let provisioner = active_provisioner(model, role)?;
+        let canonical_path = jwk_dir.join(format!("{}.pub.json", provisioner.name));
+        let canonical;
+        let expected = if let Some(live) = live_jwks.get(&provisioner.name) {
+            live.get("key").ok_or_else(|| Error::Validation {
+                field: format!("live enrollment provisioner {}.key", provisioner.name),
+                message: "public JWK is missing".to_owned(),
+            })?
+        } else {
+            canonical = read_public_jwk(&canonical_path)?;
+            &canonical
+        };
+        validate_enrollment_provisioner_key_files(
+            model,
+            jwk_dir,
+            &provisioner.name,
+            expected,
+            step_bin.as_ref(),
+        )?;
+    }
+    merge_materialized(model, live_ca_json, staged_ca_json, jwk_dir)
+}
+
+fn merge_materialized(
+    model: &SiteModel,
+    live_ca_json: &Path,
+    staged_ca_json: &Path,
+    jwk_dir: &Path,
+) -> Result<String> {
     let live = read_json(live_ca_json)?;
     let mut staged = read_json(staged_ca_json)?;
     let live_jwks = live_jwk_provisioners(&live, live_ca_json)?;
@@ -327,7 +439,7 @@ pub fn materialize(
 
     for provisioner in &active_jwks {
         let object = if let Some(live) = live_jwks.get(&provisioner.name) {
-            runtime_jwk_from_live(model, provisioner, live)?
+            runtime_jwk_from_live(model, provisioner, live, jwk_dir)?
         } else {
             runtime_jwk_from_files(model, provisioner, jwk_dir)?
         };
@@ -368,6 +480,35 @@ pub fn materialize(
         });
     }
 
+    let mut names = provisioners
+        .iter()
+        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let user_policy = active_provisioner(model, "user_enrollment")?;
+    let host_policy = active_provisioner(model, "host_bootstrap")?;
+    for (name, mut item) in live_jwks {
+        let desired = if parse_user_provisioner_name(&name).is_some() {
+            user_renewal_claims(model, user_policy)
+        } else if parse_host_provisioner_name(&name).is_some() {
+            host_renewal_claims(model, host_policy)
+        } else {
+            continue;
+        };
+        require_object_field(&item, "key", &name)?;
+        if !names.insert(name.clone()) {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", staged_ca_json.display()),
+                message: format!("renewal provisioner {name} collides with staged state"),
+            });
+        }
+        item.as_object_mut()
+            .expect("live JWK provisioner is an object")
+            .remove("encryptedKey");
+        reconcile_provisioner_claims(&mut item, &name, desired, live_ca_json)?;
+        provisioners.push(item);
+    }
+
     serde_json::to_string_pretty(&staged).map_err(|source| Error::Json {
         path: staged_ca_json.to_path_buf(),
         source,
@@ -392,14 +533,14 @@ fn add_user_client(
 
     let desired =
         user_client_provisioner(key, name, template, user_claims_for(default_ttl, max_ttl));
-    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
+    upsert_renewal_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
 }
 
 /// Reconcile the user enrollment issuer and one constrained user/client-host issuer.
 ///
-/// The static enrollment issuer authorizes the first certificate while the scoped issuer
+/// The enrollment provisioner authorizes the first certificate while the renewal provisioner
 /// authorizes later renewals. Updating both in one serialized configuration keeps issuance and
 /// renewal on the same policy before the caller activates the CA state.
 pub fn reconcile_user_client(
@@ -418,8 +559,8 @@ pub fn reconcile_user_client(
     let provisioners = provisioners_mut(&mut config, ca_json)?;
 
     reconcile_required_provisioner(provisioners, policy, user_claims(policy), ca_json)?;
-    let desired = user_client_provisioner(key, name, template, user_claims(policy));
-    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
+    let desired = user_client_provisioner(key, name, template, user_renewal_claims(model, policy));
+    upsert_renewal_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
 }
@@ -439,18 +580,18 @@ fn add_host(
     let key = read_public_jwk(public_key)?;
     let template = read_text(Path::new(template_file))?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
-    // A retained SSHPOP provisioner would bypass host-scoped revocation.
+    // A retained SSHPOP provisioner would bypass device-bound revocation.
     provisioners.retain(|item| item.get("type").and_then(Value::as_str) != Some("SSHPOP"));
 
     let desired = host_provisioner(key, name, template, host_claims_for(default_ttl, max_ttl));
-    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
+    upsert_renewal_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
 }
 
 /// Reconcile the host bootstrap issuer and one constrained host issuer.
 ///
-/// The static bootstrap issuer authorizes the first certificate while the scoped issuer
+/// The bootstrap provisioner authorizes the first certificate while the renewal provisioner
 /// authorizes later renewals. Updating both in one serialized configuration keeps issuance and
 /// renewal on the same policy before the caller activates the CA state.
 pub fn reconcile_host(
@@ -467,17 +608,17 @@ pub fn reconcile_host(
     let template = read_text(Path::new(template_file))?;
     let policy = active_provisioner(model, "host_bootstrap")?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
-    // A retained SSHPOP provisioner would bypass host-scoped revocation.
+    // A retained SSHPOP provisioner would bypass device-bound revocation.
     provisioners.retain(|item| item.get("type").and_then(Value::as_str) != Some("SSHPOP"));
 
     reconcile_required_provisioner(provisioners, policy, host_claims(policy), ca_json)?;
-    let desired = host_provisioner(key, name, template, host_claims(policy));
-    upsert_scoped_provisioner(provisioners, desired, ca_json)?;
+    let desired = host_provisioner(key, name, template, host_renewal_claims(model, policy));
+    upsert_renewal_provisioner(provisioners, desired, ca_json)?;
 
     serialize_config(config, ca_json)
 }
 
-/// Remove one exact scoped JWK provisioner from an existing CA config.
+/// Remove one exact renewal JWK provisioner from an existing CA config.
 pub fn remove_exact(ca_json: impl AsRef<Path>, name: &str) -> Result<(String, Vec<String>)> {
     remove_matching(ca_json, |item_name, _| item_name == Some(name))
 }
@@ -577,17 +718,65 @@ fn read_text(path: &Path) -> Result<String> {
 
 fn read_public_jwk(path: &Path) -> Result<Value> {
     let key = read_json(path)?;
-    let object = key.as_object().ok_or_else(|| Error::Validation {
-        field: path.display().to_string(),
+    validate_public_jwk(&key, &path.display().to_string())?;
+    Ok(key)
+}
+
+/// Extract the RFC public key members from an EC, OKP, or RSA JWK.
+pub fn jwk_public_material(jwk: &Value, field: &str) -> Result<Value> {
+    let object = jwk.as_object().ok_or_else(|| Error::Validation {
+        field: field.to_owned(),
+        message: "JWK must be a JSON object".to_owned(),
+    })?;
+    let kty = object
+        .get("kty")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Validation {
+            field: field.to_owned(),
+            message: "JWK must have a string kty".to_owned(),
+        })?;
+    let members: &[&str] = match kty {
+        "EC" => &["crv", "kty", "x", "y"],
+        "OKP" => &["crv", "kty", "x"],
+        "RSA" => &["e", "kty", "n"],
+        _ => {
+            return Err(Error::Validation {
+                field: field.to_owned(),
+                message: format!("unsupported JWK type {kty}"),
+            });
+        }
+    };
+    let mut material = Map::new();
+    for member in members {
+        let value =
+            object
+                .get(*member)
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Validation {
+                    field: field.to_owned(),
+                    message: format!("JWK must have a string {member}"),
+                })?;
+        material.insert((*member).to_owned(), Value::String(value.to_owned()));
+    }
+    Ok(Value::Object(material))
+}
+
+/// Validate that a JWK contains only public key material and return its RFC members.
+pub fn validate_public_jwk(jwk: &Value, field: &str) -> Result<Value> {
+    let object = jwk.as_object().ok_or_else(|| Error::Validation {
+        field: field.to_owned(),
         message: "public JWK must be a JSON object".to_owned(),
     })?;
-    if object.contains_key("d") {
+    if ["d", "k", "p", "q", "dp", "dq", "qi", "oth"]
+        .iter()
+        .any(|member| object.contains_key(*member))
+    {
         return Err(Error::Validation {
-            field: path.display().to_string(),
+            field: field.to_owned(),
             message: "public JWK must not contain private key material".to_owned(),
         });
     }
-    Ok(key)
+    jwk_public_material(jwk, field)
 }
 
 fn active_jwk_provisioners(model: &SiteModel) -> Vec<&Provisioner> {
@@ -619,7 +808,12 @@ fn live_jwk_provisioners(live: &Value, path: &Path) -> Result<BTreeMap<String, V
                 field: format!("{}:authority.provisioners[].name", path.display()),
                 message: "JWK provisioner is missing a name".to_owned(),
             })?;
-        by_name.insert(name.to_owned(), item.clone());
+        if by_name.insert(name.to_owned(), item.clone()).is_some() {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", path.display()),
+                message: format!("duplicate live JWK provisioner {name}"),
+            });
+        }
     }
     Ok(by_name)
 }
@@ -628,13 +822,37 @@ fn runtime_jwk_from_live(
     model: &SiteModel,
     provisioner: &Provisioner,
     live: &Value,
+    jwk_dir: &Path,
 ) -> Result<Value> {
     let mut object = live.clone();
     require_object_field(&object, "key", &provisioner.name)?;
-    require_object_field(&object, "encryptedKey", &provisioner.name)?;
+    let live_key = &object["key"];
+    let public_path = jwk_dir.join(format!("{}.pub.json", provisioner.name));
+    let public = read_public_jwk(&public_path)?;
+    require_enrollment_credential_files(jwk_dir, &provisioner.name)?;
+    if jwk_public_material(
+        live_key,
+        &format!("live provisioner {}.key", provisioner.name),
+    )? != validate_public_jwk(&public, &public_path.display().to_string())?
+    {
+        return Err(Error::Validation {
+            field: public_path.display().to_string(),
+            message: format!(
+                "public JWK does not match live enrollment provisioner {}",
+                provisioner.name
+            ),
+        });
+    }
+    object
+        .as_object_mut()
+        .expect("live JWK provisioner is an object")
+        .remove("encryptedKey");
     object["type"] = json!("JWK");
     object["name"] = json!(provisioner.name);
     object["claims"] = crate::render::active_provisioner_claims(model, &provisioner.name)?;
+    if let Some(options) = enrollment_options(provisioner) {
+        object["options"] = options;
+    }
     Ok(object)
 }
 
@@ -644,16 +862,154 @@ fn runtime_jwk_from_files(
     jwk_dir: &Path,
 ) -> Result<Value> {
     let public_path = jwk_dir.join(format!("{}.pub.json", provisioner.name));
-    let private_path = jwk_dir.join(format!("{}.priv.json", provisioner.name));
-    let public = read_json(&public_path)?;
-    let encrypted = read_text(&private_path)?;
-    Ok(json!({
+    let public = read_public_jwk(&public_path)?;
+    require_enrollment_credential_files(jwk_dir, &provisioner.name)?;
+    let mut object = json!({
         "type": "JWK",
         "name": provisioner.name,
         "key": public,
-        "encryptedKey": encrypted.trim_end_matches('\n'),
         "claims": crate::render::active_provisioner_claims(model, &provisioner.name)?,
-    }))
+    });
+    if let Some(options) = enrollment_options(provisioner) {
+        object["options"] = options;
+    }
+    Ok(object)
+}
+
+/// Prove that one server-local enrollment key can sign for its live public JWK.
+pub fn validate_enrollment_provisioner_key_files(
+    model: &SiteModel,
+    jwk_dir: &Path,
+    name: &str,
+    expected_live_key: &Value,
+    step_bin: &Path,
+) -> Result<()> {
+    let public_path = jwk_dir.join(format!("{name}.pub.json"));
+    let public_metadata = std::fs::symlink_metadata(&public_path)
+        .map_err(|source| Error::io(&public_path, source))?;
+    if !public_metadata.file_type().is_file() {
+        return Err(Error::Validation {
+            field: public_path.display().to_string(),
+            message: "enrollment provisioner public JWK must be a regular file".to_owned(),
+        });
+    }
+    let public = read_json(&public_path)?;
+    let public_material = validate_public_jwk(&public, &public_path.display().to_string())?;
+    let expected_material = jwk_public_material(
+        expected_live_key,
+        &format!("live enrollment provisioner {name}.key"),
+    )?;
+    if public_material != expected_material {
+        return Err(Error::Validation {
+            field: public_path.display().to_string(),
+            message: format!("public JWK does not match live enrollment provisioner {name}"),
+        });
+    }
+
+    require_enrollment_credential_files(jwk_dir, name)?;
+    let private_path = jwk_dir.join(format!("{name}.priv.json"));
+    let password_path = jwk_dir.join(format!("{name}.password"));
+    let password =
+        std::fs::read(&password_path).map_err(|source| Error::io(&password_path, source))?;
+    let intermediate_path = Path::new(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]);
+    let intermediate =
+        std::fs::read(intermediate_path).map_err(|source| Error::io(intermediate_path, source))?;
+    if password == intermediate {
+        return Err(Error::Validation {
+            field: password_path.display().to_string(),
+            message:
+                "enrollment provisioner password must differ from the intermediate CA password"
+                    .to_owned(),
+        });
+    }
+
+    let encrypted = read_json(&private_path)?;
+    let encrypted = encrypted.as_object().ok_or_else(|| Error::Validation {
+        field: private_path.display().to_string(),
+        message: "enrollment provisioner private key must be an encrypted JWE object".to_owned(),
+    })?;
+    if !["protected", "iv", "ciphertext", "tag", "encrypted_key"]
+        .iter()
+        .all(|field| encrypted.get(*field).and_then(Value::as_str).is_some())
+    {
+        return Err(Error::Validation {
+            field: private_path.display().to_string(),
+            message: "enrollment provisioner private key must be an encrypted JWE object"
+                .to_owned(),
+        });
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix(".grafhome-ca-enrollment-key-check-")
+        .tempdir_in(jwk_dir)
+        .map_err(|source| Error::io(jwk_dir, source))?;
+    let plaintext = temp.path().join("plaintext.jwk");
+    let status = Command::new(step_bin)
+        .arg("crypto")
+        .arg("key")
+        .arg("format")
+        .arg(&private_path)
+        .arg("--jwk")
+        .arg("--password-file")
+        .arg(&password_path)
+        .arg("--out")
+        .arg(&plaintext)
+        .arg("--insecure")
+        .arg("--no-password")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| Error::io(step_bin, source))?;
+    if !status.success() {
+        return Err(Error::Validation {
+            field: private_path.display().to_string(),
+            message: format!(
+                "encrypted private JWK could not be decrypted with its password for {name}"
+            ),
+        });
+    }
+    let private = read_json(&plaintext)?;
+    if jwk_public_material(&private, &plaintext.display().to_string())? != public_material {
+        return Err(Error::Validation {
+            field: private_path.display().to_string(),
+            message: format!("encrypted private JWK does not match public JWK for {name}"),
+        });
+    }
+    Ok(())
+}
+
+fn require_enrollment_credential_files(jwk_dir: &Path, name: &str) -> Result<()> {
+    for suffix in ["priv.json", "password"] {
+        let path = jwk_dir.join(format!("{name}.{suffix}"));
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|source| Error::io(&path, source))?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::Validation {
+                field: path.display().to_string(),
+                message: "enrollment provisioner credential must be a regular file".to_owned(),
+            });
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Validation {
+                field: path.display().to_string(),
+                message:
+                    "enrollment provisioner credential must not be accessible by group or others"
+                        .to_owned(),
+            });
+        }
+        if std::fs::read(&path)
+            .map_err(|source| Error::io(&path, source))?
+            .is_empty()
+        {
+            return Err(Error::Validation {
+                field: path.display().to_string(),
+                message: "enrollment provisioner credential must not be empty".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn require_object_field(object: &Value, field: &str, name: &str) -> Result<()> {
@@ -743,7 +1099,7 @@ mod tests {
         let client_name = crate::enrollment::user_provisioner_name("alice", "ca-host");
         let client = by_name[client_name.as_str()];
         assert_eq!(client["options"]["ssh"]["templateFile"], "preserve.tpl");
-        assert_eq!(client["claims"]["maxUserSSHCertDuration"], "2562047h");
+        assert_eq!(client["claims"]["maxUserSSHCertDuration"], "48h");
         let host_name = crate::enrollment::host_provisioner_name("proxy-host");
         assert_eq!(
             by_name[host_name.as_str()]["claims"]["maxHostSSHCertDuration"],
@@ -775,7 +1131,11 @@ mod tests {
         let original = r#"{"authority":{"provisioners":[]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, "user-template").unwrap();
 
@@ -804,7 +1164,11 @@ mod tests {
         let original = r#"{"authority":{"provisioners":[{"name":"grafhome-user-enrollment"},{"name":"grafhome-user-enrollment"}]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, "user-template").unwrap();
 
@@ -833,7 +1197,11 @@ mod tests {
         let original = r#"{"authority":{"provisioners":[{"type":"ACME","name":"grafhome-user-enrollment","key":{},"encryptedKey":"encrypted"}]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, "user-template").unwrap();
 
@@ -855,31 +1223,32 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_user_client_rejects_missing_enrollment_issuer_secret() {
+    fn reconcile_user_client_accepts_public_only_enrollment_issuer() {
         let dir = tempdir().unwrap();
         let model = SiteModel::load(crate::example_config_root()).unwrap();
         let ca_json = dir.path().join("ca.json");
         let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-enrollment","key":{}}]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, "user-template").unwrap();
 
-        let error = reconcile_user_client(
+        let result = reconcile_user_client(
             &model,
             &ca_json,
             &public_key,
             "grafhome-user-alice-ca-host",
             template.to_str().unwrap(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("provisioner grafhome-user-enrollment encryptedKey must be a string")
-        );
+        assert!(!result.contains("encryptedKey"));
+        assert!(result.contains("x509 issuance disabled for Grafhome user enrollment"));
         assert_eq!(fs::read_to_string(&ca_json).unwrap(), original);
     }
 
@@ -907,9 +1276,37 @@ mod tests {
                   {
                     "type": "JWK",
                     "name": "grafhome-host-bootstrap",
-                    "key": {"kid": "bootstrap-kid"},
+                    "key": {"kid": "bootstrap-kid", "kty": "EC", "crv": "P-256", "x": "bootstrap-x", "y": "bootstrap-y"},
                     "encryptedKey": "encrypted-bootstrap",
                     "claims": {"enableSSHCA": true}
+                  },
+                  {
+                    "type": "JWK",
+                    "name": "grafhome-user-616c696365-63612d686f7374",
+                    "key": {"kid": "existing-user-renewal"},
+                    "encryptedKey": "remove-accidental-user-secret",
+                    "claims": {
+                      "defaultUserSSHCertDuration": "12h",
+                      "maxUserSSHCertDuration": "2562047h",
+                      "operatorClaim": true
+                    },
+                    "options": {
+                      "x509": {"template": "existing-user-x509"},
+                      "ssh": {"template": "existing-user-template"}
+                    }
+                  },
+                  {
+                    "type": "JWK",
+                    "name": "grafhome-host-70726f78792d686f7374",
+                    "key": {"kid": "existing-host-renewal"},
+                    "claims": {
+                      "defaultHostSSHCertDuration": "24h",
+                      "maxHostSSHCertDuration": "2562047h"
+                    },
+                    "options": {
+                      "x509": {"template": "existing-host-x509"},
+                      "ssh": {"template": "existing-host-template", "templateFile": "preserve.tpl"}
+                    }
                   }
                 ]
               }
@@ -918,18 +1315,29 @@ mod tests {
         .unwrap();
         let jwk_dir = dir.path().join("provisioners");
         fs::create_dir(&jwk_dir).unwrap();
-        fs::write(
-            jwk_dir.join("grafhome-user-enrollment.pub.json"),
-            r#"{"kid":"user-enrollment-kid","kty":"EC"}"#,
-        )
-        .unwrap();
-        fs::write(
-            jwk_dir.join("grafhome-user-enrollment.priv.json"),
-            "{\n  \"protected\": \"encrypted-user-enrollment\"\n}\n",
-        )
-        .unwrap();
+        for (name, public) in [
+            (
+                "grafhome-host-bootstrap",
+                r#"{"kid":"bootstrap-kid","kty":"EC","crv":"P-256","x":"bootstrap-x","y":"bootstrap-y"}"#,
+            ),
+            (
+                "grafhome-user-enrollment",
+                r#"{"kid":"user-enrollment-kid","kty":"EC","crv":"P-256","x":"enrollment-x","y":"enrollment-y"}"#,
+            ),
+        ] {
+            fs::write(jwk_dir.join(format!("{name}.pub.json")), public).unwrap();
+            let private = jwk_dir.join(format!("{name}.priv.json"));
+            let password = jwk_dir.join(format!("{name}.password"));
+            fs::write(&private, r#"{"protected":"jwe"}"#).unwrap();
+            fs::write(&password, "independent-password").unwrap();
+            #[cfg(unix)]
+            {
+                fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
 
-        let text = materialize(&model, &live_path, &staged_path, &jwk_dir).unwrap();
+        let text = merge_materialized(&model, &live_path, &staged_path, &jwk_dir).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         let provisioners = value["authority"]["provisioners"].as_array().unwrap();
 
@@ -939,23 +1347,48 @@ mod tests {
             .find(|item| item["name"] == "grafhome-host-bootstrap")
             .unwrap();
         assert_eq!(bootstrap["key"]["kid"], "bootstrap-kid");
-        assert_eq!(bootstrap["encryptedKey"], "encrypted-bootstrap");
+        assert!(bootstrap.get("encryptedKey").is_none());
+        assert!(
+            bootstrap["options"]["ssh"]["template"]
+                .as_str()
+                .unwrap()
+                .contains("\"type\": \"host\"")
+        );
         assert_eq!(bootstrap["claims"]["defaultHostSSHCertDuration"], "168h");
         let user_enrollment = provisioners
             .iter()
             .find(|item| item["name"] == "grafhome-user-enrollment")
             .unwrap();
         assert_eq!(user_enrollment["key"]["kid"], "user-enrollment-kid");
-        assert!(
-            user_enrollment["encryptedKey"]
-                .as_str()
-                .unwrap()
-                .contains("encrypted-user-enrollment")
-        );
+        assert!(user_enrollment.get("encryptedKey").is_none());
         assert_eq!(
             user_enrollment["claims"]["defaultUserSSHCertDuration"],
             "24h"
         );
+        let user_renewal = provisioners
+            .iter()
+            .find(|item| item["name"] == "grafhome-user-616c696365-63612d686f7374")
+            .unwrap();
+        assert_eq!(user_renewal["key"]["kid"], "existing-user-renewal");
+        assert_eq!(
+            user_renewal["options"]["ssh"]["template"],
+            "existing-user-template"
+        );
+        assert_eq!(user_renewal["claims"]["defaultUserSSHCertDuration"], "24h");
+        assert_eq!(user_renewal["claims"]["maxUserSSHCertDuration"], "48h");
+        assert_eq!(user_renewal["claims"]["operatorClaim"], true);
+        assert!(user_renewal.get("encryptedKey").is_none());
+        let host_renewal = provisioners
+            .iter()
+            .find(|item| item["name"] == "grafhome-host-70726f78792d686f7374")
+            .unwrap();
+        assert_eq!(host_renewal["key"]["kid"], "existing-host-renewal");
+        assert_eq!(
+            host_renewal["options"]["ssh"]["templateFile"],
+            "preserve.tpl"
+        );
+        assert_eq!(host_renewal["claims"]["defaultHostSSHCertDuration"], "168h");
+        assert_eq!(host_renewal["claims"]["maxHostSSHCertDuration"], "720h");
         assert!(!provisioners.iter().any(|item| item["type"] == "SSHPOP"));
         assert!(
             provisioners
@@ -970,7 +1403,11 @@ mod tests {
         let ca_json = dir.path().join("ca.json");
         fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
 
@@ -1019,7 +1456,7 @@ mod tests {
                         {
                             "type": "JWK",
                             "name": "grafhome-user-alice-ca-host",
-                            "key": {"kid": "client-kid", "kty": "EC"},
+                            "key": {"kid": "client-kid", "kty": "EC", "crv": "P-256", "x": "client-x", "y": "client-y"},
                             "claims": {
                                 "defaultUserSSHCertDuration": "12h",
                                 "maxUserSSHCertDuration": "168h",
@@ -1040,7 +1477,11 @@ mod tests {
         )
         .unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, r#"{"type":"user","principals":["alice"]}"#).unwrap();
 
@@ -1137,7 +1578,11 @@ mod tests {
         )
         .unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"host-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"host-kid","kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("host.tpl");
         fs::write(&template, r#"{"type":"host","principals":["edge"]}"#).unwrap();
 
@@ -1178,7 +1623,7 @@ mod tests {
                     "provisioners": [{
                         "type": "JWK",
                         "name": "grafhome-host-edge",
-                        "key": {"kid": "host-kid", "kty": "EC"},
+                        "key": {"kid": "host-kid", "kty": "EC", "crv": "P-256", "x": "host-x", "y": "host-y"},
                         "claims": {
                             "defaultHostSSHCertDuration": "24h",
                             "maxHostSSHCertDuration": "168h",
@@ -1196,7 +1641,11 @@ mod tests {
         )
         .unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"host-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"host-kid","kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("host.tpl");
         fs::write(&template, r#"{"type":"host","principals":["edge"]}"#).unwrap();
 
@@ -1243,10 +1692,14 @@ mod tests {
     fn rejects_existing_user_client_provisioner_with_different_key() {
         let dir = tempdir().unwrap();
         let ca_json = dir.path().join("ca.json");
-        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"other","kty":"EC"}}]}}"#;
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"other","kty":"EC","crv":"P-256","x":"other-x","y":"other-y"}}]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, "user-template").unwrap();
 
@@ -1268,10 +1721,14 @@ mod tests {
     fn rejects_existing_host_provisioner_with_different_key() {
         let dir = tempdir().unwrap();
         let ca_json = dir.path().join("ca.json");
-        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-edge","key":{"kid":"other","kty":"EC"}}]}}"#;
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-edge","key":{"kid":"other","kty":"EC","crv":"P-256","x":"other-x","y":"other-y"}}]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"host-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"host-kid","kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("host.tpl");
         fs::write(&template, "host-template").unwrap();
 
@@ -1290,13 +1747,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_scoped_provisioner_names() {
+    fn rejects_duplicate_renewal_provisioner_names() {
         let dir = tempdir().unwrap();
         let ca_json = dir.path().join("ca.json");
-        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"client-kid","kty":"EC"}},{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"client-kid","kty":"EC"}}]}}"#;
+        let original = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}},{"type":"JWK","name":"grafhome-user-alice-ca-host","key":{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}}]}}"#;
         fs::write(&ca_json, original).unwrap();
         let public_key = dir.path().join("provisioner.pub.json");
-        fs::write(&public_key, r#"{"kid":"client-kid","kty":"EC"}"#).unwrap();
+        fs::write(
+            &public_key,
+            r#"{"kid":"client-kid","kty":"EC","crv":"P-256","x":"client-x","y":"client-y"}"#,
+        )
+        .unwrap();
         let template = dir.path().join("user.tpl");
         fs::write(&template, "user-template").unwrap();
 
@@ -1365,12 +1826,44 @@ mod tests {
         let jwk_dir = dir.path().join("provisioners");
         fs::create_dir(&jwk_dir).unwrap();
 
-        let error = materialize(&model, &live_path, &staged_path, &jwk_dir).unwrap_err();
+        let error = merge_materialized(&model, &live_path, &staged_path, &jwk_dir).unwrap_err();
 
         assert!(
             error
                 .to_string()
-                .contains("grafhome-user-enrollment.pub.json")
+                .contains("grafhome-host-bootstrap.pub.json")
         );
+    }
+
+    #[test]
+    fn live_enrollment_provisioner_rejects_a_mismatched_canonical_public_key() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let provisioner = active_provisioner(&model, "host_bootstrap").unwrap();
+        let private = dir.path().join(format!("{}.priv.json", provisioner.name));
+        let password = dir.path().join(format!("{}.password", provisioner.name));
+        fs::write(
+            dir.path().join(format!("{}.pub.json", provisioner.name)),
+            r#"{"kty":"EC","crv":"P-256","x":"wrong-x","y":"wrong-y"}"#,
+        )
+        .unwrap();
+        fs::write(&private, "encrypted").unwrap();
+        fs::write(&password, "independent-password").unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let live = json!({
+            "type": "JWK",
+            "name": provisioner.name,
+            "key": {"kty":"EC","crv":"P-256","x":"live-x","y":"live-y"}
+        });
+
+        let error = runtime_jwk_from_live(&model, provisioner, &live, dir.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not match live enrollment provisioner"));
     }
 }

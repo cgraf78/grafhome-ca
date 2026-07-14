@@ -14,7 +14,7 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 - Parse and validate the private site policy without compiling it into the binary.
 - Render non-secret config into a staging directory from typed policy.
 - Export public CA trust material from initialized Smallstep state for reviewed rollout.
-- Provide CLIs for validation, scoped enrollment, renewal, and revocation.
+- Provide CLIs for validation, policy-controlled enrollment, renewal, and revocation.
 - Keep machine-readable statuses and identifiers centralized.
 
 ## Non-Rust Responsibilities
@@ -35,12 +35,26 @@ artifact retains structural cross-build coverage.
 ## Safety Contract
 
 Enrollment and identity revocation are the narrow live-mutation boundary.
-`approve user` and `approve host` install scoped JWK provisioners on the CA
-origin and roll back if CA activation or health verification fails. Private JWK
-material never leaves its enrolled host. `revoke user` and
+`approve user` and `approve host` install device-bound renewal JWK provisioners
+on the CA origin and roll back if CA activation or health verification fails.
+Private JWK material never leaves its enrolled host. `revoke user` and
 `revoke host` remove those provisioners, disabling future issuance and renewal
 without certificate serial lookup. Existing SSH certificates remain valid until
 expiry because OpenSSH does not perform online CA revocation checks.
+The two broad enrollment provisioners keep only their public JWKs in `ca.json`.
+Their encrypted private JWKs and independent passwords are server-local inputs
+to operator token creation, so `/provisioners` cannot publish an offline
+password-cracking target. Enrollment provisioners deny X.509 issuance and force
+the intended SSH certificate type. Device-bound renewal provisioners pin exact
+principals, deny X.509 issuance, and enforce finite renewal claims.
+Authority-wide SSH allow-lists provide a final policy check over all configured
+user and host principals.
+Routine user enrollment grants retain document version 1. An exceptional
+effectively-infinite grant uses version 2, which makes pre-feature clients fail
+before issuance. A compatible client preserves that initial certificate and
+tests the finite renewal path with temporary output. This version boundary is
+deliberate because silently treating the exceptional grant as routine would
+replace the operator-approved certificate.
 Enrollment grants are bound to the requesting host's keys and the configured
 `ca_api` URL. Their root fingerprints use the fixed SHA-256 hexadecimal form;
 the copied grant remains the out-of-band trust handoff for first bootstrap.

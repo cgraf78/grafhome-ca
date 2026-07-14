@@ -1,6 +1,8 @@
 //! Grafhome CA policy, enrollment, and certificate CLI.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 #[cfg(unix)]
@@ -20,7 +22,10 @@ use grafhome_ca::enrollment::{
 };
 use grafhome_ca::executable::{root_step_bin, user_step_bin};
 use grafhome_ca::model::SiteModel;
-use grafhome_ca::policy::{Endpoint, Host, Provisioner, User, UserClient};
+use grafhome_ca::policy::{
+    Endpoint, Host, Provisioner, STEP_EFFECTIVE_UNLIMITED_TTL, UNLIMITED_TTL, User, UserClient,
+    duration_at_most, valid_step_duration_expression,
+};
 
 const USER_KEY_NAME: &str = "id_ed25519";
 #[cfg(target_os = "android")]
@@ -108,6 +113,11 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         out_file: PathBuf,
     },
+    /// Run an explicit one-time state migration.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
     /// Apply current policy to a local host.
     Apply {
         #[command(subcommand)]
@@ -150,6 +160,16 @@ enum Command {
         /// Also require the local credential material needed for unattended renewal.
         #[arg(long)]
         renewable: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MigrateCommand {
+    /// Prepare enrollment signing JWK files with separate passwords for materialization.
+    EnrollmentProvisionerKeys {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
     },
 }
 
@@ -207,8 +227,11 @@ enum ApproveCommand {
         #[arg(long)]
         ttl: Option<String>,
         /// SSH user certificate lifetime.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "effectively_infinite")]
         cert_ttl: Option<String>,
+        /// Issue the allowlisted user/client an effectively-infinite certificate.
+        #[arg(long)]
+        effectively_infinite: bool,
         /// Approve without an interactive confirmation (for automation).
         #[arg(long)]
         yes: bool,
@@ -431,17 +454,24 @@ fn run() -> grafhome_ca::Result<()> {
             jwk_dir,
             out_file,
         } => {
-            let config_root = resolve_config_root(config_root)?;
-            let model = SiteModel::load(&config_root)?;
-            grafhome_ca::schema::validate_config_root(&config_root)?;
-            let text = grafhome_ca::runtime_provisioners::materialize(
-                &model,
-                &live_ca_json,
-                &staged_ca_json,
-                &jwk_dir,
-            )?;
-            write_secret_file(&out_file, text.as_bytes())?;
-            Ok(())
+            let model = load_root_model(config_root, "materialize", false)?;
+            with_ca_lock(&model, || {
+                let step_bin = root_step_bin(&model)?;
+                let text = grafhome_ca::runtime_provisioners::materialize(
+                    &model,
+                    &live_ca_json,
+                    &staged_ca_json,
+                    &jwk_dir,
+                    &step_bin,
+                )?;
+                write_secret_file(&out_file, text.as_bytes())
+            })
+        }
+        Command::Migrate {
+            command: MigrateCommand::EnrollmentProvisionerKeys { config_root },
+        } => {
+            let model = load_root_model(config_root, "migrate enrollment provisioner keys", false)?;
+            with_ca_lock(&model, || migrate_enrollment_provisioner_keys(&model))
         }
         Command::Apply {
             command:
@@ -567,6 +597,7 @@ fn run() -> grafhome_ca::Result<()> {
                     request_file,
                     ttl,
                     cert_ttl,
+                    effectively_infinite,
                     yes,
                 },
         } => {
@@ -579,10 +610,27 @@ fn run() -> grafhome_ca::Result<()> {
             )?;
             let request: UserRequest =
                 parse_enrollment_document(&text, "public enrollment request")?;
+            request.validate()?;
+            let approved_cert_ttl = user_approval_cert_ttl(
+                &model,
+                &request,
+                cert_ttl.as_deref(),
+                effectively_infinite,
+            )?;
             if !yes {
-                confirm_user_approval(&request)?;
+                if effectively_infinite {
+                    confirm_effectively_infinite_user_approval(&request)?;
+                } else {
+                    confirm_user_approval(&request)?;
+                }
             }
-            approve_user_enrollment(&model, &request, ttl.as_deref(), cert_ttl.as_deref())
+            approve_user_enrollment(
+                &model,
+                &request,
+                ttl.as_deref(),
+                &approved_cert_ttl,
+                effectively_infinite,
+            )
         }
         Command::Revoke {
             command:
@@ -1340,7 +1388,7 @@ fn select_single_user_client<'a>(
 }
 
 fn checked_ttl(field: &str, ttl: &str) -> grafhome_ca::Result<String> {
-    if !valid_step_duration(ttl) {
+    if !valid_step_duration_expression(ttl) {
         return Err(grafhome_ca::Error::Validation {
             field: field.to_owned(),
             message: "duration must use Smallstep units such as 15m, 24h, 1.5h, or 2h45m"
@@ -1348,45 +1396,6 @@ fn checked_ttl(field: &str, ttl: &str) -> grafhome_ca::Result<String> {
         });
     }
     Ok(ttl.to_owned())
-}
-
-fn valid_step_duration(ttl: &str) -> bool {
-    let bytes = ttl.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if index < bytes.len() && bytes[index] == b'.' {
-            index += 1;
-            let fraction_start = index;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
-            }
-            if fraction_start == index {
-                return false;
-            }
-        }
-        if start == index {
-            return false;
-        }
-        let unit_len = if bytes[index..].starts_with(b"ns")
-            || bytes[index..].starts_with(b"us")
-            || bytes[index..].starts_with(b"ms")
-        {
-            2
-        } else if bytes[index..].starts_with(b"s")
-            || bytes[index..].starts_with(b"m")
-            || bytes[index..].starts_with(b"h")
-        {
-            1
-        } else {
-            return false;
-        };
-        index += unit_len;
-    }
-    index > 0
 }
 
 fn ca_root_cert_path(model: &SiteModel) -> PathBuf {
@@ -1466,6 +1475,286 @@ fn host_material_dir(model: &SiteModel, host: &str) -> PathBuf {
     PathBuf::from(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"])
         .join("secrets/hosts")
         .join(host)
+}
+
+fn enrollment_provisioner_dir(model: &SiteModel) -> PathBuf {
+    PathBuf::from(&model.deployment.values["GRAFHOME_CA_STATE_DIR"]).join("secrets/provisioners")
+}
+
+fn enrollment_provisioner_private_key(model: &SiteModel, name: &str) -> PathBuf {
+    enrollment_provisioner_dir(model).join(format!("{name}.priv.json"))
+}
+
+fn enrollment_provisioner_public_key(model: &SiteModel, name: &str) -> PathBuf {
+    enrollment_provisioner_dir(model).join(format!("{name}.pub.json"))
+}
+
+fn enrollment_provisioner_password(model: &SiteModel, name: &str) -> PathBuf {
+    enrollment_provisioner_dir(model).join(format!("{name}.password"))
+}
+
+fn enrollment_provisioner_credential(
+    model: &SiteModel,
+    name: &str,
+) -> grafhome_ca::Result<(PathBuf, PathBuf)> {
+    enrollment_provisioner_credential_in(model, &enrollment_provisioner_dir(model), name)
+}
+
+fn enrollment_provisioner_credential_in(
+    model: &SiteModel,
+    directory: &Path,
+    name: &str,
+) -> grafhome_ca::Result<(PathBuf, PathBuf)> {
+    let private_key = directory.join(format!("{name}.priv.json"));
+    let password = directory.join(format!("{name}.password"));
+    for path in [&private_key, &password] {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|source| grafhome_ca::Error::io(path, source))?;
+        if !metadata.file_type().is_file() {
+            return Err(grafhome_ca::Error::Validation {
+                field: path.display().to_string(),
+                message: "enrollment provisioner credential must be a regular file".to_owned(),
+            });
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(grafhome_ca::Error::Validation {
+                field: path.display().to_string(),
+                message:
+                    "enrollment provisioner credential must not be accessible by group or others"
+                        .to_owned(),
+            });
+        }
+        if std::fs::read(path)
+            .map_err(|source| grafhome_ca::Error::io(path, source))?
+            .is_empty()
+        {
+            return Err(grafhome_ca::Error::Validation {
+                field: path.display().to_string(),
+                message: "enrollment provisioner credential must not be empty".to_owned(),
+            });
+        }
+    }
+    let enrollment_password =
+        std::fs::read(&password).map_err(|source| grafhome_ca::Error::io(&password, source))?;
+    let intermediate_password_path =
+        Path::new(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]);
+    let intermediate_password = std::fs::read(intermediate_password_path)
+        .map_err(|source| grafhome_ca::Error::io(intermediate_password_path, source))?;
+    if enrollment_password == intermediate_password {
+        return Err(grafhome_ca::Error::Validation {
+            field: password.display().to_string(),
+            message:
+                "enrollment provisioner password must differ from the intermediate CA password"
+                    .to_owned(),
+        });
+    }
+    Ok((private_key, password))
+}
+
+fn live_provisioners<'a>(
+    live: &'a serde_json::Value,
+    ca_json: &Path,
+) -> grafhome_ca::Result<&'a [serde_json::Value]> {
+    live.pointer("/authority/provisioners")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| grafhome_ca::Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: "expected provisioners array".to_owned(),
+        })
+}
+
+fn unique_live_provisioner<'a>(
+    provisioners: &'a [serde_json::Value],
+    name: &str,
+    ca_json: &Path,
+) -> grafhome_ca::Result<&'a serde_json::Value> {
+    let matches = provisioners
+        .iter()
+        .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [live] => Ok(*live),
+        [] => Err(grafhome_ca::Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("live enrollment provisioner {name} is missing"),
+        }),
+        _ => Err(grafhome_ca::Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("live enrollment provisioner {name} is duplicated"),
+        }),
+    }
+}
+
+fn migrate_enrollment_provisioner_keys(model: &SiteModel) -> grafhome_ca::Result<()> {
+    let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+    let text = std::fs::read_to_string(&ca_json)
+        .map_err(|source| grafhome_ca::Error::io(&ca_json, source))?;
+    let live: serde_json::Value =
+        serde_json::from_str(&text).map_err(|source| grafhome_ca::Error::Json {
+            path: ca_json.clone(),
+            source,
+        })?;
+    let provisioners = live_provisioners(&live, &ca_json)?;
+    let directory = enrollment_provisioner_dir(model);
+    let directory_existed = directory.exists();
+    let directory_parent = directory
+        .parent()
+        .expect("enrollment provisioner directory has a parent");
+    let directory_parent_existed = directory_parent.exists();
+    std::fs::create_dir_all(&directory)
+        .map_err(|source| grafhome_ca::Error::io(&directory, source))?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|source| grafhome_ca::Error::io(&directory, source))?;
+        if !directory_parent_existed {
+            let state_dir = directory_parent
+                .parent()
+                .expect("CA secrets directory has a parent");
+            File::open(state_dir)
+                .and_then(|parent| parent.sync_all())
+                .map_err(|source| grafhome_ca::Error::io(state_dir, source))?;
+        }
+        if !directory_existed {
+            File::open(directory_parent)
+                .and_then(|parent| parent.sync_all())
+                .map_err(|source| grafhome_ca::Error::io(directory_parent, source))?;
+        }
+    }
+    let old_password = Path::new(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]);
+    let step_bin = root_step_bin(model)?;
+
+    for role in ["host_bootstrap", "user_enrollment"] {
+        let policy = required_provisioner(model, role)?;
+        let public_path = enrollment_provisioner_public_key(model, &policy.name);
+        let private_path = enrollment_provisioner_private_key(model, &policy.name);
+        let password_path = enrollment_provisioner_password(model, &policy.name);
+        let live = unique_live_provisioner(provisioners, &policy.name, &ca_json)?;
+        let public = live
+            .get("key")
+            .ok_or_else(|| grafhome_ca::Error::Validation {
+                field: format!("{}:{}:key", ca_json.display(), policy.name),
+                message: "live enrollment provisioner public JWK is missing".to_owned(),
+            })?;
+        if password_path.exists() {
+            grafhome_ca::runtime_provisioners::validate_enrollment_provisioner_key_files(
+                model,
+                &directory,
+                &policy.name,
+                public,
+                Path::new(&step_bin),
+            )?;
+            outln!(
+                "{} enrollment provisioner key already migrated",
+                policy.name
+            );
+            continue;
+        }
+        let encrypted = live
+            .get("encryptedKey")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| grafhome_ca::Error::Validation {
+                field: format!("{}:{}:encryptedKey", ca_json.display(), policy.name),
+                message:
+                    "live encrypted key is unavailable; restore it from backup before migration"
+                        .to_owned(),
+            })?;
+
+        let temp = tempfile::Builder::new()
+            .prefix(".grafhome-ca-enrollment-key-migration-")
+            .tempdir_in(&directory)
+            .map_err(|source| grafhome_ca::Error::io(&directory, source))?;
+        let source = temp.path().join("source.jwe");
+        let plaintext = temp.path().join("plaintext.jwk");
+        let migrated = temp.path().join("migrated.jwe");
+        let new_password = temp.path().join("password");
+        write_secret_file(&source, encrypted.as_bytes())?;
+        run_status(
+            process(&step_bin)
+                .arg("crypto")
+                .arg("key")
+                .arg("format")
+                .arg(&source)
+                .arg("--jwk")
+                .arg("--password-file")
+                .arg(old_password)
+                .arg("--out")
+                .arg(&plaintext)
+                .arg("--insecure")
+                .arg("--no-password"),
+        )?;
+        let password = run_capture(
+            process(&step_bin)
+                .arg("crypto")
+                .arg("rand")
+                .arg("--format")
+                .arg("hex")
+                .arg("64"),
+        )?;
+        if password.is_empty()
+            || password
+                == std::fs::read(old_password)
+                    .map_err(|source| grafhome_ca::Error::io(old_password, source))?
+        {
+            return Err(grafhome_ca::Error::Validation {
+                field: "step crypto rand".to_owned(),
+                message: "did not generate a distinct enrollment provisioner password".to_owned(),
+            });
+        }
+        write_secret_file(&new_password, &password)?;
+        let private: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&plaintext)
+                .map_err(|source| grafhome_ca::Error::io(&plaintext, source))?,
+        )
+        .map_err(|source| grafhome_ca::Error::Json {
+            path: plaintext.clone(),
+            source,
+        })?;
+        let public_material = grafhome_ca::runtime_provisioners::validate_public_jwk(
+            public,
+            &format!("{}:{}:key", ca_json.display(), policy.name),
+        )?;
+        let private_material = grafhome_ca::runtime_provisioners::jwk_public_material(
+            &private,
+            &plaintext.display().to_string(),
+        )?;
+        if private_material != public_material {
+            return Err(grafhome_ca::Error::Validation {
+                field: format!("{}:{}:key", ca_json.display(), policy.name),
+                message: "live public JWK does not match its encrypted private key".to_owned(),
+            });
+        }
+        run_status(
+            process(&step_bin)
+                .arg("crypto")
+                .arg("key")
+                .arg("format")
+                .arg(&plaintext)
+                .arg("--jwk")
+                .arg("--password-file")
+                .arg(&new_password)
+                .arg("--out")
+                .arg(&migrated),
+        )?;
+
+        let public = serde_json::to_vec_pretty(public).expect("public JWK serializes");
+        let migrated =
+            std::fs::read(&migrated).map_err(|source| grafhome_ca::Error::io(&migrated, source))?;
+        write_secret_file_atomic(&public_path, &public)?;
+        write_secret_file_atomic(&private_path, &migrated)?;
+        write_secret_file_atomic(&password_path, &password)?;
+        grafhome_ca::runtime_provisioners::validate_enrollment_provisioner_key_files(
+            model,
+            &directory,
+            &policy.name,
+            live.get("key").expect("live public key was validated"),
+            Path::new(&step_bin),
+        )?;
+        outln!("migrated {} enrollment provisioner key", policy.name);
+    }
+    Ok(())
 }
 
 fn host_enrollment_request_path(model: &SiteModel, host: &str) -> PathBuf {
@@ -1844,6 +2133,49 @@ fn confirm_user_approval(request: &UserRequest) -> grafhome_ca::Result<()> {
     )
 }
 
+fn confirm_effectively_infinite_user_approval(request: &UserRequest) -> grafhome_ca::Result<()> {
+    let fingerprint = ssh_public_key_fingerprint(&request.ssh_public_key)?;
+    eprintln!("{}", effectively_infinite_warning(request, &fingerprint));
+    require_effectively_infinite_confirmation(confirm_tty(
+        "Approve effectively-infinite certificate? [y/N] ",
+    )?)
+}
+
+fn effectively_infinite_warning(request: &UserRequest, fingerprint: &str) -> String {
+    format!(
+        "WARNING: effectively-infinite SSH user certificate\nUser: {}\nClient host: {}\nSSH key: {fingerprint}\nCA-side revocation will not invalidate this certificate; immediate revocation requires OpenSSH RevokedKeys distribution.",
+        request.user, request.host
+    )
+}
+
+fn require_effectively_infinite_confirmation(approved: bool) -> grafhome_ca::Result<()> {
+    if approved {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: "approve user".to_owned(),
+            message: "effectively-infinite certificate was not approved".to_owned(),
+        })
+    }
+}
+
+fn ssh_public_key_fingerprint(public_key: &str) -> grafhome_ca::Result<String> {
+    let mut file = tempfile::NamedTempFile::new()
+        .map_err(|source| grafhome_ca::Error::io("<temporary SSH public key>", source))?;
+    file.write_all(public_key.as_bytes())
+        .map_err(|source| grafhome_ca::Error::io(file.path(), source))?;
+    let output = run_capture(process("ssh-keygen").arg("-lf").arg(file.path()))?;
+    let output = String::from_utf8_lossy(&output);
+    output
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_owned)
+        .ok_or_else(|| grafhome_ca::Error::Validation {
+            field: "enrollment request SSH key".to_owned(),
+            message: "ssh-keygen returned no fingerprint".to_owned(),
+        })
+}
+
 fn confirm_host_approval(request: &HostRequest) -> grafhome_ca::Result<()> {
     confirm_approval(&request.host, "approve host")
 }
@@ -1960,7 +2292,11 @@ fn enroll_user_flow(
         Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
         None => lookup_renewal_password(&user, &host)?,
     };
-    renew_user(model, &user, Some(&host), &password, false)?;
+    if grant.preserves_initial_certificate() {
+        verify_user_renewal(model, &user, &host, &password)?;
+    } else {
+        renew_user(model, &user, Some(&host), &password, false)?;
+    }
     std::fs::remove_file(&pending_path)
         .map_err(|source| grafhome_ca::Error::io(&pending_path, source))?;
     outln!("User enrollment complete: {user}@{host}");
@@ -1990,29 +2326,34 @@ fn approve_user_enrollment(
     model: &SiteModel,
     request: &UserRequest,
     token_ttl: Option<&str>,
-    cert_ttl: Option<&str>,
+    cert_ttl: &str,
+    effectively_infinite: bool,
 ) -> grafhome_ca::Result<()> {
     request.validate()?;
     if let Some(ttl) = token_ttl {
         checked_ttl("approve user.ttl", ttl)?;
     }
-    if let Some(ttl) = cert_ttl {
-        checked_ttl("approve user.cert_ttl", ttl)?;
-    }
-    active_user(model, &request.user)?;
-    required_user_client(model, &request.user, &request.host)?;
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
     let token = authorize_user(model, &request.user, &request.host, &public_jwk, || {
-        create_user_token(model, &request.user, &request.host, token_ttl, cert_ttl)
+        create_user_token(
+            model,
+            &request.user,
+            &request.host,
+            token_ttl,
+            Some(cert_ttl),
+        )
     })?;
     let fingerprint = ca_fingerprint(model)?;
-    let grant = UserGrant::new(
+    let mut grant = UserGrant::new(
         request,
         required_endpoint(model, "ca_api")?.url(),
         fingerprint,
         String::from_utf8_lossy(&token).trim(),
     );
+    if effectively_infinite {
+        grant.mark_effectively_infinite_certificate();
+    }
     eprintln!("Approved {}@{}.", request.user, request.host);
     eprintln!("Copy the GRANT line back to the pending enroll user command.");
     outln!(
@@ -2020,6 +2361,50 @@ fn approve_user_enrollment(
         serde_json::to_string(&grant).expect("user grant serializes")
     );
     Ok(())
+}
+
+fn user_approval_cert_ttl(
+    model: &SiteModel,
+    request: &UserRequest,
+    cert_ttl: Option<&str>,
+    effectively_infinite: bool,
+) -> grafhome_ca::Result<String> {
+    let user = active_user(model, &request.user)?;
+    let client = required_user_client(model, &request.user, &request.host)?;
+    let provisioner = required_provisioner(model, "user_enrollment")?;
+
+    if effectively_infinite {
+        if !client.allow_effectively_infinite_cert {
+            return Err(grafhome_ca::Error::Validation {
+                field: format!(
+                    "policy/user-clients.toml:{}:{}.allow_effectively_infinite_cert",
+                    request.user, request.host
+                ),
+                message: "effectively-infinite certificate approval is not allowed".to_owned(),
+            });
+        }
+        if provisioner.max_ttl != UNLIMITED_TTL {
+            return Err(grafhome_ca::Error::Validation {
+                field: format!("policy/provisioners.toml:{}.max_ttl", provisioner.role),
+                message: "effectively-infinite approval requires max_ttl = \"unlimited\""
+                    .to_owned(),
+            });
+        }
+        return Ok(STEP_EFFECTIVE_UNLIMITED_TTL.to_owned());
+    }
+
+    let cert_ttl = checked_ttl("approve user.cert_ttl", cert_ttl.unwrap_or(&user.cert_ttl))?;
+    let renewal_max_ttl = model.policy.renewal_max_ttl(provisioner);
+    if !duration_at_most(&cert_ttl, renewal_max_ttl) {
+        return Err(grafhome_ca::Error::Validation {
+            field: "approve user.cert_ttl".to_owned(),
+            message: format!(
+                "must not exceed renewal_max_ttl ({}) without --effectively-infinite",
+                renewal_max_ttl
+            ),
+        });
+    }
+    Ok(cert_ttl)
 }
 
 fn ensure_host_keys(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<HostRequest> {
@@ -2701,6 +3086,8 @@ fn create_host_token(
         cert_ttl.unwrap_or(&provisioner.default_ttl),
     )?;
     let step_bin = root_step_bin(model)?;
+    let (provisioner_key, provisioner_password) =
+        enrollment_provisioner_credential(model, &provisioner.name)?;
     let mut command = process(&step_bin);
     command
         .env("STEPPATH", model.deployment.ca_steppath())
@@ -2717,10 +3104,12 @@ fn create_host_token(
         .arg(token_ttl)
         .arg("--cert-not-after")
         .arg(cert_ttl)
-        .arg("--provisioner")
+        .arg("--issuer")
         .arg(&provisioner.name)
-        .arg("--provisioner-password-file")
-        .arg(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"])
+        .arg("--key")
+        .arg(provisioner_key)
+        .arg("--password-file")
+        .arg(provisioner_password)
         .arg("--ca-url")
         .arg(ca_api.url())
         .arg("--root")
@@ -2796,7 +3185,7 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
             .arg("--not-after")
             .arg("5m")
             .arg("--cert-not-after")
-            .arg(&host_policy.default_ttl)
+            .arg(host_policy.renewal_default_ttl())
             .arg("--issuer")
             .arg(host_provisioner_name(&host.host))
             .arg("--key")
@@ -2865,6 +3254,8 @@ fn create_user_token(
         cert_ttl.unwrap_or(&user.cert_ttl),
     )?;
     let step_bin = root_step_bin(model)?;
+    let (provisioner_key, provisioner_password) =
+        enrollment_provisioner_credential(model, &user.provisioner)?;
     run_capture(
         process(&step_bin)
             .env("STEPPATH", model.deployment.ca_steppath())
@@ -2878,10 +3269,12 @@ fn create_user_token(
             .arg(token_ttl)
             .arg("--cert-not-after")
             .arg(cert_ttl)
-            .arg("--provisioner")
+            .arg("--issuer")
             .arg(&user.provisioner)
-            .arg("--provisioner-password-file")
-            .arg(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"])
+            .arg("--key")
+            .arg(provisioner_key)
+            .arg("--password-file")
+            .arg(provisioner_password)
             .arg("--ca-url")
             .arg(ca_api.url())
             .arg("--root")
@@ -3549,17 +3942,64 @@ fn renew_user(
     password: &str,
     quiet: bool,
 ) -> grafhome_ca::Result<()> {
-    let step_bin = user_step_bin()?;
     let user = active_user(model, user_name)?;
     let client = match host {
         Some(host) => required_user_client(model, &user.user, host)?,
         None => select_single_user_client(model, &user.user)?,
     };
+    renew_user_certificate(
+        model,
+        user,
+        client,
+        password,
+        &user_public_key_path()?,
+        &user_cert_path()?,
+        quiet,
+    )
+}
+
+fn verify_user_renewal(
+    model: &SiteModel,
+    user_name: &str,
+    host: &str,
+    password: &str,
+) -> grafhome_ca::Result<()> {
+    let user = active_user(model, user_name)?;
+    let client = required_user_client(model, &user.user, host)?;
+    let material_dir = user_client_material_dir(&user.user, &client.host)?;
+    let temp = tempfile::Builder::new()
+        .prefix(".grafhome-ca-renewal-check-")
+        .tempdir_in(&material_dir)
+        .map_err(|source| grafhome_ca::Error::io(&material_dir, source))?;
+    let public_key = temp.path().join("id_ed25519.pub");
+    std::fs::copy(user_public_key_path()?, &public_key)
+        .map_err(|source| grafhome_ca::Error::io(&public_key, source))?;
+    let certificate = temp.path().join("id_ed25519-cert.pub");
+    renew_user_certificate(
+        model,
+        user,
+        client,
+        password,
+        &public_key,
+        &certificate,
+        false,
+    )
+}
+
+fn renew_user_certificate(
+    model: &SiteModel,
+    user: &User,
+    client: &UserClient,
+    password: &str,
+    public_key: &Path,
+    certificate: &Path,
+    quiet: bool,
+) -> grafhome_ca::Result<()> {
+    let step_bin = user_step_bin()?;
     let ca_api = required_endpoint(model, "ca_api")?;
     let provisioner = user_provisioner_name(&user.user, &client.host);
     let material_dir = user_client_material_dir(&user.user, &client.host)?;
     let private_jwk = material_dir.join("provisioner.priv.json");
-    let certificate = user_cert_path()?;
     let token = with_password_file(&material_dir, password, |password_file| {
         run_capture(
             process(&step_bin)
@@ -3596,7 +4036,7 @@ fn renew_user(
             .arg("ssh")
             .arg("certificate")
             .arg(&user.principal)
-            .arg(user_public_key_path()?)
+            .arg(public_key)
             .arg("--sign")
             .arg("--token")
             .arg(token.trim())
@@ -4150,6 +4590,12 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
         .map_err(|source| grafhome_ca::Error::io(file.path(), source))?;
     let temp_path = file.into_temp_path();
     std::fs::rename(&temp_path, path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    // The password file is the migration completion marker. Persist the
+    // directory entry as well as file contents so success survives power loss.
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| grafhome_ca::Error::io(parent, source))?;
     let _ = temp_path.close();
     Ok(())
 }
@@ -4168,10 +4614,11 @@ mod tests {
 
     use super::{
         CA_REACHABILITY_TIMEOUT, Endpoint, ExistingIdentityChoice, NoncanonicalTerminalMode,
-        endpoint_reachable_with, parse_enrollment_document, prepare_existing_user_identity,
-        read_app_private_credential, read_interactive_document, read_terminal_document,
-        renewal_already_running, ssh_public_keys_match, store_app_private_credential,
-        try_renewal_lock, validate_grant_ca_url,
+        effectively_infinite_warning, endpoint_reachable_with, parse_enrollment_document,
+        prepare_existing_user_identity, read_app_private_credential, read_interactive_document,
+        read_terminal_document, renewal_already_running, require_effectively_infinite_confirmation,
+        ssh_public_keys_match, store_app_private_credential, try_renewal_lock,
+        validate_grant_ca_url,
     };
 
     fn test_endpoint(address: &str) -> Endpoint {
@@ -4243,6 +4690,76 @@ mod tests {
 
         assert!(error.contains("CA reachability probe 192.0.2.21:8443"));
         assert!(error.contains("no local address available"));
+    }
+
+    #[test]
+    fn jwk_public_material_supports_smallstep_key_types_and_ignores_metadata() {
+        for (jwk, expected) in [
+            (
+                serde_json::json!({
+                    "kty": "EC", "crv": "P-256", "x": "ec-x", "y": "ec-y",
+                    "kid": "metadata", "d": "private"
+                }),
+                serde_json::json!({"kty": "EC", "crv": "P-256", "x": "ec-x", "y": "ec-y"}),
+            ),
+            (
+                serde_json::json!({
+                    "kty": "OKP", "crv": "Ed25519", "x": "okp-x", "alg": "EdDSA"
+                }),
+                serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": "okp-x"}),
+            ),
+            (
+                serde_json::json!({"kty": "RSA", "n": "modulus", "e": "AQAB", "use": "sig"}),
+                serde_json::json!({"kty": "RSA", "n": "modulus", "e": "AQAB"}),
+            ),
+        ] {
+            assert_eq!(
+                grafhome_ca::runtime_provisioners::jwk_public_material(&jwk, "test JWK").unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn jwk_public_material_rejects_unsupported_and_incomplete_keys() {
+        let unsupported = grafhome_ca::runtime_provisioners::jwk_public_material(
+            &serde_json::json!({"kty": "oct", "k": "secret"}),
+            "test JWK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unsupported.contains("unsupported JWK type oct"));
+
+        let incomplete = grafhome_ca::runtime_provisioners::jwk_public_material(
+            &serde_json::json!({"kty": "EC", "crv": "P-256", "x": "ec-x"}),
+            "test JWK",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(incomplete.contains("must have a string y"));
+    }
+
+    #[test]
+    fn effectively_infinite_manual_approval_warns_and_defaults_to_denial() {
+        let request = grafhome_ca::enrollment::UserRequest::new(
+            "alice",
+            "laptop",
+            "ssh-ed25519 AAAA alice@laptop",
+            serde_json::json!({"kty": "OKP", "crv": "Ed25519", "x": "public"}),
+        );
+        let warning = effectively_infinite_warning(&request, "SHA256:fingerprint");
+
+        assert!(warning.contains("User: alice"));
+        assert!(warning.contains("Client host: laptop"));
+        assert!(warning.contains("SSH key: SHA256:fingerprint"));
+        assert!(warning.contains("RevokedKeys"));
+        assert!(require_effectively_infinite_confirmation(true).is_ok());
+        assert!(
+            require_effectively_infinite_confirmation(false)
+                .unwrap_err()
+                .to_string()
+                .contains("was not approved")
+        );
     }
 
     #[test]
