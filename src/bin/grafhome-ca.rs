@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
@@ -28,6 +29,7 @@ const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
 const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
 const CA_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CA_HEALTH_CONSECUTIVE_SUCCESSES: usize = 2;
+const CA_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 
 macro_rules! outln {
     ($($arg:tt)*) => {
@@ -272,6 +274,9 @@ enum RenewCommand {
         /// Exit successfully without output unless this host is enrolled and renewable.
         #[arg(long)]
         if_enrolled: bool,
+        /// Exit successfully without output while the configured CA endpoint is unreachable.
+        #[arg(long)]
+        if_reachable: bool,
         /// Suppress successful renewal output. Errors are still reported.
         #[arg(long)]
         quiet: bool,
@@ -293,6 +298,9 @@ enum RenewCommand {
         /// Exit successfully without output unless this user is enrolled and renewable.
         #[arg(long)]
         if_enrolled: bool,
+        /// Exit successfully without output while the configured CA endpoint is unreachable.
+        #[arg(long)]
+        if_reachable: bool,
         /// Suppress successful renewal output. Errors are still reported.
         #[arg(long)]
         quiet: bool,
@@ -505,12 +513,22 @@ fn run() -> grafhome_ca::Result<()> {
                     config_root,
                     host,
                     if_enrolled,
+                    if_reachable,
                     quiet,
                 },
         } => {
             let model = load_root_model(config_root, "renew host", false)?;
             let host = resolve_host(host.as_deref())?;
-            if if_enrolled && !status(&model, None, Some(&host), true, true)? {
+            if if_enrolled && !local_renewal_ready(&model, None, Some(&host))? {
+                return Ok(());
+            }
+            let Some(_lock) = try_renewal_lock(&host_renewal_lock_path(&model))? else {
+                return renewal_already_running("host", if_enrolled || if_reachable || quiet);
+            };
+            if if_reachable && !ca_api_reachable(&model)? {
+                return Ok(());
+            }
+            if if_enrolled && !status(&model, None, Some(&host), true, false)? {
                 return Ok(());
             }
             let step_bin = root_step_bin(&model)?;
@@ -606,6 +624,7 @@ fn run() -> grafhome_ca::Result<()> {
                     host,
                     password_file,
                     if_enrolled,
+                    if_reachable,
                     quiet,
                 },
         } => {
@@ -616,9 +635,18 @@ fn run() -> grafhome_ca::Result<()> {
             if if_enrolled {
                 let local_ready =
                     user_local_renewal_ready(&model, &user, &host, password_file.is_none())?;
-                if !local_ready || !status(&model, Some(&user), Some(&host), true, false)? {
+                if !local_ready {
                     return Ok(());
                 }
+            }
+            let Some(_lock) = try_renewal_lock(&user_renewal_lock_path(&model)?)? else {
+                return renewal_already_running("user", if_enrolled || if_reachable || quiet);
+            };
+            if if_reachable && !ca_api_reachable(&model)? {
+                return Ok(());
+            }
+            if if_enrolled && !status(&model, Some(&user), Some(&host), true, false)? {
+                return Ok(());
             }
             if !user_certificate_needs_renewal(&model, &user, &host)? {
                 return Ok(());
@@ -1192,6 +1220,45 @@ fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Resul
             field: format!("policy/endpoints.toml:{role}"),
             message: "missing required endpoint".to_owned(),
         })
+}
+
+fn ca_api_reachable(model: &SiteModel) -> grafhome_ca::Result<bool> {
+    endpoint_reachable_with(required_endpoint(model, "ca_api")?, |address, timeout| {
+        TcpStream::connect_timeout(address, timeout).map(drop)
+    })
+}
+
+fn endpoint_reachable_with(
+    endpoint: &Endpoint,
+    connect: impl FnOnce(&SocketAddr, Duration) -> std::io::Result<()>,
+) -> grafhome_ca::Result<bool> {
+    let address =
+        endpoint
+            .address
+            .parse::<IpAddr>()
+            .map_err(|error| grafhome_ca::Error::Validation {
+                field: format!("policy/endpoints.toml:{}.address", endpoint.role),
+                message: format!("invalid IP address {}: {error}", endpoint.address),
+            })?;
+    let address = SocketAddr::new(address, endpoint.port);
+    match connect(&address, CA_REACHABILITY_TIMEOUT) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(source) => Err(grafhome_ca::Error::io(
+            format!("CA reachability probe {address}"),
+            source,
+        )),
+    }
 }
 
 fn required_host<'a>(model: &'a SiteModel, host: &str) -> grafhome_ca::Result<&'a Host> {
@@ -3243,6 +3310,45 @@ fn status_root_cert_path(
     Ok(None)
 }
 
+fn host_renewal_lock_path(model: &SiteModel) -> PathBuf {
+    PathBuf::from(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"])
+        .join(".grafhome-ca-renew-host.lock")
+}
+
+fn user_renewal_lock_path(model: &SiteModel) -> grafhome_ca::Result<PathBuf> {
+    Ok(user_steppath(model)?.join(".grafhome-ca-renew-user.lock"))
+}
+
+fn try_renewal_lock(path: &Path) -> grafhome_ca::Result<Option<std::fs::File>> {
+    let parent = path
+        .parent()
+        .expect("renewal lock path has a parent directory");
+    std::fs::create_dir_all(parent).map_err(|source| grafhome_ca::Error::io(parent, source))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(path)
+        .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(source) => Err(grafhome_ca::Error::io(path, source)),
+    }
+}
+
+fn renewal_already_running(scope: &str, silent: bool) -> grafhome_ca::Result<()> {
+    if silent {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: format!("renew {scope}"),
+            message: "another renewal is already running".to_owned(),
+        })
+    }
+}
+
 fn with_ca_lock<T>(
     model: &SiteModel,
     action: impl FnOnce() -> grafhome_ca::Result<T>,
@@ -4051,7 +4157,8 @@ fn write_secret_file_atomic(path: &Path, content: &[u8]) -> grafhome_ca::Result<
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
-    use std::io::{BufRead, Cursor, Write};
+    use std::io::{BufRead, Cursor, Error, ErrorKind, Write};
+    use std::net::SocketAddr;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -4060,11 +4167,103 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ExistingIdentityChoice, NoncanonicalTerminalMode, parse_enrollment_document,
-        prepare_existing_user_identity, read_app_private_credential, read_interactive_document,
-        read_terminal_document, ssh_public_keys_match, store_app_private_credential,
-        validate_grant_ca_url,
+        CA_REACHABILITY_TIMEOUT, Endpoint, ExistingIdentityChoice, NoncanonicalTerminalMode,
+        endpoint_reachable_with, parse_enrollment_document, prepare_existing_user_identity,
+        read_app_private_credential, read_interactive_document, read_terminal_document,
+        renewal_already_running, ssh_public_keys_match, store_app_private_credential,
+        try_renewal_lock, validate_grant_ca_url,
     };
+
+    fn test_endpoint(address: &str) -> Endpoint {
+        Endpoint {
+            role: "ca_api".to_owned(),
+            dns_name: "ca.example.test".to_owned(),
+            target: "proxy-host".to_owned(),
+            address: address.to_owned(),
+            port: 8443,
+            scheme: "https".to_owned(),
+        }
+    }
+
+    #[test]
+    fn reachability_uses_configured_address_and_bounded_timeout() {
+        let reachable =
+            endpoint_reachable_with(&test_endpoint("192.0.2.21"), |address, timeout| {
+                assert_eq!(address, &"192.0.2.21:8443".parse::<SocketAddr>().unwrap());
+                assert_eq!(timeout, CA_REACHABILITY_TIMEOUT);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(reachable);
+    }
+
+    #[test]
+    fn reachability_treats_connect_failure_as_offline() {
+        let reachable = endpoint_reachable_with(&test_endpoint("192.0.2.21"), |_, _| {
+            Err(Error::new(ErrorKind::TimedOut, "offline"))
+        })
+        .unwrap();
+
+        assert!(!reachable);
+    }
+
+    #[test]
+    fn reachability_rejects_invalid_policy_address() {
+        let error = endpoint_reachable_with(&test_endpoint("not-an-ip"), |_, _| Ok(()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("policy/endpoints.toml:ca_api.address"));
+        assert!(error.contains("invalid IP address"));
+    }
+
+    #[test]
+    fn reachability_reports_unexpected_local_socket_error() {
+        let error = endpoint_reachable_with(&test_endpoint("192.0.2.21"), |_, _| {
+            Err(Error::new(ErrorKind::PermissionDenied, "blocked locally"))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("CA reachability probe 192.0.2.21:8443"));
+        assert!(error.contains("blocked locally"));
+    }
+
+    #[test]
+    fn reachability_reports_local_address_exhaustion() {
+        let error = endpoint_reachable_with(&test_endpoint("192.0.2.21"), |_, _| {
+            Err(Error::new(
+                ErrorKind::AddrNotAvailable,
+                "no local address available",
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("CA reachability probe 192.0.2.21:8443"));
+        assert!(error.contains("no local address available"));
+    }
+
+    #[test]
+    fn renewal_lock_prevents_overlap_and_releases_with_file_drop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("renew.lock");
+        let first = try_renewal_lock(&path).unwrap().unwrap();
+
+        assert!(try_renewal_lock(&path).unwrap().is_none());
+        drop(first);
+        assert!(try_renewal_lock(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn renewal_contention_is_silent_only_for_scheduled_mode() {
+        assert!(renewal_already_running("user", true).is_ok());
+        let error = renewal_already_running("user", false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("renew user: another renewal is already running"));
+    }
 
     #[test]
     fn app_private_credential_round_trips_with_owner_only_permissions() {

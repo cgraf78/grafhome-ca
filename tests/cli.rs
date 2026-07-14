@@ -341,6 +341,16 @@ esac
 }
 
 #[cfg(unix)]
+fn configure_unreachable_ca(fixture: &ExecFixture) {
+    let path = fixture.config_root.join("policy/endpoints.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    let text = text
+        .replacen("address = \"198.51.100.21\"", "address = \"127.0.0.1\"", 1)
+        .replacen("port = 443", "port = 1", 1);
+    fs::write(path, text).unwrap();
+}
+
+#[cfg(unix)]
 fn configure_step_path_fallback(dir: &tempfile::TempDir, fixture: &ExecFixture) -> String {
     let path_bin = dir.path().join("path-bin");
     fs::create_dir(&path_bin).unwrap();
@@ -2930,6 +2940,40 @@ fn quiet_renew_user_suppresses_successful_renewal_output() {
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains("ssh certificate alice"));
     assert!(log.contains("ssh-keygen args=-L"));
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_user_if_reachable_silently_skips_offline_ca() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    configure_unreachable_ca(&fixture);
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "renew",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--if-reachable",
+            "--quiet",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    let log = fs::read_to_string(&fixture.log).unwrap_or_default();
+    assert!(!log.contains("needs-renewal"));
+    assert!(!log.contains("ca token"));
 }
 
 #[cfg(unix)]
