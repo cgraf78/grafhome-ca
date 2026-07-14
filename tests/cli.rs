@@ -449,6 +449,17 @@ fn prepare_apply_host(fixture: &ExecFixture) {
 }
 
 #[cfg(unix)]
+fn prepare_host_renewal(fixture: &ExecFixture, host: &str) {
+    prepare_apply_host(fixture);
+    let material = fixture
+        .config_root
+        .join("../server-step/secrets/hosts")
+        .join(host);
+    fs::create_dir_all(&material).unwrap();
+    fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+}
+
+#[cfg(unix)]
 fn prepare_apply_ca(fixture: &ExecFixture) -> PathBuf {
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
@@ -754,6 +765,47 @@ fn apply_host_installs_fresh_local_policy() {
 
 #[cfg(unix)]
 #[test]
+fn apply_host_if_enrolled_silently_skips_an_unenrolled_host() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+
+    apply_host_command(&fixture, &install_root)
+        .args(["--if-enrolled", "--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert!(!install_root.exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn quiet_apply_host_reconciles_an_enrolled_host_without_routine_output() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_host_renewal(&fixture, "proxy-host");
+
+    apply_host_command(&fixture, &install_root)
+        .args(["--if-enrolled", "--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert!(
+        install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .is_file()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("systemctl args=reload sshd.service"));
+}
+
+#[cfg(unix)]
+#[test]
 fn apply_host_silently_falls_back_to_ssh_service() {
     let (dir, fixture) = exec_fixture();
     let install_root = dir.path().join("install");
@@ -800,7 +852,17 @@ fn apply_exposes_only_supported_local_nouns() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--if-enrolled"))
+        .stdout(predicate::str::contains("--quiet"))
+        .stdout(predicate::str::contains("--if-reachable").not())
         .stdout(predicate::str::contains("--host").not());
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "host", "--dry-run", "--quiet"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[cfg(unix)]
@@ -979,6 +1041,16 @@ fn apply_host_skips_validation_and_reload_when_current() {
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(!log.contains("sshd args=-t"));
     assert!(!log.contains("systemctl args=reload"));
+
+    apply_host_command(&fixture, &install_root)
+        .arg("--quiet")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(!log.contains("sshd args=-t"));
+    assert!(!log.contains("systemctl args=reload"));
 }
 
 #[cfg(unix)]
@@ -995,6 +1067,7 @@ fn apply_host_restores_previous_policy_when_sshd_validation_fails() {
     fs::write(&sshd_config, "previous config\n").unwrap();
 
     apply_host_command(&fixture, &install_root)
+        .arg("--quiet")
         .env("FAKE_SSHD_FAIL_ONCE", "1")
         .assert()
         .failure()

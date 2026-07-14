@@ -91,10 +91,11 @@ objects in `ca.json` contain public verification keys, issuance claims, and
 templates, but no `encryptedKey` for the public provisioner API to return.
 
 For an existing CA, upgrade the binary on the CA origin and every enrolled
-client before distributing policy that contains the new `renewal_*` or
-`allow_effectively_infinite_cert` fields. Old policy remains readable by the
-new binary, so this binary-first sequence does not require a flag day. Then run
-the one-time migration before installing a newly rendered `ca.json`:
+client before distributing policy that contains the new `renewal_*`,
+`allow_effectively_infinite_cert`, `require_ssh_admin_access`, or `ssh_admin`
+fields. Old policy remains readable by the new binary, so this binary-first
+sequence does not require a flag day. Then run the one-time migration before
+installing a newly rendered `ca.json`:
 
 ```sh
 grafhome-ca migrate enrollment-provisioner-keys
@@ -194,6 +195,21 @@ Removing an authorization row therefore removes its stale principals file on
 the affected host. This changes login authorization; it does not revoke an
 enrollment or an already-issued certificate, which remains the responsibility
 of `revoke host` or `revoke user`.
+
+For unattended convergence after a private policy update, run the same command
+with scheduled-mode guards:
+
+```sh
+grafhome-ca apply host --if-enrolled --quiet
+```
+
+An unenrolled host is skipped without output. Routine success and no-op output
+are also suppressed, while invalid policy,
+unsafe filesystem provenance, `sshd` validation failures, and rollback errors
+remain fatal and visible. Sites can enable `require_ssh_admin_access = true`
+and mark one or more active users with `ssh_admin = true`; policy validation
+then requires every SSH server to retain an active login mapping for at least
+one such user.
 
 After changing CA issuance policy, reconcile the live provisioners on the CA
 origin:
