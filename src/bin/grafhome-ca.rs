@@ -192,6 +192,12 @@ enum ApplyCommand {
         /// Show changes without writing files or reloading SSH.
         #[arg(long)]
         dry_run: bool,
+        /// Exit successfully when this host has no local renewal enrollment.
+        #[arg(long)]
+        if_enrolled: bool,
+        /// Suppress routine success and no-op output while preserving errors.
+        #[arg(long, conflicts_with = "dry_run")]
+        quiet: bool,
     },
 }
 
@@ -488,11 +494,16 @@ fn run() -> grafhome_ca::Result<()> {
                 ApplyCommand::Host {
                     config_root,
                     dry_run,
+                    if_enrolled,
+                    quiet,
                 },
         } => {
             let model = load_root_model(config_root, "apply host", true)?;
             let host = resolve_host(None)?;
-            apply_host_policy(&model, &host, dry_run)
+            if if_enrolled && !local_renewal_ready(&model, None, Some(&host))? {
+                return Ok(());
+            }
+            apply_host_policy(&model, &host, dry_run, quiet)
         }
         Command::Approve {
             command:
@@ -2770,17 +2781,22 @@ fn print_ca_policy_changes(updated: &[String], dry_run: bool) -> grafhome_ca::Re
     Ok(())
 }
 
-fn apply_host_policy(model: &SiteModel, host_name: &str, dry_run: bool) -> grafhome_ca::Result<()> {
+fn apply_host_policy(
+    model: &SiteModel,
+    host_name: &str,
+    dry_run: bool,
+    quiet: bool,
+) -> grafhome_ca::Result<()> {
     let ca_url = required_endpoint(model, "ca_api")?.url();
     let desired = desired_host_ssh_files(model, host_name, &ca_url)?;
     if dry_run {
         let changes = host_policy_changes(model, &desired)?;
-        print_host_policy_changes(host_name, &changes, true)?;
+        print_host_policy_changes(host_name, &changes, true, false)?;
         return Ok(());
     }
 
     with_host_policy_lock(model, || {
-        apply_host_policy_locked(model, host_name, &desired)
+        apply_host_policy_locked(model, host_name, &desired, quiet)
     })
 }
 
@@ -2788,10 +2804,13 @@ fn apply_host_policy_locked(
     model: &SiteModel,
     host_name: &str,
     desired: &BTreeMap<PathBuf, HostPolicyFile>,
+    quiet: bool,
 ) -> grafhome_ca::Result<()> {
     let changes = host_policy_changes(model, desired)?;
     if changes.is_empty() {
-        outln!("Host policy already current: {host_name}");
+        if !quiet {
+            outln!("Host policy already current: {host_name}");
+        }
         return Ok(());
     }
 
@@ -2827,7 +2846,7 @@ fn apply_host_policy_locked(
         });
     }
 
-    print_host_policy_changes(host_name, &changes, false)
+    print_host_policy_changes(host_name, &changes, false, quiet)
 }
 
 fn host_policy_changes(
@@ -2940,7 +2959,11 @@ fn print_host_policy_changes(
     host_name: &str,
     changes: &BTreeMap<PathBuf, HostPolicyChange>,
     dry_run: bool,
+    quiet: bool,
 ) -> grafhome_ca::Result<()> {
+    if quiet {
+        return Ok(());
+    }
     if changes.is_empty() {
         outln!("Host policy already current: {host_name}");
         return Ok(());

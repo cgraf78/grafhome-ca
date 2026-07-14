@@ -101,8 +101,19 @@ pub struct User {
     pub provisioner: String,
     /// User certificate lifetime.
     pub cert_ttl: String,
+    /// Whether this user satisfies the SSH administrative access safety invariant.
+    #[serde(default)]
+    pub ssh_admin: bool,
     /// Policy status.
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsersDocument {
+    #[serde(default)]
+    require_ssh_admin_access: bool,
+    users: Vec<User>,
 }
 
 /// Provisioner entry from `policy/provisioners.toml`.
@@ -181,6 +192,8 @@ pub struct Policy {
     pub hosts: Vec<Host>,
     /// Managed users.
     pub users: Vec<User>,
+    /// Whether every SSH server must retain a designated administrator login path.
+    pub require_ssh_admin_access: bool,
     /// Smallstep provisioners.
     pub provisioners: Vec<Provisioner>,
     /// Hosts where users may enroll and renew certificates.
@@ -218,7 +231,7 @@ impl Policy {
         let root = root.as_ref();
         let endpoints = read_typed(root.join("policy/endpoints.toml"), "endpoints")?;
         let hosts = read_typed(root.join("policy/hosts.toml"), "hosts")?;
-        let users = read_typed(root.join("policy/users.toml"), "users")?;
+        let users_document = read_users(root.join("policy/users.toml"))?;
         let provisioners = read_typed(root.join("policy/provisioners.toml"), "provisioners")?;
         let user_clients = read_typed(root.join("policy/user-clients.toml"), "user_clients")?;
         let user_remotes = read_typed(root.join("policy/user-remotes.toml"), "user_remotes")?;
@@ -226,7 +239,8 @@ impl Policy {
             root: root.to_path_buf(),
             endpoints,
             hosts,
-            users,
+            users: users_document.users,
+            require_ssh_admin_access: users_document.require_ssh_admin_access,
             provisioners,
             user_clients,
             user_remotes,
@@ -375,6 +389,12 @@ impl Policy {
                 });
             }
             validate_step_duration("policy/users.toml", name, "cert_ttl", &user.cert_ttl)?;
+            if user.ssh_admin && user.status != "active" {
+                return Err(Error::Validation {
+                    field: format!("policy/users.toml:{name}.ssh_admin"),
+                    message: "SSH administrators must have active status".to_owned(),
+                });
+            }
         }
 
         for provisioner in &self.provisioners {
@@ -512,6 +532,42 @@ impl Policy {
             }
         }
 
+        // The policy-level switch deliberately owns enforcement separately from
+        // the designations it protects. Removing an administrator field cannot
+        // silently disable a site that opted into the lockout safeguard.
+        let ssh_admins = self
+            .users
+            .iter()
+            .filter(|user| user.ssh_admin && user.status == "active")
+            .map(|user| user.user.as_str())
+            .collect::<BTreeSet<_>>();
+        if self.require_ssh_admin_access {
+            if ssh_admins.is_empty() {
+                return Err(Error::Validation {
+                    field: "policy/users.toml:require_ssh_admin_access".to_owned(),
+                    message: "requires at least one active user with ssh_admin = true".to_owned(),
+                });
+            }
+            let hosts_with_admin_access = self
+                .active_ssh_access()
+                .filter(|access| ssh_admins.contains(access.user.as_str()))
+                .map(|access| access.host.as_str())
+                .collect::<BTreeSet<_>>();
+            for host in self.hosts.iter().filter(|host| host.ssh_server) {
+                if !hosts_with_admin_access.contains(host.host.as_str()) {
+                    return Err(Error::Validation {
+                        field: format!("policy/user-remotes.toml:{}.ssh_admin", host.host),
+                        message: "SSH server must retain an active login path for at least one user with ssh_admin = true".to_owned(),
+                    });
+                }
+            }
+        } else if !ssh_admins.is_empty() {
+            return Err(Error::Validation {
+                field: "policy/users.toml:require_ssh_admin_access".to_owned(),
+                message: "must be true when users are designated with ssh_admin = true".to_owned(),
+            });
+        }
+
         let mut clients = BTreeSet::new();
         for client in &self.user_clients {
             ensure_contains(
@@ -593,6 +649,14 @@ where
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn read_users(path: impl AsRef<Path>) -> Result<UsersDocument> {
+    let path = path.as_ref();
+    read_toml(path)?.try_into().map_err(|source| Error::Toml {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn unique_values<'a>(
@@ -799,6 +863,84 @@ mod tests {
     }
 
     #[test]
+    fn old_policy_without_ssh_admin_designations_remains_valid() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                !line.starts_with("require_ssh_admin_access") && !line.starts_with("ssh_admin")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&users, text).unwrap();
+
+        Policy::load(dir.path()).expect("pre-ssh-admin policy remains valid");
+    }
+
+    #[test]
+    fn rejects_ssh_server_without_an_active_admin_login_path() {
+        let (dir, policy_dir) = copy_policy();
+        let remotes = policy_dir.join("user-remotes.toml");
+        let text = fs::read_to_string(&remotes).unwrap().replacen(
+            "host = \"ca-host\"\nunix_account = \"alice\"\nallow_ssh = true",
+            "host = \"ca-host\"\nunix_account = \"alice\"\nallow_ssh = false",
+            1,
+        );
+        fs::write(&remotes, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("user-remotes.toml:ca-host.ssh_admin"));
+        assert!(error.contains("must retain an active login path"));
+    }
+
+    #[test]
+    fn required_ssh_admin_access_rejects_removing_every_designation() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("ssh_admin"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&users, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("users.toml:require_ssh_admin_access"));
+        assert!(error.contains("requires at least one active user"));
+    }
+
+    #[test]
+    fn ssh_admin_designation_requires_the_durable_site_switch() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .replace("require_ssh_admin_access = true\n", "");
+        fs::write(&users, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("users.toml:require_ssh_admin_access"));
+        assert!(error.contains("must be true"));
+    }
+
+    #[test]
+    fn rejects_inactive_ssh_admin_designation() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .replace("status = \"active\"", "status = \"disabled\"");
+        fs::write(&users, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("users.toml:alice.ssh_admin"));
+        assert!(error.contains("must have active status"));
+    }
+
+    #[test]
     fn rejects_renewal_maximum_shorter_than_default() {
         let (dir, policy_dir) = copy_policy();
         let provisioners = policy_dir.join("provisioners.toml");
@@ -869,6 +1011,8 @@ mod tests {
         let text = fs::read_to_string(&users)
             .unwrap()
             .replace("cert_ttl = \"24h\"", "cert_ttl = \"8760h\"")
+            .replace("ssh_admin = true\n", "")
+            .replace("require_ssh_admin_access = true\n", "")
             .replace("status = \"active\"", "status = \"disabled\"");
         fs::write(&users, text).unwrap();
 

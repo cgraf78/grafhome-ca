@@ -80,8 +80,9 @@ owner-only regular files, and the enrollment password must differ from
 `GRAFHOME_CA_PASSWORD_FILE`. `grafhome-ca migrate enrollment-provisioner-keys`
 creates this layout for an existing CA without changing provisioner identities.
 Upgrade every policy-consuming binary before distributing policy with the new
-renewal or effectively-infinite fields; older binaries reject unknown policy
-fields. New binaries continue to accept the previous policy shape.
+renewal, effectively-infinite, or SSH-administrator fields; older binaries
+reject unknown policy fields. New binaries continue to accept the previous
+policy shape.
 
 `GRAFHOME_CA_SERVICE_USER`
 : Unix service account and primary service group that run the CA server.
@@ -91,11 +92,13 @@ fields. New binaries continue to accept the previous policy shape.
 
 ## Policy Terms
 
-Policy lives in typed TOML documents under `policy/`. Each file contains one
+Policy lives in typed TOML documents under `policy/`. Each file contains an
 array of tables named after the file with hyphens replaced by underscores. For
-example, `policy/user-remotes.toml` contains `[[user_remotes]]` entries. TOML
-comments are supported, booleans are written as `true` or `false`, endpoint
-ports are integers, and host principals are arrays:
+example, `policy/user-remotes.toml` contains `[[user_remotes]]` entries.
+`users.toml` may additionally carry the file-level
+`require_ssh_admin_access` safety switch. TOML comments are supported,
+booleans are written as `true` or `false`, endpoint ports are integers, and
+host principals are arrays:
 
 ```toml
 # This host accepts and initiates certificate-authenticated SSH connections.
@@ -128,6 +131,16 @@ also validate policy and its filesystem provenance before proceeding.
 active row maps one active policy user's principal to one Unix account on one
 host. A user whose `status` is `planned` or `disabled` is omitted from rendered
 authorized-principals files even if historical access rows remain active.
+
+`users.toml` may set `require_ssh_admin_access = true` as a durable site safety
+switch and designate one or more active users with `ssh_admin = true`. Once
+enabled, every host with `ssh_server = true` must retain an active
+`user-remotes.toml` login mapping for at least one active SSH administrator.
+The separate switch ensures that accidentally deleting every designation is an
+error rather than silently disabling the invariant. Policies that omit both
+fields retain their existing behavior. The designation does not grant Unix or
+sudo privileges; it identifies certificate users whose existing login mappings
+serve as the site's administrative recovery path.
 
 `users.principal` and `hosts.principals` directly own the user and host
 certificate namespaces. `grafhome-ca check` rejects duplicate principals,

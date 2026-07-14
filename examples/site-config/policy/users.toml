@@ -1,6 +1,9 @@
+require_ssh_admin_access = true
+
 [[users]]
 user = "alice"
 principal = "alice"
 provisioner = "grafhome-user-enrollment"
 cert_ttl = "24h"
+ssh_admin = true
 status = "active"
