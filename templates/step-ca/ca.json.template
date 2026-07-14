@@ -23,6 +23,19 @@
           "dns": ${GRAFHOME_CA_X509_ALLOWED_DNS_JSON}
         },
         "allowWildcardNames": false
+      },
+      "ssh": {
+        "user": {
+          "allow": {
+            "principal": ${GRAFHOME_CA_SSH_USER_ALLOWED_PRINCIPALS_JSON}
+          }
+        },
+        "host": {
+          "allow": {
+            "dns": ${GRAFHOME_CA_SSH_HOST_ALLOWED_DNS_JSON},
+            "ip": ${GRAFHOME_CA_SSH_HOST_ALLOWED_IPS_JSON}
+          }
+        }
       }
     },
     "provisioners": ${GRAFHOME_CA_PROVISIONERS_JSON}

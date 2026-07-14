@@ -8,11 +8,12 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 
-/// Current enrollment document format.
+/// Enrollment document version used by routine host and user flows.
 pub const VERSION: u32 = 1;
 
 const USER_REQUEST_KIND: &str = "grafhome-user-enrollment-request";
 const USER_GRANT_KIND: &str = "grafhome-user-enrollment-grant";
+const USER_GRANT_EFFECTIVELY_INFINITE_VERSION: u32 = 2;
 const HOST_REQUEST_KIND: &str = "grafhome-host-enrollment-request";
 const HOST_GRANT_KIND: &str = "grafhome-host-enrollment-grant";
 
@@ -36,14 +37,14 @@ pub fn host_provisioner_name(host: &str) -> String {
     format!("grafhome-host-{}", encode_identity(host))
 }
 
-/// Decode a scoped user provisioner into its user and host identities.
+/// Decode a user renewal provisioner into its user and client-host identities.
 pub fn parse_user_provisioner_name(name: &str) -> Option<(String, String)> {
     let encoded = name.strip_prefix("grafhome-user-")?;
     let (user, host) = encoded.split_once('-')?;
     Some((decode_identity(user)?, decode_identity(host)?))
 }
 
-/// Decode a scoped host provisioner into its host identity.
+/// Decode a host renewal provisioner into its host identity.
 pub fn parse_host_provisioner_name(name: &str) -> Option<String> {
     decode_identity(name.strip_prefix("grafhome-host-")?)
 }
@@ -230,9 +231,33 @@ impl UserGrant {
         }
     }
 
+    /// Mark this as an exceptional grant whose initial certificate must be preserved.
+    pub fn mark_effectively_infinite_certificate(&mut self) {
+        self.version = USER_GRANT_EFFECTIVELY_INFINITE_VERSION;
+    }
+
+    /// Whether enrollment must preserve the approved initial certificate.
+    pub fn preserves_initial_certificate(&self) -> bool {
+        self.version == USER_GRANT_EFFECTIVELY_INFINITE_VERSION
+    }
+
     /// Validate envelope fields before matching the local pending request.
     pub fn validate(&self) -> Result<()> {
-        validate_header(self.version, &self.kind, USER_GRANT_KIND)?;
+        if !matches!(
+            self.version,
+            VERSION | USER_GRANT_EFFECTIVELY_INFINITE_VERSION
+        ) {
+            return Err(validation(
+                "enrollment document version",
+                format!("unsupported version {}", self.version),
+            ));
+        }
+        if self.kind != USER_GRANT_KIND {
+            return Err(validation(
+                "enrollment document kind",
+                format!("expected {USER_GRANT_KIND}, got {}", self.kind),
+            ));
+        }
         nonempty("user enrollment grant CA URL", &self.ca_url)?;
         nonempty(
             "user enrollment grant root fingerprint",
@@ -355,7 +380,7 @@ mod tests {
     };
 
     #[test]
-    fn scoped_names_round_trip_without_hyphen_collisions() {
+    fn renewal_provisioner_names_round_trip_without_hyphen_collisions() {
         let first = user_provisioner_name("a-b", "c");
         let second = user_provisioner_name("a", "b-c");
 
@@ -437,5 +462,69 @@ mod tests {
         let error = grant.validate().unwrap_err().to_string();
 
         assert!(error.contains("64-character SHA-256 hexadecimal fingerprint"));
+    }
+
+    #[test]
+    fn ordinary_user_grant_keeps_the_version_one_wire_format() {
+        let request = UserRequest::new(
+            "alice",
+            "laptop",
+            "ssh-ed25519 AAAA alice@laptop",
+            json!({"kty": "OKP", "crv": "Ed25519", "x": "public"}),
+        );
+        let grant = UserGrant::new(
+            &request,
+            "https://ca.example.test",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "token",
+        );
+
+        let value = serde_json::to_value(grant).unwrap();
+
+        assert_eq!(value["version"], 1);
+        assert_eq!(value.as_object().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn effectively_infinite_user_grant_uses_a_fail_safe_new_version() {
+        let request = UserRequest::new(
+            "alice",
+            "laptop",
+            "ssh-ed25519 AAAA alice@laptop",
+            json!({"kty": "OKP", "crv": "Ed25519", "x": "public"}),
+        );
+        let mut grant = UserGrant::new(
+            &request,
+            "https://ca.example.test",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "token",
+        );
+
+        grant.mark_effectively_infinite_certificate();
+
+        assert_eq!(grant.version, 2);
+        assert!(grant.preserves_initial_certificate());
+        assert!(grant.validate().is_ok());
+    }
+
+    #[test]
+    fn user_grant_rejects_unknown_future_versions() {
+        let request = UserRequest::new(
+            "alice",
+            "laptop",
+            "ssh-ed25519 AAAA alice@laptop",
+            json!({"kty": "OKP", "crv": "Ed25519", "x": "public"}),
+        );
+        let mut grant = UserGrant::new(
+            &request,
+            "https://ca.example.test",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "token",
+        );
+        grant.version = 3;
+
+        let error = grant.validate().unwrap_err().to_string();
+
+        assert!(error.contains("unsupported version 3"));
     }
 }

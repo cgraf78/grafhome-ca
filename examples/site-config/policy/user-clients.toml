@@ -1,6 +1,7 @@
 [[user_clients]]
 host = "ca-host"
 user = "alice"
+allow_effectively_infinite_cert = true
 status = "active"
 
 [[user_clients]]

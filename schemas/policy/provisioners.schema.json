@@ -28,6 +28,12 @@
           "max_ttl": {
             "oneOf": [{ "$ref": "#/definitions/ttl" }, { "const": "unlimited" }]
           },
+          "renewal_default_ttl": {
+            "$ref": "#/definitions/ttl"
+          },
+          "renewal_max_ttl": {
+            "$ref": "#/definitions/ttl"
+          },
           "status": {
             "enum": ["active", "planned", "disabled"]
           }

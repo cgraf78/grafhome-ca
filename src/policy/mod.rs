@@ -26,6 +26,24 @@ pub fn step_max_ttl(max_ttl: &str) -> &str {
     }
 }
 
+/// Return whether one validated Smallstep duration is no longer than another.
+#[must_use]
+pub fn duration_at_most(duration: &str, maximum: &str) -> bool {
+    match (
+        duration_nanoseconds(duration),
+        duration_nanoseconds(maximum),
+    ) {
+        (Some(duration), Some(maximum)) => duration <= maximum,
+        _ => false,
+    }
+}
+
+/// Return whether a duration uses the Go-style grammar accepted by Smallstep.
+#[must_use]
+pub fn valid_step_duration_expression(duration: &str) -> bool {
+    duration_nanoseconds(duration).is_some()
+}
+
 /// Endpoint entry from `policy/endpoints.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +119,12 @@ pub struct Provisioner {
     pub default_ttl: String,
     /// Maximum certificate lifetime.
     pub max_ttl: String,
+    /// Default lifetime for certificates issued by device-bound renewal provisioners.
+    #[serde(default)]
+    pub renewal_default_ttl: Option<String>,
+    /// Maximum lifetime for certificates issued by device-bound renewal provisioners.
+    #[serde(default)]
+    pub renewal_max_ttl: Option<String>,
     /// Policy status.
     pub status: String,
 }
@@ -113,8 +137,21 @@ pub struct UserClient {
     pub host: String,
     /// Policy user whose SSH certs this host may request.
     pub user: String,
+    /// Whether an operator may explicitly approve an effectively-infinite certificate.
+    #[serde(default)]
+    pub allow_effectively_infinite_cert: bool,
     /// Policy status.
     pub status: String,
+}
+
+impl Provisioner {
+    /// Default certificate lifetime for a device-bound renewal provisioner.
+    #[must_use]
+    pub fn renewal_default_ttl(&self) -> &str {
+        self.renewal_default_ttl
+            .as_deref()
+            .unwrap_or(&self.default_ttl)
+    }
 }
 
 /// User login destination entry from `policy/user-remotes.toml`.
@@ -153,6 +190,29 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Maximum lifetime for certificates issued by a device-bound renewal provisioner.
+    ///
+    /// Legacy user policy could combine an unlimited enrollment maximum with a
+    /// user lifetime above the provisioner's default. Deriving the largest
+    /// configured finite lifetime preserves that policy during binary-first
+    /// rollout without retaining unlimited routine renewal.
+    #[must_use]
+    pub fn renewal_max_ttl<'a>(&'a self, provisioner: &'a Provisioner) -> &'a str {
+        if let Some(maximum) = provisioner.renewal_max_ttl.as_deref() {
+            return maximum;
+        }
+        if provisioner.max_ttl != UNLIMITED_TTL {
+            return &provisioner.max_ttl;
+        }
+        self.users
+            .iter()
+            .filter(|user| user.status == "active" && user.provisioner == provisioner.name)
+            .map(|user| user.cert_ttl.as_str())
+            .chain(std::iter::once(provisioner.renewal_default_ttl()))
+            .max_by_key(|duration| duration_nanoseconds(duration).unwrap_or_default())
+            .expect("renewal default is always a candidate")
+    }
+
     /// Load the initial policy files needed for config-only validation.
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
@@ -339,6 +399,54 @@ impl Policy {
                     &provisioner.max_ttl,
                 )?;
             }
+            if let Some(duration) = &provisioner.renewal_default_ttl {
+                validate_step_duration(
+                    "policy/provisioners.toml",
+                    &provisioner.role,
+                    "renewal_default_ttl",
+                    duration,
+                )?;
+            }
+            if let Some(duration) = &provisioner.renewal_max_ttl {
+                validate_step_duration(
+                    "policy/provisioners.toml",
+                    &provisioner.role,
+                    "renewal_max_ttl",
+                    duration,
+                )?;
+            }
+            if !duration_at_most(
+                provisioner.renewal_default_ttl(),
+                self.renewal_max_ttl(provisioner),
+            ) {
+                return Err(Error::Validation {
+                    field: format!(
+                        "policy/provisioners.toml:{}.renewal_max_ttl",
+                        provisioner.role
+                    ),
+                    message: "renewal_max_ttl must be at least renewal_default_ttl".to_owned(),
+                });
+            }
+        }
+
+        for user in &self.users {
+            if user.status != "active" {
+                continue;
+            }
+            let provisioner = self
+                .provisioners
+                .iter()
+                .find(|provisioner| provisioner.name == user.provisioner)
+                .expect("user provisioner existence was validated");
+            if !duration_at_most(&user.cert_ttl, self.renewal_max_ttl(provisioner)) {
+                return Err(Error::Validation {
+                    field: format!("policy/users.toml:{}.cert_ttl", user.user),
+                    message: format!(
+                        "cert_ttl must not exceed the user provisioner's renewal_max_ttl ({})",
+                        self.renewal_max_ttl(provisioner)
+                    ),
+                });
+            }
         }
 
         // Certificate principals share one Smallstep namespace. A collision
@@ -520,7 +628,8 @@ fn validate_step_duration(table: &str, row_id: &str, field: &str, duration: &str
     let valid = !digits.is_empty()
         && digits.as_bytes()[0] != b'0'
         && digits.bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(unit, "s" | "m" | "h");
+        && matches!(unit, "s" | "m" | "h")
+        && duration_nanoseconds(duration).is_some();
     if valid {
         Ok(())
     } else {
@@ -529,6 +638,66 @@ fn validate_step_duration(table: &str, row_id: &str, field: &str, duration: &str
             message: "step-ca durations must use Go-style s, m, or h units".to_owned(),
         })
     }
+}
+
+fn duration_nanoseconds(duration: &str) -> Option<u128> {
+    let bytes = duration.as_bytes();
+    let mut index = 0;
+    let mut total = 0_u128;
+    while index < bytes.len() {
+        let integer_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if integer_start == index {
+            return None;
+        }
+        let integer = duration[integer_start..index].parse::<u128>().ok()?;
+        let mut fraction = None;
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            let fraction_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if fraction_start == index {
+                return None;
+            }
+            fraction = Some(fraction_start..index);
+        }
+        let (unit, unit_len) = if bytes[index..].starts_with(b"ns") {
+            (1_u128, 2)
+        } else if bytes[index..].starts_with(b"us") {
+            (1_000_u128, 2)
+        } else if bytes[index..].starts_with(b"ms") {
+            (1_000_000_u128, 2)
+        } else if bytes[index..].starts_with(b"s") {
+            (1_000_000_000_u128, 1)
+        } else if bytes[index..].starts_with(b"m") {
+            (60_000_000_000_u128, 1)
+        } else if bytes[index..].starts_with(b"h") {
+            (3_600_000_000_000_u128, 1)
+        } else {
+            return None;
+        };
+        index += unit_len;
+        let mut component = integer.checked_mul(unit)?;
+        if let Some(fraction) = fraction {
+            let mut place = unit;
+            for digit in &bytes[fraction] {
+                place /= 10;
+                if place == 0 {
+                    break;
+                }
+                component = component.checked_add(u128::from(digit - b'0') * place)?;
+            }
+        }
+        total = total.checked_add(component)?;
+        if total > i64::MAX as u128 {
+            return None;
+        }
+    }
+    (index > 0).then_some(total)
 }
 
 fn ensure_contains<'a>(
@@ -554,7 +723,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::Policy;
+    use super::{Policy, duration_at_most};
 
     #[test]
     fn checked_in_policy_loads() {
@@ -568,6 +737,148 @@ mod tests {
             policy.endpoint("ca_origin").unwrap().url(),
             "https://ca-origin.example.test:8443"
         );
+        let user = policy
+            .provisioners
+            .iter()
+            .find(|provisioner| provisioner.role == "user_enrollment")
+            .unwrap();
+        assert_eq!(user.renewal_default_ttl(), "24h");
+        assert_eq!(policy.renewal_max_ttl(user), "48h");
+        assert!(
+            policy
+                .user_clients
+                .iter()
+                .find(|client| client.host == "ca-host")
+                .unwrap()
+                .allow_effectively_infinite_cert
+        );
+    }
+
+    #[test]
+    fn old_policy_defaults_to_finite_renewal_without_enabling_infinite_approval() {
+        let (dir, policy_dir) = copy_policy();
+        let provisioners = policy_dir.join("provisioners.toml");
+        let text = fs::read_to_string(&provisioners)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("renewal_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&provisioners, text).unwrap();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users).unwrap().replacen(
+            "cert_ttl = \"24h\"",
+            "cert_ttl = \"48h\"",
+            1,
+        );
+        fs::write(&users, text).unwrap();
+        let clients = policy_dir.join("user-clients.toml");
+        let text = fs::read_to_string(&clients)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("allow_effectively_infinite_cert"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&clients, text).unwrap();
+
+        let policy = Policy::load(dir.path()).expect("pre-renewal-policy format loads");
+        let user = policy
+            .provisioners
+            .iter()
+            .find(|provisioner| provisioner.role == "user_enrollment")
+            .unwrap();
+        assert_eq!(user.max_ttl, super::UNLIMITED_TTL);
+        assert_eq!(user.renewal_default_ttl(), "24h");
+        assert_eq!(policy.renewal_max_ttl(user), "48h");
+        assert!(
+            policy
+                .user_clients
+                .iter()
+                .all(|client| !client.allow_effectively_infinite_cert)
+        );
+    }
+
+    #[test]
+    fn rejects_renewal_maximum_shorter_than_default() {
+        let (dir, policy_dir) = copy_policy();
+        let provisioners = policy_dir.join("provisioners.toml");
+        let text = fs::read_to_string(&provisioners).unwrap().replacen(
+            "renewal_max_ttl = \"48h\"",
+            "renewal_max_ttl = \"23h\"",
+            1,
+        );
+        fs::write(&provisioners, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("renewal_max_ttl must be at least renewal_default_ttl"));
+    }
+
+    #[test]
+    fn duration_comparison_accepts_an_equal_maximum() {
+        assert!(duration_at_most("48h", "48h"));
+    }
+
+    #[test]
+    fn duration_comparison_accepts_a_compound_duration_below_maximum() {
+        assert!(duration_at_most("2h45m", "48h"));
+    }
+
+    #[test]
+    fn duration_comparison_accepts_a_fractional_duration_below_maximum() {
+        assert!(duration_at_most("1.5h", "48h"));
+    }
+
+    #[test]
+    fn duration_comparison_accepts_a_long_fraction_smallstep_can_truncate() {
+        assert!(duration_at_most(
+            "1.0000000000000000000000000000000000000000h",
+            "48h"
+        ));
+    }
+
+    #[test]
+    fn duration_comparison_rejects_a_duration_just_above_maximum() {
+        assert!(!duration_at_most("48h1ns", "48h"));
+    }
+
+    #[test]
+    fn duration_parser_enforces_the_go_duration_ceiling() {
+        assert!(super::valid_step_duration_expression("2562047h"));
+        assert!(!super::valid_step_duration_expression("2562048h"));
+    }
+
+    #[test]
+    fn rejects_user_certificate_lifetime_above_renewal_maximum() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .replace("cert_ttl = \"24h\"", "cert_ttl = \"49h\"");
+        fs::write(&users, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+
+        assert!(error.contains("cert_ttl must not exceed"));
+        assert!(error.contains("renewal_max_ttl (48h)"));
+    }
+
+    #[test]
+    fn inactive_historical_user_does_not_raise_the_active_renewal_maximum() {
+        let (dir, policy_dir) = copy_policy();
+        let users = policy_dir.join("users.toml");
+        let text = fs::read_to_string(&users)
+            .unwrap()
+            .replace("cert_ttl = \"24h\"", "cert_ttl = \"8760h\"")
+            .replace("status = \"active\"", "status = \"disabled\"");
+        fs::write(&users, text).unwrap();
+
+        let policy = Policy::load(dir.path()).expect("inactive historical lifetime is inert");
+        let provisioner = policy
+            .provisioners
+            .iter()
+            .find(|provisioner| provisioner.role == "user_enrollment")
+            .unwrap();
+        assert_eq!(policy.renewal_max_ttl(provisioner), "48h");
     }
 
     #[test]
