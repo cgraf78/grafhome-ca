@@ -35,6 +35,8 @@ const CA_HEALTH_RETRY_ATTEMPTS: usize = 30;
 const CA_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CA_HEALTH_CONSECUTIVE_SUCCESSES: usize = 2;
 const CA_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+const SYSTEMD_RENEWAL_CREDENTIAL_NAME: &str = "grafhome-ca-renewal";
 
 macro_rules! outln {
     ($($arg:tt)*) => {
@@ -4119,14 +4121,15 @@ fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
-    let stored_in_keyring = try_store_secret_service(user, host, password)?;
-    store_systemd_credential(user, host, password)?;
+    // The systemd copy is the unattended backend. Store it first so a failed
+    // enrollment cannot leave a Secret Service item that looks renewable but
+    // becomes unavailable after a headless reboot.
+    let systemd_mode = store_systemd_credential(user, host, password)?;
+    let stored_in_keyring = try_store_secret_service(user, host, password);
     if stored_in_keyring {
-        eprintln!(
-            "Stored the renewal password in the system keyring and as an encrypted systemd user credential."
-        );
+        eprintln!("Stored the renewal password in the system keyring and as {systemd_mode}.");
     } else {
-        eprintln!("Stored the renewal password as an encrypted systemd user credential.");
+        eprintln!("Stored the renewal password as {systemd_mode}.");
     }
     Ok(())
 }
@@ -4142,7 +4145,7 @@ fn store_renewal_password(user: &str, host: &str, password: &str) -> grafhome_ca
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
-fn try_store_secret_service(user: &str, host: &str, password: &str) -> grafhome_ca::Result<bool> {
+fn try_store_secret_service(user: &str, host: &str, password: &str) -> bool {
     let child = process("secret-tool")
         .arg("store")
         .arg("--label=Grafhome CA renewal")
@@ -4158,8 +4161,7 @@ fn try_store_secret_service(user: &str, host: &str, password: &str) -> grafhome_
         .spawn();
     let mut child = match child {
         Ok(child) => child,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => return Err(grafhome_ca::Error::io("secret-tool", source)),
+        Err(_) => return false,
     };
     if let Err(source) = child
         .stdin
@@ -4169,17 +4171,18 @@ fn try_store_secret_service(user: &str, host: &str, password: &str) -> grafhome_
     {
         if source.kind() == std::io::ErrorKind::BrokenPipe {
             let _ = child.wait();
-            return Ok(false);
+            return false;
         }
-        return Err(grafhome_ca::Error::io("secret-tool stdin", source));
+        let _ = child.wait();
+        return false;
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|source| grafhome_ca::Error::io("secret-tool", source))?;
+    let Ok(output) = child.wait_with_output() else {
+        return false;
+    };
     if !output.status.success() {
-        return Ok(false);
+        return false;
     }
-    Ok(true)
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -4189,10 +4192,14 @@ fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String> {
-    if let Some(password) = lookup_secret_service(user, host)? {
-        return Ok(password);
+    match lookup_systemd_credential(user, host) {
+        Ok(password) => Ok(password),
+        Err(systemd_error) => {
+            // Secret Service is a recovery copy. Prefer the unattended systemd
+            // credential so a stale keyring item cannot override it.
+            lookup_secret_service(user, host).ok_or(systemd_error)
+        }
     }
-    lookup_systemd_credential(user, host)
 }
 
 #[cfg(target_os = "android")]
@@ -4207,7 +4214,7 @@ fn lookup_renewal_password(user: &str, host: &str) -> grafhome_ca::Result<String
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
-fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<String>> {
+fn lookup_secret_service(user: &str, host: &str) -> Option<String> {
     let output = process("secret-tool")
         .arg("lookup")
         .arg("service")
@@ -4219,16 +4226,15 @@ fn lookup_secret_service(user: &str, host: &str) -> grafhome_ca::Result<Option<S
         .output();
     let output = match output {
         Ok(output) => output,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(grafhome_ca::Error::io("secret-tool", source)),
+        Err(_) => return None,
     };
     let password = String::from_utf8_lossy(&output.stdout)
         .trim_end_matches(['\r', '\n'])
         .to_owned();
     if !output.status.success() || password.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(password))
+    Some(password)
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
@@ -4316,76 +4322,216 @@ fn read_app_private_credential(path: &Path) -> grafhome_ca::Result<Option<String
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
-fn store_systemd_credential(user: &str, host: &str, password: &str) -> grafhome_ca::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemdCredentialMode {
+    User,
+    Tpm,
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+impl std::fmt::Display for SystemdCredentialMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => formatter.write_str("an encrypted systemd user credential"),
+            Self::Tpm => formatter.write_str("an encrypted TPM-bound systemd credential"),
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+impl SystemdCredentialMode {
+    /// @brief Add encryption arguments for this credential format.
+    fn encrypt_args(self, command: &mut ProcessCommand) {
+        match self {
+            Self::User => {
+                command.arg("--user");
+            }
+            Self::Tpm => {
+                // systemd before version 256 has no user-scoped credentials.
+                // File mode still scopes access to this user, while TPM-only
+                // encryption keeps copied home-directory data confidential.
+                // Avoid fixed PCR binding so routine firmware and Secure Boot
+                // database updates do not strand the renewal credential.
+                command.arg("--with-key=tpm2").arg("--tpm2-pcrs=");
+            }
+        }
+    }
+
+    /// @brief Add decryption arguments for this credential format.
+    fn decrypt_args(self, command: &mut ProcessCommand) {
+        if self == Self::User {
+            command.arg("--user");
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+fn store_systemd_credential(
+    user: &str,
+    host: &str,
+    password: &str,
+) -> grafhome_ca::Result<SystemdCredentialMode> {
     let path = renewal_credential_path(user, host)?;
     let parent = path.parent().expect("credential path has a parent");
     std::fs::create_dir_all(parent).map_err(|source| grafhome_ca::Error::io(parent, source))?;
     let temporary = parent.join(format!(".renewal-password.cred-{}", std::process::id()));
-    if temporary.exists() {
-        std::fs::remove_file(&temporary)
-            .map_err(|source| grafhome_ca::Error::io(&temporary, source))?;
-    }
-    let mut child = process("systemd-creds")
-        .arg("encrypt")
-        .arg("--user")
+    remove_file_if_present(&temporary)?;
+
+    let user_error =
+        match try_encrypt_systemd_credential(SystemdCredentialMode::User, &temporary, password) {
+            Ok(()) => {
+                finalize_systemd_credential(&temporary, &path)?;
+                return Ok(SystemdCredentialMode::User);
+            }
+            Err(message) => message,
+        };
+
+    // A failed command may have created a partial output. Never let it become
+    // input to the compatibility attempt or remain beside private key material.
+    remove_file_if_present(&temporary)?;
+    let tpm_error =
+        match try_encrypt_systemd_credential(SystemdCredentialMode::Tpm, &temporary, password) {
+            Ok(()) => {
+                finalize_systemd_credential(&temporary, &path)?;
+                return Ok(SystemdCredentialMode::Tpm);
+            }
+            Err(message) => message,
+        };
+    remove_file_if_present(&temporary)?;
+
+    Err(grafhome_ca::Error::Validation {
+        field: "renewal credential storage".to_owned(),
+        message: format!(
+            "could not create the encrypted systemd credential required for unattended renewal; \
+             user-scoped credential: {user_error}; legacy TPM credential: {tpm_error}. \
+             Use systemd 256 or newer, or grant this user access to the TPM resource manager \
+             (commonly by adding it to the tss group). As an explicit fallback, pass the same \
+             owner-only --password-file to enrollment and scheduled renewal"
+        ),
+    })
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+fn try_encrypt_systemd_credential(
+    mode: SystemdCredentialMode,
+    path: &Path,
+    password: &str,
+) -> Result<(), String> {
+    let mut command = process("systemd-creds");
+    command.arg("encrypt");
+    mode.encrypt_args(&mut command);
+    command
         .arg("--quiet")
-        .arg("--name=grafhome-ca-renewal")
+        .arg(format!("--name={SYSTEMD_RENEWAL_CREDENTIAL_NAME}"))
         .arg("-")
-        .arg(&temporary)
+        .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
-        .map_err(|source| grafhome_ca::Error::io("systemd-creds", source))?;
-    child
+        .map_err(|source| format!("could not start systemd-creds: {source}"))?;
+    let write_result = child
         .stdin
-        .as_mut()
+        .take()
         .expect("piped systemd-creds stdin")
-        .write_all(password.as_bytes())
-        .map_err(|source| grafhome_ca::Error::io("systemd-creds stdin", source))?;
+        .write_all(password.as_bytes());
     let output = child
         .wait_with_output()
-        .map_err(|source| grafhome_ca::Error::io("systemd-creds", source))?;
+        .map_err(|source| format!("could not wait for systemd-creds: {source}"))?;
     if !output.status.success() {
-        return Err(grafhome_ca::Error::Validation {
-            field: "renewal credential storage".to_owned(),
-            message: format!(
-                "neither Secret Service nor systemd user credentials could store the renewal password: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        });
+        return Err(backend_command_error(
+            &output.stderr,
+            "systemd-creds encryption failed without an error message",
+            &[password],
+        ));
     }
-    #[cfg(unix)]
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-        .map_err(|source| grafhome_ca::Error::io(&temporary, source))?;
-    std::fs::rename(&temporary, &path).map_err(|source| grafhome_ca::Error::io(&path, source))?;
-    Ok(())
+    write_result.map_err(|source| format!("could not write to systemd-creds: {source}"))
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+fn finalize_systemd_credential(temporary: &Path, path: &Path) -> grafhome_ca::Result<()> {
+    let result = (|| {
+        #[cfg(unix)]
+        std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| grafhome_ca::Error::io(temporary, source))?;
+        std::fs::rename(temporary, path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 fn lookup_systemd_credential(user: &str, host: &str) -> grafhome_ca::Result<String> {
     let path = renewal_credential_path(user, host)?;
-    let output = process("systemd-creds")
-        .arg("decrypt")
-        .arg("--user")
+    let user_error = match try_decrypt_systemd_credential(SystemdCredentialMode::User, &path) {
+        Ok(password) => return Ok(password),
+        Err(message) => message,
+    };
+    let tpm_error = match try_decrypt_systemd_credential(SystemdCredentialMode::Tpm, &path) {
+        Ok(password) => return Ok(password),
+        Err(message) => message,
+    };
+    Err(grafhome_ca::Error::Validation {
+        field: "renewal credential storage".to_owned(),
+        message: format!(
+            "no usable renewal password found for {user}@{host}; user-scoped credential: \
+             {user_error}; legacy TPM credential: {tpm_error}. Rerun enrollment or use \
+             --password-file"
+        ),
+    })
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+fn try_decrypt_systemd_credential(
+    mode: SystemdCredentialMode,
+    path: &Path,
+) -> Result<String, String> {
+    let mut command = process("systemd-creds");
+    command.arg("decrypt");
+    mode.decrypt_args(&mut command);
+    let output = command
         .arg("--quiet")
-        .arg("--name=grafhome-ca-renewal")
-        .arg(&path)
+        .arg(format!("--name={SYSTEMD_RENEWAL_CREDENTIAL_NAME}"))
+        .arg(path)
         .arg("-")
         .output()
-        .map_err(|source| grafhome_ca::Error::io("systemd-creds", source))?;
+        .map_err(|source| format!("could not start systemd-creds: {source}"))?;
     let password = String::from_utf8_lossy(&output.stdout)
         .trim_end_matches(['\r', '\n'])
         .to_owned();
     if !output.status.success() || password.is_empty() {
-        return Err(grafhome_ca::Error::Validation {
-            field: "renewal credential storage".to_owned(),
-            message: format!(
-                "no usable renewal password found for {user}@{host}; rerun enrollment or use --password-file"
-            ),
-        });
+        return Err(backend_command_error(
+            &output.stderr,
+            "systemd-creds did not return a credential",
+            &[],
+        ));
     }
     Ok(password)
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+fn backend_command_error(stderr: &[u8], fallback: &str, redactions: &[&str]) -> String {
+    let message = redact_text(&String::from_utf8_lossy(stderr), redactions)
+        .trim()
+        .to_owned();
+    if message.is_empty() {
+        fallback.to_owned()
+    } else {
+        message
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+fn remove_file_if_present(path: &Path) -> grafhome_ca::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(grafhome_ca::Error::io(path, source)),
+    }
 }
 
 #[cfg(target_os = "macos")]
