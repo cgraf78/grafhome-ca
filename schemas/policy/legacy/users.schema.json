@@ -1,0 +1,6 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/legacy/users.schema.json",
+  "title": "Grafhome legacy user policy",
+  "$ref": "../users.schema.json#/definitions/legacyDocument"
+}

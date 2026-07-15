@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/legacy/provisioners.schema.json",
+  "title": "provisioners policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["provisioners"],
+  "properties": {
+    "provisioners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "name", "type", "default_ttl", "max_ttl", "status"],
+        "properties": {
+          "role": {
+            "enum": ["host_bootstrap", "user_enrollment", "proxy_x509"]
+          },
+          "name": {
+            "$ref": "#/definitions/name"
+          },
+          "type": {
+            "enum": ["JWK", "ACME"]
+          },
+          "default_ttl": {
+            "$ref": "#/definitions/ttl"
+          },
+          "max_ttl": {
+            "oneOf": [{ "$ref": "#/definitions/ttl" }, { "const": "unlimited" }]
+          },
+          "renewal_default_ttl": {
+            "$ref": "#/definitions/ttl"
+          },
+          "renewal_max_ttl": {
+            "$ref": "#/definitions/ttl"
+          },
+          "status": {
+            "enum": ["active", "planned", "disabled"]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "max_ttl": { "const": "unlimited" }
+              },
+              "required": ["max_ttl"]
+            },
+            "then": {
+              "properties": {
+                "role": { "const": "user_enrollment" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "role": { "enum": ["host_bootstrap", "user_enrollment"] }
+              },
+              "required": ["role"]
+            },
+            "then": {
+              "properties": {
+                "type": { "const": "JWK" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "role": { "const": "proxy_x509" }
+              },
+              "required": ["role"]
+            },
+            "then": {
+              "properties": {
+                "type": { "const": "ACME" }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "ttl": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smh]$"
+    }
+  }
+}

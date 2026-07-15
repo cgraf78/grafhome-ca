@@ -1,0 +1,8 @@
+ssh_roles = ["server", "client"]
+principals = ["ca-host", "ca-origin.example.test"]
+
+[user_access.alice.enrollment]
+allow_effectively_infinite_cert = true
+
+[[user_access.alice.logins]]
+unix_account = "alice"

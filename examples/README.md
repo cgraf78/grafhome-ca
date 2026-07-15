@@ -8,8 +8,14 @@ commit publicly and are used by the test suite to keep examples valid.
 ```text
 ${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/
   config/deployment.env
-  policy/*.toml
+  policy/ca.toml
+  policy/users.toml
+  policy/hosts/<host>.toml
 ```
+
+`legacy-site-config/` preserves the previous six-file policy shape as a
+migration and compatibility fixture. It is not the recommended authoring
+layout for new deployments.
 
 To adapt the example for a real deployment, copy the `site-config/` contents to
 that XDG location in a private repository or private host configuration system,

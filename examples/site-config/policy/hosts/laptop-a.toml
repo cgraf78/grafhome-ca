@@ -1,0 +1,8 @@
+ssh_roles = ["server", "client"]
+principals = ["laptop-a", "laptop-a.example.test"]
+
+[user_access.alice]
+enrollment = true
+
+[[user_access.alice.logins]]
+unix_account = "alice"
