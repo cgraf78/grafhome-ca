@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::executable::root_step_bin;
 use crate::model::SiteModel;
-use crate::policy::{ENDPOINT_ROLE_CA_API, Host, ca_policy_field};
+use crate::policy::{ENDPOINT_ROLE_CA_API, Host, SshRole, ca_policy_field};
 use crate::render::RenderedFile;
 
 const ROOT_CERT: &str = "root_ca.crt";
@@ -174,7 +174,7 @@ fn root_fingerprint(model: &SiteModel, root_cert_path: &Path) -> Result<String> 
 fn host_principals(hosts: &[Host]) -> Vec<String> {
     let mut principals = hosts
         .iter()
-        .filter(|host| host.ssh_server)
+        .filter(|host| host.has_ssh_role(SshRole::Server))
         .flat_map(|host| host.principals.iter().map(String::as_str))
         .map(str::trim)
         .filter(|principal| !principal.is_empty())

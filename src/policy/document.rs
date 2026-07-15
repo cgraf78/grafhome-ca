@@ -4,15 +4,16 @@
 //! edit. The rest of the crate consumes the normalized [`Policy`] model, so
 //! document layout changes cannot leak into authorization or rendering logic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
     CA_POLICY_PATH, Endpoint, HOST_POLICY_DIR, Host, LEGACY_POLICY_PATHS,
-    PROVISIONER_ROLE_USER_ENROLLMENT, Policy, Provisioner, USERS_POLICY_PATH, User, UserClient,
-    UserRemote, provisioner_role_rank, read_typed_document,
+    PROVISIONER_ROLE_USER_ENROLLMENT, Policy, Provisioner, SshRole, Status, USERS_POLICY_PATH,
+    User, UserClient, UserRemote, expected_provisioner_type, provisioner_role_rank,
+    read_typed_document,
 };
 use crate::error::{Error, Result};
 
@@ -54,14 +55,14 @@ struct EndpointPolicy {
 #[serde(deny_unknown_fields)]
 struct ProvisionerPolicy {
     name: String,
-    r#type: String,
     default_ttl: String,
     max_ttl: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     renewal_default_ttl: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     renewal_max_ttl: Option<String>,
-    status: String,
+    #[serde(default, skip_serializing_if = "Status::is_active")]
+    status: Status,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -75,18 +76,19 @@ struct UsersDocument {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserPolicy {
-    principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    principal: Option<String>,
     cert_ttl: String,
     #[serde(default, skip_serializing_if = "is_false")]
     ssh_admin: bool,
-    status: String,
+    #[serde(default, skip_serializing_if = "Status::is_active")]
+    status: Status,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct HostDocument {
-    ssh_server: bool,
-    ssh_client: bool,
+    ssh_roles: BTreeSet<SshRole>,
     principals: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     user_access: BTreeMap<String, HostUserAccess>,
@@ -102,18 +104,27 @@ struct HostUserAccess {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum EnrollmentPolicy {
+    Enabled(bool),
+    Options(EnrollmentOptions),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct EnrollmentPolicy {
-    #[serde(default, skip_serializing_if = "is_false")]
-    allow_effectively_infinite_cert: bool,
-    status: String,
+struct EnrollmentOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow_effectively_infinite_cert: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<Status>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LoginPolicy {
     unix_account: String,
-    status: String,
+    #[serde(default, skip_serializing_if = "Status::is_active")]
+    status: Status,
 }
 
 /// Detect the policy layout while rejecting ambiguous mixed-format trees.
@@ -172,17 +183,19 @@ pub fn load(root: &Path) -> Result<Policy> {
     let mut provisioners = ca
         .provisioners
         .into_iter()
-        .map(|(role, provisioner)| Provisioner {
-            role,
-            name: provisioner.name,
-            r#type: provisioner.r#type,
-            default_ttl: provisioner.default_ttl,
-            max_ttl: provisioner.max_ttl,
-            renewal_default_ttl: provisioner.renewal_default_ttl,
-            renewal_max_ttl: provisioner.renewal_max_ttl,
-            status: provisioner.status,
+        .map(|(role, provisioner)| {
+            Ok(Provisioner {
+                r#type: provisioner_type(&role)?.to_owned(),
+                role,
+                name: provisioner.name,
+                default_ttl: provisioner.default_ttl,
+                max_ttl: provisioner.max_ttl,
+                renewal_default_ttl: provisioner.renewal_default_ttl,
+                renewal_max_ttl: provisioner.renewal_max_ttl,
+                status: provisioner.status,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     provisioners.sort_by_key(|provisioner| provisioner_role_rank(&provisioner.role));
     let user_provisioner = provisioners
         .iter()
@@ -199,8 +212,8 @@ pub fn load(root: &Path) -> Result<Policy> {
         .users
         .into_iter()
         .map(|(user, policy)| User {
+            principal: policy.principal.unwrap_or_else(|| user.clone()),
             user,
-            principal: policy.principal,
             provisioner: user_provisioner.clone(),
             cert_ttl: policy.cert_ttl,
             ssh_admin: policy.ssh_admin,
@@ -216,17 +229,47 @@ pub fn load(root: &Path) -> Result<Policy> {
         let document: HostDocument = read_document(root.join(&relative))?;
         hosts.push(Host {
             host: host.clone(),
-            ssh_server: document.ssh_server,
-            ssh_client: document.ssh_client,
+            ssh_roles: document.ssh_roles,
             principals: document.principals,
         });
         for (user, access) in document.user_access {
             if let Some(enrollment) = access.enrollment {
+                let enrollment = match enrollment {
+                    EnrollmentPolicy::Enabled(true) => EnrollmentOptions {
+                        allow_effectively_infinite_cert: None,
+                        status: None,
+                    },
+                    EnrollmentPolicy::Enabled(false) => {
+                        return Err(Error::Validation {
+                            field: format!(
+                                "policy/hosts/{host}.toml:user_access.{user}.enrollment"
+                            ),
+                            message: "must be true when present; omit it to deny enrollment"
+                                .to_owned(),
+                        });
+                    }
+                    EnrollmentPolicy::Options(options)
+                        if options.allow_effectively_infinite_cert.is_none()
+                            && options.status.is_none() =>
+                    {
+                        return Err(Error::Validation {
+                            field: format!(
+                                "policy/hosts/{host}.toml:user_access.{user}.enrollment"
+                            ),
+                            message:
+                                "must contain an option; use enrollment = true for the default"
+                                    .to_owned(),
+                        });
+                    }
+                    EnrollmentPolicy::Options(options) => options,
+                };
                 user_clients.push(UserClient {
                     host: host.clone(),
                     user: user.clone(),
-                    allow_effectively_infinite_cert: enrollment.allow_effectively_infinite_cert,
-                    status: enrollment.status,
+                    allow_effectively_infinite_cert: enrollment
+                        .allow_effectively_infinite_cert
+                        .unwrap_or(false),
+                    status: enrollment.status.unwrap_or_default(),
                 });
             }
             user_remotes.extend(access.logins.into_iter().map(|login| UserRemote {
@@ -277,12 +320,21 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
                     provisioner.role.clone(),
                     ProvisionerPolicy {
                         name: provisioner.name.clone(),
-                        r#type: provisioner.r#type.clone(),
                         default_ttl: provisioner.default_ttl.clone(),
                         max_ttl: provisioner.max_ttl.clone(),
-                        renewal_default_ttl: provisioner.renewal_default_ttl.clone(),
-                        renewal_max_ttl: provisioner.renewal_max_ttl.clone(),
-                        status: provisioner.status.clone(),
+                        renewal_default_ttl: provisioner
+                            .renewal_default_ttl
+                            .as_ref()
+                            .filter(|duration| **duration != provisioner.default_ttl)
+                            .cloned(),
+                        renewal_max_ttl: provisioner
+                            .renewal_max_ttl
+                            .as_ref()
+                            .filter(|duration| {
+                                duration.as_str() != policy.inferred_renewal_max_ttl(provisioner)
+                            })
+                            .cloned(),
+                        status: provisioner.status,
                     },
                 )
             })
@@ -297,10 +349,10 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
                 (
                     user.user.clone(),
                     UserPolicy {
-                        principal: user.principal.clone(),
+                        principal: (user.principal != user.user).then(|| user.principal.clone()),
                         cert_ttl: user.cert_ttl.clone(),
                         ssh_admin: user.ssh_admin,
-                        status: user.status.clone(),
+                        status: user.status,
                     },
                 )
             })
@@ -330,22 +382,30 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
             user_access
                 .entry(enrollment.user.clone())
                 .or_default()
-                .enrollment = Some(EnrollmentPolicy {
-                allow_effectively_infinite_cert: enrollment.allow_effectively_infinite_cert,
-                status: enrollment.status.clone(),
-            });
+                .enrollment = Some(
+                if !enrollment.allow_effectively_infinite_cert && enrollment.status.is_active() {
+                    EnrollmentPolicy::Enabled(true)
+                } else {
+                    EnrollmentPolicy::Options(EnrollmentOptions {
+                        allow_effectively_infinite_cert: enrollment
+                            .allow_effectively_infinite_cert
+                            .then_some(true),
+                        status: (!enrollment.status.is_active()).then_some(enrollment.status),
+                    })
+                },
+            );
         }
         for login in policy
             .user_remotes
             .iter()
             .filter(|login| login.host == host.host)
         {
-            let status = if login.allow_ssh || login.status != "active" {
-                login.status.clone()
+            let status = if login.allow_ssh || !login.status.is_active() {
+                login.status
             } else {
                 // The canonical format represents authorization by relationship
                 // presence. Preserve an explicit active deny as inert history.
-                "disabled".to_owned()
+                Status::Disabled
             };
             user_access
                 .entry(login.user.clone())
@@ -357,8 +417,7 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
                 });
         }
         let document = HostDocument {
-            ssh_server: host.ssh_server,
-            ssh_client: host.ssh_client,
+            ssh_roles: host.ssh_roles.clone(),
             principals: host.principals.clone(),
             user_access,
         };
@@ -368,6 +427,13 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
         )?);
     }
     Ok(files)
+}
+
+fn provisioner_type(role: &str) -> Result<&'static str> {
+    expected_provisioner_type(role).ok_or_else(|| Error::Validation {
+        field: format!("{CA_POLICY_PATH}:provisioners.{role}"),
+        message: "unknown provisioner role".to_owned(),
+    })
 }
 
 fn host_paths(root: &Path) -> Result<Vec<PathBuf>> {

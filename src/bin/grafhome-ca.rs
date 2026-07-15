@@ -24,9 +24,9 @@ use grafhome_ca::executable::{root_step_bin, user_step_bin};
 use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{
     ENDPOINT_ROLE_CA_API, ENDPOINT_ROLE_CA_ORIGIN, Endpoint, Host, PROVISIONER_ROLE_HOST_BOOTSTRAP,
-    PROVISIONER_ROLE_USER_ENROLLMENT, Provisioner, STEP_EFFECTIVE_UNLIMITED_TTL, UNLIMITED_TTL,
-    User, UserClient, ca_policy_field, duration_at_most, host_policy_field, user_policy_field,
-    valid_step_duration_expression,
+    PROVISIONER_ROLE_USER_ENROLLMENT, Provisioner, STEP_EFFECTIVE_UNLIMITED_TTL, SshRole,
+    UNLIMITED_TTL, User, UserClient, ca_policy_field, duration_at_most, host_policy_field,
+    user_policy_field, valid_step_duration_expression,
 };
 
 const USER_KEY_NAME: &str = "id_ed25519";
@@ -1372,7 +1372,7 @@ fn active_user<'a>(model: &'a SiteModel, user: &str) -> grafhome_ca::Result<&'a 
             field: user_policy_field(user, "user"),
             message: "unknown user".to_owned(),
         })?;
-    if user.status != "active" {
+    if !user.status.is_active() {
         return Err(grafhome_ca::Error::Validation {
             field: user_policy_field(&user.user, "status"),
             message: "user must be active".to_owned(),
@@ -1389,7 +1389,7 @@ fn required_provisioner<'a>(
         .policy
         .provisioners
         .iter()
-        .find(|entry| entry.role == role && entry.status == "active")
+        .find(|entry| entry.role == role && entry.status.is_active())
         .ok_or_else(|| grafhome_ca::Error::Validation {
             field: ca_policy_field("provisioners", role, "role"),
             message: "missing active provisioner role".to_owned(),
@@ -1405,7 +1405,7 @@ fn required_user_client<'a>(
         .policy
         .user_clients
         .iter()
-        .find(|client| client.user == user && client.host == host && client.status == "active")
+        .find(|client| client.user == user && client.host == host && client.status.is_active())
         .ok_or_else(|| grafhome_ca::Error::Validation {
             field: host_policy_field(host, &format!("user_access.{user}.enrollment")),
             message: "missing active user client for user and host".to_owned(),
@@ -2699,7 +2699,7 @@ fn desired_host_ssh_files(
     let step_bin = root_step_bin(model)?;
     let steppath = Path::new(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]);
     let root = server_root_cert_path(model);
-    let user_ca_keys = if host.ssh_server {
+    let user_ca_keys = if host.has_ssh_role(SshRole::Server) {
         String::from_utf8_lossy(&run_capture(
             process(&step_bin)
                 .env("STEPPATH", steppath)
@@ -2715,7 +2715,7 @@ fn desired_host_ssh_files(
     } else {
         String::new()
     };
-    let host_ca_keys = if host.ssh_client {
+    let host_ca_keys = if host.has_ssh_role(SshRole::Client) {
         String::from_utf8_lossy(&run_capture(
             process(&step_bin)
                 .env("STEPPATH", steppath)
@@ -3065,7 +3065,7 @@ fn known_hosts_from_roots(model: &SiteModel, roots: &str) -> String {
         .policy
         .hosts
         .iter()
-        .filter(|host| host.ssh_server)
+        .filter(|host| host.has_ssh_role(SshRole::Server))
         .flat_map(|host| host.principals.iter().map(String::as_str))
         .collect::<Vec<_>>();
     principals.sort_unstable();

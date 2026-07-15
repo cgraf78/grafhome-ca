@@ -2,5 +2,76 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/users.schema.json",
   "title": "Grafhome user policy compatibility entry point",
-  "oneOf": [{ "$ref": "legacy/users.schema.json" }, { "$ref": "canonical/users.schema.json" }]
+  "oneOf": [
+    { "$ref": "#/definitions/legacyDocument" },
+    { "$ref": "#/definitions/canonicalDocument" }
+  ],
+  "definitions": {
+    "legacyDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["users"],
+      "properties": {
+        "require_ssh_admin_access": { "type": "boolean" },
+        "users": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["user", "principal", "provisioner", "cert_ttl", "status"],
+            "properties": {
+              "user": { "$ref": "#/definitions/account" },
+              "principal": { "$ref": "#/definitions/principal" },
+              "provisioner": { "$ref": "#/definitions/name" },
+              "cert_ttl": { "$ref": "#/definitions/ttl" },
+              "ssh_admin": { "type": "boolean" },
+              "status": { "$ref": "#/definitions/status" }
+            }
+          }
+        }
+      }
+    },
+    "canonicalDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["users"],
+      "properties": {
+        "require_ssh_admin_access": { "type": "boolean" },
+        "users": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/definitions/account" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["cert_ttl"],
+            "properties": {
+              "principal": { "$ref": "#/definitions/principal" },
+              "cert_ttl": { "$ref": "#/definitions/ttl" },
+              "ssh_admin": { "type": "boolean" },
+              "status": { "$ref": "#/definitions/status" }
+            }
+          }
+        }
+      }
+    },
+    "account": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "principal": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._@-]+$"
+    },
+    "ttl": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smh]$"
+    },
+    "status": {
+      "enum": ["active", "planned", "disabled"]
+    }
+  }
 }

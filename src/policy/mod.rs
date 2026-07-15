@@ -4,6 +4,7 @@
 //! comment, and edit by hand without reducing booleans or lists to strings.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -32,6 +33,47 @@ pub const PROVISIONER_ROLE_HOST_BOOTSTRAP: &str = "host_bootstrap";
 pub const PROVISIONER_ROLE_USER_ENROLLMENT: &str = "user_enrollment";
 /// Proxy ACME provisioner role.
 pub const PROVISIONER_ROLE_PROXY_X509: &str = "proxy_x509";
+
+/// Lifecycle state for a policy object or relationship.
+#[derive(Debug, Default, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    /// The object participates in generated and runtime policy.
+    #[default]
+    Active,
+    /// The object records intended future policy without enabling it.
+    Planned,
+    /// The object is retained as inactive policy history.
+    Disabled,
+}
+
+impl Status {
+    /// Return whether this state participates in effective policy.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Active => "active",
+            Self::Planned => "planned",
+            Self::Disabled => "disabled",
+        })
+    }
+}
+
+/// SSH capability enabled for a managed host.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshRole {
+    /// Accept SSH connections and trust configured user certificates.
+    Server,
+    /// Initiate SSH connections and trust configured host certificates.
+    Client,
+}
 
 pub(crate) const LEGACY_ENDPOINTS_PATH: &str = "policy/endpoints.toml";
 pub(crate) const LEGACY_HOSTS_PATH: &str = "policy/hosts.toml";
@@ -118,12 +160,18 @@ impl Endpoint {
 pub struct Host {
     /// Stable host name used by policy references.
     pub host: String,
-    /// Whether this host should accept SSH server connections.
-    pub ssh_server: bool,
-    /// Whether this host should act as an SSH client.
-    pub ssh_client: bool,
+    /// SSH capabilities enabled for this host.
+    pub ssh_roles: BTreeSet<SshRole>,
     /// Host certificate principals.
     pub principals: Vec<String>,
+}
+
+impl Host {
+    /// Return whether this host has one SSH capability.
+    #[must_use]
+    pub fn has_ssh_role(&self, role: SshRole) -> bool {
+        self.ssh_roles.contains(&role)
+    }
 }
 
 /// User entry from `policy/users.toml`.
@@ -142,7 +190,7 @@ pub struct User {
     #[serde(default)]
     pub ssh_admin: bool,
     /// Policy status.
-    pub status: String,
+    pub status: Status,
 }
 
 /// Provisioner entry normalized from `policy/ca.toml`.
@@ -166,7 +214,7 @@ pub struct Provisioner {
     #[serde(default)]
     pub renewal_max_ttl: Option<String>,
     /// Policy status.
-    pub status: String,
+    pub status: Status,
 }
 
 /// User certificate enrollment relationship from a host manifest.
@@ -181,7 +229,7 @@ pub struct UserClient {
     #[serde(default)]
     pub allow_effectively_infinite_cert: bool,
     /// Policy status.
-    pub status: String,
+    pub status: Status,
 }
 
 impl Provisioner {
@@ -207,7 +255,7 @@ pub struct UserRemote {
     /// Whether SSH access is allowed.
     pub allow_ssh: bool,
     /// Policy status.
-    pub status: String,
+    pub status: Status,
 }
 
 /// Parsed policy set.
@@ -243,12 +291,18 @@ impl Policy {
         if let Some(maximum) = provisioner.renewal_max_ttl.as_deref() {
             return maximum;
         }
+        self.inferred_renewal_max_ttl(provisioner)
+    }
+
+    /// Maximum renewal lifetime implied when no explicit override is present.
+    #[must_use]
+    pub fn inferred_renewal_max_ttl<'a>(&'a self, provisioner: &'a Provisioner) -> &'a str {
         if provisioner.max_ttl != UNLIMITED_TTL {
             return &provisioner.max_ttl;
         }
         self.users
             .iter()
-            .filter(|user| user.status == "active" && user.provisioner == provisioner.name)
+            .filter(|user| user.status.is_active() && user.provisioner == provisioner.name)
             .map(|user| user.cert_ttl.as_str())
             .chain(std::iter::once(provisioner.renewal_default_ttl()))
             .max_by_key(|duration| duration_nanoseconds(duration).unwrap_or_default())
@@ -287,11 +341,11 @@ impl Policy {
     /// Active user-host rows that grant SSH access.
     pub fn active_ssh_access(&self) -> impl Iterator<Item = &UserRemote> {
         self.user_remotes.iter().filter(|access| {
-            access.status == "active"
+            access.status.is_active()
                 && access.allow_ssh
                 && self
                     .user(&access.user)
-                    .is_some_and(|user| user.status == "active")
+                    .is_some_and(|user| user.status.is_active())
         })
     }
 
@@ -299,7 +353,7 @@ impl Policy {
     pub fn active_user_clients(&self, user: &str) -> impl Iterator<Item = &UserClient> {
         self.user_clients
             .iter()
-            .filter(move |client| client.status == "active" && client.user == user)
+            .filter(move |client| client.status.is_active() && client.user == user)
     }
 
     fn validate(&self) -> Result<()> {
@@ -409,7 +463,7 @@ impl Policy {
                 });
             }
             validate_step_duration("policy/users.toml", name, "cert_ttl", &user.cert_ttl)?;
-            if user.ssh_admin && user.status != "active" {
+            if user.ssh_admin && !user.status.is_active() {
                 return Err(Error::Validation {
                     field: user_policy_field(name, "ssh_admin"),
                     message: "SSH administrators must have active status".to_owned(),
@@ -418,6 +472,17 @@ impl Policy {
         }
 
         for provisioner in &self.provisioners {
+            if let Some(expected) = expected_provisioner_type(&provisioner.role)
+                && provisioner.r#type != expected
+            {
+                return Err(Error::Validation {
+                    field: ca_policy_field("provisioners", &provisioner.role, "type"),
+                    message: format!(
+                        "provisioner role {} requires type {expected}",
+                        provisioner.role
+                    ),
+                });
+            }
             validate_step_duration(
                 "policy/ca.toml:provisioners",
                 &provisioner.role,
@@ -470,7 +535,7 @@ impl Policy {
         }
 
         for user in &self.users {
-            if user.status != "active" {
+            if !user.status.is_active() {
                 continue;
             }
             let provisioner = self
@@ -523,10 +588,10 @@ impl Policy {
             let remote = self
                 .host(&access.host)
                 .expect("remote host existence was validated");
-            let grants_ssh = access.allow_ssh && access.status == "active";
-            if grants_ssh && !remote.ssh_server {
+            let grants_ssh = access.allow_ssh && access.status.is_active();
+            if grants_ssh && !remote.has_ssh_role(SshRole::Server) {
                 return Err(Error::Validation {
-                    field: host_policy_field(&access.host, "ssh_server"),
+                    field: host_policy_field(&access.host, "ssh_roles"),
                     message: format!("host {} is not an SSH server", access.host),
                 });
             }
@@ -560,7 +625,7 @@ impl Policy {
         let ssh_admins = self
             .users
             .iter()
-            .filter(|user| user.ssh_admin && user.status == "active")
+            .filter(|user| user.ssh_admin && user.status.is_active())
             .map(|user| user.user.as_str())
             .collect::<BTreeSet<_>>();
         if self.require_ssh_admin_access {
@@ -575,7 +640,11 @@ impl Policy {
                 .filter(|access| ssh_admins.contains(access.user.as_str()))
                 .map(|access| access.host.as_str())
                 .collect::<BTreeSet<_>>();
-            for host in self.hosts.iter().filter(|host| host.ssh_server) {
+            for host in self
+                .hosts
+                .iter()
+                .filter(|host| host.has_ssh_role(SshRole::Server))
+            {
                 if !hosts_with_admin_access.contains(host.host.as_str()) {
                     return Err(Error::Validation {
                         field: host_policy_field(&host.host, "user_access"),
@@ -610,9 +679,9 @@ impl Policy {
             let host = self
                 .host(&client.host)
                 .expect("client host existence was validated");
-            if !host.ssh_client {
+            if client.status.is_active() && !host.has_ssh_role(SshRole::Client) {
                 return Err(Error::Validation {
-                    field: host_policy_field(&client.host, "ssh_client"),
+                    field: host_policy_field(&client.host, "ssh_roles"),
                     message: format!("host {} is not an SSH client", client.host),
                 });
             }
@@ -793,6 +862,14 @@ fn provisioner_role_rank(role: &str) -> u8 {
     }
 }
 
+fn expected_provisioner_type(role: &str) -> Option<&'static str> {
+    match role {
+        PROVISIONER_ROLE_HOST_BOOTSTRAP | PROVISIONER_ROLE_USER_ENROLLMENT => Some("JWK"),
+        PROVISIONER_ROLE_PROXY_X509 => Some("ACME"),
+        _ => None,
+    }
+}
+
 fn unique_values<'a>(
     table: &str,
     values: impl Iterator<Item = &'a str>,
@@ -939,7 +1016,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Policy, User, UserClient, UserRemote, duration_at_most};
+    use super::{Policy, SshRole, Status, User, UserClient, UserRemote, duration_at_most};
 
     #[test]
     fn checked_in_policy_loads() {
@@ -960,6 +1037,13 @@ mod tests {
             .unwrap();
         assert_eq!(user.renewal_default_ttl(), "24h");
         assert_eq!(policy.renewal_max_ttl(user), "48h");
+        assert!(user.status.is_active());
+        let alice = policy.user("alice").expect("alice exists");
+        assert_eq!(alice.principal, "alice");
+        assert!(alice.status.is_active());
+        let edge_host = policy.host("edge-host").expect("edge host exists");
+        assert!(edge_host.has_ssh_role(SshRole::Server));
+        assert!(edge_host.has_ssh_role(SshRole::Client));
         assert!(
             policy
                 .user_clients
@@ -967,6 +1051,15 @@ mod tests {
                 .find(|client| client.host == "ca-host")
                 .unwrap()
                 .allow_effectively_infinite_cert
+        );
+        assert!(
+            policy
+                .user_clients
+                .iter()
+                .find(|client| client.host == "edge-host")
+                .unwrap()
+                .status
+                .is_active()
         );
     }
 
@@ -1275,6 +1368,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_legacy_provisioner_type_that_conflicts_with_its_role() {
+        let (dir, policy_dir) = copy_policy();
+        let provisioners = policy_dir.join("provisioners.toml");
+        let text = fs::read_to_string(&provisioners).unwrap().replacen(
+            "type = \"JWK\"",
+            "type = \"ACME\"",
+            1,
+        );
+        fs::write(provisioners, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("provisioners.host_bootstrap.type"));
+        assert!(error.contains("requires type JWK"));
+    }
+
+    #[test]
     fn rejects_root_user_identity() {
         let (dir, policy_dir) = copy_policy();
         let users = policy_dir.join("users.toml");
@@ -1388,13 +1497,13 @@ mod tests {
             provisioner: "grafhome-user-enrollment".to_owned(),
             cert_ttl: "12h".to_owned(),
             ssh_admin: false,
-            status: "active".to_owned(),
+            status: Status::Active,
         });
 
         // Exercise independent host roles and relationships that exist on only
         // one side of the enrollment/login boundary.
-        before.policy.hosts[2].ssh_client = false;
-        before.policy.hosts[3].ssh_server = false;
+        before.policy.hosts[2].ssh_roles.remove(&SshRole::Client);
+        before.policy.hosts[3].ssh_roles.remove(&SshRole::Server);
         before
             .policy
             .user_clients
@@ -1408,13 +1517,13 @@ mod tests {
                 host: "laptop-a".to_owned(),
                 user: "bob".to_owned(),
                 allow_effectively_infinite_cert: false,
-                status: "active".to_owned(),
+                status: Status::Active,
             },
             UserClient {
                 host: "ca-host".to_owned(),
                 user: "bob".to_owned(),
                 allow_effectively_infinite_cert: true,
-                status: "planned".to_owned(),
+                status: Status::Planned,
             },
         ]);
         before.policy.user_remotes.extend([
@@ -1423,21 +1532,21 @@ mod tests {
                 host: "edge-host".to_owned(),
                 unix_account: "bob".to_owned(),
                 allow_ssh: true,
-                status: "active".to_owned(),
+                status: Status::Active,
             },
             UserRemote {
                 user: "bob".to_owned(),
                 host: "edge-host".to_owned(),
                 unix_account: "builder".to_owned(),
                 allow_ssh: true,
-                status: "planned".to_owned(),
+                status: Status::Planned,
             },
             UserRemote {
                 user: "bob".to_owned(),
                 host: "proxy-host".to_owned(),
                 unix_account: "bob".to_owned(),
                 allow_ssh: true,
-                status: "disabled".to_owned(),
+                status: Status::Disabled,
             },
         ]);
 
@@ -1467,6 +1576,76 @@ mod tests {
     }
 
     #[test]
+    fn canonical_enrollment_false_is_rejected_as_redundant_deny() {
+        let policy = Policy::load(crate::example_config_root()).unwrap();
+        let dir = tempdir().unwrap();
+        super::write_canonical(&policy, dir.path().join("policy")).unwrap();
+        let host = dir.path().join("policy/hosts/edge-host.toml");
+        let text = fs::read_to_string(&host)
+            .unwrap()
+            .replace("enrollment = true", "enrollment = false");
+        fs::write(host, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("user_access.alice.enrollment"));
+        assert!(error.contains("must be true when present"));
+        assert!(error.contains("omit it to deny enrollment"));
+    }
+
+    #[test]
+    fn canonical_empty_enrollment_options_are_rejected() {
+        let policy = Policy::load(crate::example_config_root()).unwrap();
+        let dir = tempdir().unwrap();
+        super::write_canonical(&policy, dir.path().join("policy")).unwrap();
+        let host = dir.path().join("policy/hosts/edge-host.toml");
+        let text = fs::read_to_string(&host).unwrap().replace(
+            "[user_access.alice]\nenrollment = true",
+            "[user_access.alice.enrollment]",
+        );
+        fs::write(host, text).unwrap();
+
+        let error = Policy::load(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("user_access.alice.enrollment"));
+        assert!(error.contains("must contain an option"));
+        assert!(error.contains("use enrollment = true"));
+    }
+
+    #[test]
+    fn inactive_enrollment_history_does_not_require_the_client_role() {
+        let mut policy = Policy::load(crate::example_config_root()).unwrap();
+        policy
+            .hosts
+            .iter_mut()
+            .find(|host| host.host == "edge-host")
+            .unwrap()
+            .ssh_roles
+            .remove(&SshRole::Client);
+        policy
+            .user_clients
+            .iter_mut()
+            .find(|client| client.host == "edge-host" && client.user == "alice")
+            .unwrap()
+            .status = Status::Disabled;
+        let dir = tempdir().unwrap();
+
+        super::write_canonical(&policy, dir.path().join("policy")).unwrap();
+        let loaded = Policy::load(dir.path()).expect("inactive history remains representable");
+        assert!(
+            !loaded
+                .host("edge-host")
+                .unwrap()
+                .has_ssh_role(SshRole::Client)
+        );
+        let enrollment = loaded
+            .user_clients
+            .iter()
+            .find(|client| client.host == "edge-host" && client.user == "alice")
+            .expect("inactive enrollment history is preserved");
+        assert_eq!(enrollment.status, Status::Disabled);
+        assert!(!enrollment.allow_effectively_infinite_cert);
+    }
+
+    #[test]
     fn migration_normalizes_an_explicit_active_login_deny_to_disabled_history() {
         let legacy_root =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/legacy-site-config");
@@ -1485,7 +1664,7 @@ mod tests {
             canonical
                 .user_remotes
                 .iter()
-                .any(|login| login.host == "ca-host" && login.status == "disabled")
+                .any(|login| login.host == "ca-host" && login.status == Status::Disabled)
         );
     }
 
@@ -1499,7 +1678,7 @@ mod tests {
             .iter_mut()
             .find(|host| host.host == "edge-host")
             .unwrap();
-        edge.ssh_server = false;
+        edge.ssh_roles.remove(&SshRole::Server);
         let denied = policy
             .user_remotes
             .iter_mut()
@@ -1518,7 +1697,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(history.unix_account, "root");
-        assert_eq!(history.status, "disabled");
+        assert_eq!(history.status, Status::Disabled);
         assert!(
             !canonical
                 .active_ssh_access()
@@ -1657,12 +1836,12 @@ mod tests {
                     .iter()
                     .map(|entry| serde_json::to_string(entry).unwrap()),
             )
-            .chain(
-                policy
-                    .provisioners
-                    .iter()
-                    .map(|entry| serde_json::to_string(entry).unwrap()),
-            )
+            .chain(policy.provisioners.iter().map(|entry| {
+                let mut effective = entry.clone();
+                effective.renewal_default_ttl = Some(entry.renewal_default_ttl().to_owned());
+                effective.renewal_max_ttl = Some(policy.renewal_max_ttl(entry).to_owned());
+                serde_json::to_string(&effective).unwrap()
+            }))
             .chain(
                 policy
                     .user_clients

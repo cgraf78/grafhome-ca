@@ -427,6 +427,13 @@ entry points for legacy editor and validator integrations. See
 [`docs/configuration.md`](docs/configuration.md) for the document shape and an
 example.
 
+Canonical policy defaults lifecycle status to active, derives provisioner types
+from their roles, and defaults a user principal to its table key. Use
+`ssh_roles = ["server", "client"]` for explicit host capabilities and
+`enrollment = true` for ordinary user enrollment permission. Migration omits
+those inherited values while retaining explicit non-active states, exceptional
+enrollment options, host principals, login accounts, and renewal overrides.
+
 New binaries retain read compatibility with the legacy six-file layout for a
 binary-first rollout. Convert a validated legacy config into a new directory
 without modifying the source:

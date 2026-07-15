@@ -1321,7 +1321,7 @@ fn revoke_user_rejects_locally_writable_policy() {
 }
 
 #[test]
-fn check_rejects_legacy_sshpop_policy() {
+fn check_rejects_unknown_canonical_provisioner_role() {
     let dir = tempdir().unwrap();
     let config_root = dir.path().join("grafhome-ca");
     copy_dir(&example_config_root(), &config_root);
@@ -1329,8 +1329,7 @@ fn check_rejects_legacy_sshpop_policy() {
     let mut text = fs::read_to_string(&provisioners).unwrap();
     text.push_str(
         "\n[provisioners.host_renew]\nname = \"grafhome-host-renew\"\n\
-         type = \"SSHPOP\"\ndefault_ttl = \"168h\"\nmax_ttl = \"720h\"\n\
-         status = \"active\"\n",
+         default_ttl = \"168h\"\nmax_ttl = \"720h\"\n",
     );
     fs::write(provisioners, text).unwrap();
 
@@ -1341,7 +1340,8 @@ fn check_rejects_legacy_sshpop_policy() {
         .arg(config_root)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("host_renew"));
+        .stderr(predicate::str::contains("provisioners.host_renew"))
+        .stderr(predicate::str::contains("unknown provisioner role"));
 }
 
 #[test]
@@ -1367,6 +1367,26 @@ fn migrate_policy_creates_a_valid_host_centric_tree() {
     assert!(output.join("users.toml").is_file());
     assert!(output.join("hosts/ca-host.toml").is_file());
     assert!(!output.join("hosts.toml").exists());
+
+    let ca = fs::read_to_string(output.join("ca.toml")).unwrap();
+    let users = fs::read_to_string(output.join("users.toml")).unwrap();
+    let edge_host = fs::read_to_string(output.join("hosts/edge-host.toml")).unwrap();
+    assert!(!ca.contains("status = \"active\""));
+    assert!(!ca.contains("type ="));
+    assert!(!ca.contains("renewal_default_ttl"));
+    assert_eq!(ca.matches("renewal_max_ttl").count(), 1);
+    assert!(!users.contains("principal = \"alice\""));
+    assert!(!users.contains("status = \"active\""));
+    let edge_document = edge_host.parse::<toml::Value>().unwrap();
+    assert_eq!(
+        edge_document["ssh_roles"],
+        toml::Value::Array(vec![
+            toml::Value::String("server".to_owned()),
+            toml::Value::String("client".to_owned()),
+        ])
+    );
+    assert!(edge_host.contains("enrollment = true"));
+    assert!(!edge_host.contains("[user_access.alice.enrollment]"));
 }
 
 #[test]
@@ -2177,8 +2197,8 @@ fn renew_host_uses_trusted_path_step_when_configured_path_is_missing() {
     let path = configure_step_path_fallback(&dir, &fixture);
     let provisioners = fixture.config_root.join("policy/ca.toml");
     let text = fs::read_to_string(&provisioners).unwrap().replacen(
-        "renewal_default_ttl = \"168h\"",
-        "renewal_default_ttl = \"24h\"",
+        "default_ttl = \"168h\"",
+        "default_ttl = \"168h\"\nrenewal_default_ttl = \"24h\"",
         1,
     );
     fs::write(&provisioners, text).unwrap();

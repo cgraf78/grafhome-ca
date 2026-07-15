@@ -103,8 +103,8 @@ fn legacy_policy_specs() -> &'static [PolicySpec] {
         },
         PolicySpec {
             path: policy::USERS_POLICY_PATH,
-            schema: "schemas/policy/legacy/users.schema.json",
-            schema_text: include_str!("../schemas/policy/legacy/users.schema.json"),
+            schema: "schemas/policy/users.schema.json",
+            schema_text: include_str!("../schemas/policy/users.schema.json"),
         },
         PolicySpec {
             path: policy::LEGACY_PROVISIONERS_PATH,
@@ -133,8 +133,8 @@ fn validate_canonical_policy(config_root: &Path) -> Result<()> {
     validate_policy_file(config_root, ca.path, &ca)?;
     let users = PolicySpec {
         path: policy::USERS_POLICY_PATH,
-        schema: "schemas/policy/canonical/users.schema.json",
-        schema_text: include_str!("../schemas/policy/canonical/users.schema.json"),
+        schema: "schemas/policy/users.schema.json",
+        schema_text: include_str!("../schemas/policy/users.schema.json"),
     };
     validate_policy_file(config_root, users.path, &users)?;
     let host_schema = include_str!("../schemas/policy/host.schema.json");
@@ -180,8 +180,8 @@ mod tests {
         copy_dir(&example_config_root(), dir.path());
         let hosts = dir.path().join("policy/hosts/ca-host.toml");
         let text = fs::read_to_string(&hosts).unwrap().replacen(
-            "ssh_server = true",
-            "ssh_server = true\nlegacy_flag = true",
+            "ssh_roles = [\"server\", \"client\"]",
+            "ssh_roles = [\"server\", \"client\"]\nlegacy_flag = true",
             1,
         );
         fs::write(hosts, text).unwrap();
@@ -213,6 +213,43 @@ mod tests {
     }
 
     #[test]
+    fn schema_rejects_false_enrollment_instead_of_treating_it_as_a_deny() {
+        let dir = tempdir().unwrap();
+        copy_dir(&example_config_root(), dir.path());
+        let host = dir.path().join("policy/hosts/edge-host.toml");
+        let text = fs::read_to_string(&host)
+            .unwrap()
+            .replace("enrollment = true", "enrollment = false");
+        fs::write(host, text).unwrap();
+
+        let error = crate::schema::validate_config_root(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("policy/hosts/edge-host.toml"));
+        assert!(error.contains("false"), "{error}");
+    }
+
+    #[test]
+    fn legacy_schema_rejects_provisioner_type_that_conflicts_with_its_role() {
+        let dir = tempdir().unwrap();
+        let legacy = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/legacy-site-config");
+        copy_dir(&legacy, dir.path());
+        let provisioners = dir.path().join("policy/provisioners.toml");
+        let text = fs::read_to_string(&provisioners).unwrap().replacen(
+            "type = \"JWK\"",
+            "type = \"ACME\"",
+            1,
+        );
+        fs::write(provisioners, text).unwrap();
+
+        let error = crate::schema::validate_config_root(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("policy/provisioners.toml"));
+        assert!(error.contains("JWK"), "{error}");
+    }
+
+    #[test]
     fn published_legacy_schema_entry_points_remain_compatible() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schemas/policy");
         for name in [
@@ -238,8 +275,25 @@ mod tests {
         let users: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(root.join("users.schema.json")).unwrap())
                 .unwrap();
-        assert_eq!(users["oneOf"][0]["$ref"], "legacy/users.schema.json");
-        assert_eq!(users["oneOf"][1]["$ref"], "canonical/users.schema.json");
+        assert_eq!(users["oneOf"][0]["$ref"], "#/definitions/legacyDocument");
+        assert_eq!(users["oneOf"][1]["$ref"], "#/definitions/canonicalDocument");
+
+        let legacy: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("legacy/users.schema.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy["$ref"],
+            "../users.schema.json#/definitions/legacyDocument"
+        );
+        let canonical: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("canonical/users.schema.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            canonical["$ref"],
+            "../users.schema.json#/definitions/canonicalDocument"
+        );
     }
 
     fn copy_dir(source: &std::path::Path, destination: &std::path::Path) {

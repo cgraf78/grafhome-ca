@@ -1,12 +1,14 @@
 //! Compatibility reader for the normalized six-file policy layout.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::Deserialize;
 
 use super::{
-    LEGACY_ENDPOINTS_PATH, LEGACY_HOSTS_PATH, LEGACY_PROVISIONERS_PATH, LEGACY_USER_CLIENTS_PATH,
-    LEGACY_USER_REMOTES_PATH, Policy, USERS_POLICY_PATH, User, read_toml, read_typed_document,
+    Host, LEGACY_ENDPOINTS_PATH, LEGACY_HOSTS_PATH, LEGACY_PROVISIONERS_PATH,
+    LEGACY_USER_CLIENTS_PATH, LEGACY_USER_REMOTES_PATH, Policy, SshRole, USERS_POLICY_PATH, User,
+    read_toml, read_typed_document,
 };
 use crate::error::{Error, Result};
 
@@ -18,10 +20,32 @@ struct UsersDocument {
     users: Vec<User>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyHost {
+    host: String,
+    ssh_server: bool,
+    ssh_client: bool,
+    principals: Vec<String>,
+}
+
 /// Normalize legacy documents into the shared policy model.
 pub(super) fn load(root: &Path) -> Result<Policy> {
     let endpoints = read_array(root.join(LEGACY_ENDPOINTS_PATH), "endpoints")?;
-    let hosts = read_array(root.join(LEGACY_HOSTS_PATH), "hosts")?;
+    let hosts = read_array::<LegacyHost>(root.join(LEGACY_HOSTS_PATH), "hosts")?
+        .into_iter()
+        .map(|host| Host {
+            host: host.host,
+            ssh_roles: [
+                host.ssh_server.then_some(SshRole::Server),
+                host.ssh_client.then_some(SshRole::Client),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>(),
+            principals: host.principals,
+        })
+        .collect();
     let users: UsersDocument = read_document(root.join(USERS_POLICY_PATH))?;
     let provisioners = read_array(root.join(LEGACY_PROVISIONERS_PATH), "provisioners")?;
     let user_clients = read_array(root.join(LEGACY_USER_CLIENTS_PATH), "user_clients")?;

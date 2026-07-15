@@ -51,6 +51,32 @@
                 "role": { "const": "user_enrollment" }
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "role": { "enum": ["host_bootstrap", "user_enrollment"] }
+              },
+              "required": ["role"]
+            },
+            "then": {
+              "properties": {
+                "type": { "const": "JWK" }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "role": { "const": "proxy_x509" }
+              },
+              "required": ["role"]
+            },
+            "then": {
+              "properties": {
+                "type": { "const": "ACME" }
+              }
+            }
           }
         ]
       }

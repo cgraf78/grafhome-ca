@@ -102,31 +102,33 @@ database-style relations:
 
 The host filename is its stable policy name. Endpoint and provisioner table
 keys are their roles, and user table keys are their policy identities, so those
-values are not repeated as fields. HTTPS is the only supported endpoint scheme
-and is derived rather than configured. TOML comments are supported, booleans
+values are not repeated as fields. HTTPS is the only supported endpoint scheme,
+and provisioner types are derived from their roles rather than configured. User
+principals default to their table keys. TOML comments are supported, booleans
 are written as `true` or `false`, endpoint ports are integers, and host
-principals are arrays:
+principals and SSH roles are arrays:
 
 ```toml
 # policy/hosts/server-a.toml
-ssh_server = true
-ssh_client = true
+ssh_roles = ["server", "client"]
 principals = ["server-a", "server-a.example.test"]
 
-[user_access.alice.enrollment]
-status = "active"
+[user_access.alice]
+enrollment = true
 
 [[user_access.alice.logins]]
 unix_account = "alice"
-status = "active"
 ```
 
 Each host's `user_access` tables colocate two independent capabilities without
 combining their meanings. `enrollment` authorizes that user to enroll and renew
 on the source host. Each `logins` row authorizes that certificate user to log
-into one Unix account on the destination host. Separately, `ssh_client = true`
-installs outbound host-CA trust. Relationship absence means deny; `planned` and
-`disabled` rows may be retained when lifecycle history matters.
+into one Unix account on the destination host. Separately, the `client` SSH role
+installs outbound host-CA trust. Relationship absence means deny. Lifecycle
+status defaults to `active`; write `planned` or `disabled` only when retaining a
+future or historical row. A default enrollment uses `enrollment = true`; its
+nested table is needed only for non-default options such as
+`allow_effectively_infinite_cert` or a non-active status.
 
 Operational inventories such as schedulers, static keys, emergency access, and
 CA operators are intentionally outside Grafhome CA policy. The CLI does not
@@ -155,14 +157,15 @@ grafhome-ca migrate policy \
 
 The output directory must not exist. The command writes into a sibling staging
 directory, parses and semantically validates every generated document, and
-renames the complete directory into place only after validation succeeds. An
-active legacy login with `allow_ssh = false` becomes a `disabled` historical
-login because canonical authorization is expressed by relationship presence
-and lifecycle state. Review the generated diff and replace the private policy
-directory atomically. The structural conversion does not preserve legacy TOML
-comments; carry forward any rationale that remains useful during review. Do
-not maintain two writable formats or mix canonical and legacy documents under
-one config root.
+renames the complete directory into place only after validation succeeds. The
+writer omits active lifecycle values, keyed identities, derived provisioner
+types, and inherited renewal values. An active legacy login with
+`allow_ssh = false` becomes a `disabled` historical login because canonical
+authorization is expressed by relationship presence and lifecycle state.
+Review the generated diff and replace the private policy directory atomically.
+The structural conversion does not preserve legacy TOML comments; carry forward
+any rationale that remains useful during review. Do not maintain two writable
+formats or mix canonical and legacy documents under one config root.
 
 Host-manifest login rows are the sole source of SSH login authorization. Each
 active row maps one active policy user's principal to one Unix account on that
@@ -171,7 +174,7 @@ authorized-principals files even if historical login rows remain active.
 
 `users.toml` may set `require_ssh_admin_access = true` as a durable site safety
 switch and designate one or more active users with `ssh_admin = true`. Once
-enabled, every host with `ssh_server = true` must retain an active
+enabled, every host with the `server` SSH role must retain an active
 host-manifest login mapping for at least one active SSH administrator.
 The separate switch ensures that accidentally deleting every designation is an
 error rather than silently disabling the invariant. Policies that omit both
@@ -179,9 +182,10 @@ fields retain their existing behavior. The designation does not grant Unix or
 sudo privileges; it identifies certificate users whose existing login mappings
 serve as the site's administrative recovery path.
 
-`users.<user>.principal` and each host manifest's `principals` directly own the
-user and host certificate namespaces. `grafhome-ca check` rejects duplicate
-principals, including collisions between user and host certificates.
+`users.<user>.principal`, when it differs from the user table key, and each host
+manifest's explicit `principals` own the user and host certificate namespaces.
+`grafhome-ca check` rejects duplicate principals, including collisions between
+user and host certificates.
 
 `ca_origin`
 : The private CA service endpoint hosted on the CA origin host.
@@ -258,8 +262,10 @@ provisioner token or template is misconfigured.
   Smallstep requires a positive finite maximum, so Grafhome renders this as
   `2562047h`, the largest whole-hour Go duration (roughly 292 years). The
   configured user `cert_ttl` remains the default lifetime for normal issuance.
-  Device-bound renewal provisioners use the finite `renewal_*` values instead
-  of inheriting an unlimited enrollment maximum. Older policy files remain
+  Device-bound renewal provisioners use finite renewal values instead of
+  inheriting an unlimited enrollment maximum. Omit a renewal default when it
+  matches `default_ttl`, and omit a renewal maximum when the active user policy
+  already implies it. Older policy files remain
   readable: an omitted renewal default uses `default_ttl`; when the old
   enrollment maximum is unlimited, the omitted renewal maximum becomes the
   largest finite active-user `cert_ttl` or renewal default. This preserves

@@ -4,10 +4,13 @@
   "title": "Grafhome host policy",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ssh_server", "ssh_client", "principals"],
+  "required": ["ssh_roles", "principals"],
   "properties": {
-    "ssh_server": { "type": "boolean" },
-    "ssh_client": { "type": "boolean" },
+    "ssh_roles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["server", "client"] }
+    },
     "principals": {
       "type": "array",
       "minItems": 1,
@@ -26,13 +29,18 @@
         "minProperties": 1,
         "properties": {
           "enrollment": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["status"],
-            "properties": {
-              "allow_effectively_infinite_cert": { "type": "boolean" },
-              "status": { "$ref": "#/definitions/status" }
-            }
+            "oneOf": [
+              { "const": true },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "allow_effectively_infinite_cert": { "const": true },
+                  "status": { "$ref": "#/definitions/status" }
+                }
+              }
+            ]
           },
           "logins": {
             "type": "array",
@@ -40,7 +48,7 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["unix_account", "status"],
+              "required": ["unix_account"],
               "properties": {
                 "unix_account": { "$ref": "#/definitions/account" },
                 "status": { "$ref": "#/definitions/status" }

@@ -111,7 +111,7 @@ fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provis
         .policy
         .provisioners
         .iter()
-        .find(|provisioner| provisioner.role == role && provisioner.status == "active")
+        .find(|provisioner| provisioner.role == role && provisioner.status.is_active())
         .ok_or_else(|| Error::Validation {
             field: ca_policy_field("provisioners", role, "role"),
             message: "missing active provisioner".to_owned(),
@@ -790,7 +790,7 @@ fn active_jwk_provisioners(model: &SiteModel) -> Vec<&Provisioner> {
         .policy
         .provisioners
         .iter()
-        .filter(|entry| entry.status == "active" && entry.r#type == "JWK")
+        .filter(|entry| entry.status.is_active() && entry.r#type == "JWK")
         .collect()
 }
 

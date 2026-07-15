@@ -73,10 +73,9 @@
     "provisioner": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type", "default_ttl", "max_ttl", "status"],
+      "required": ["name", "default_ttl", "max_ttl"],
       "properties": {
         "name": { "$ref": "#/definitions/name" },
-        "type": { "enum": ["JWK", "ACME"] },
         "default_ttl": { "$ref": "#/definitions/ttl" },
         "max_ttl": {},
         "renewal_default_ttl": { "$ref": "#/definitions/ttl" },

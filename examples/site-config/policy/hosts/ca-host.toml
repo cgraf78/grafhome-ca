@@ -1,11 +1,8 @@
-ssh_server = true
-ssh_client = true
+ssh_roles = ["server", "client"]
 principals = ["ca-host", "ca-origin.example.test"]
 
 [user_access.alice.enrollment]
 allow_effectively_infinite_cert = true
-status = "active"
 
 [[user_access.alice.logins]]
 unix_account = "alice"
-status = "active"
