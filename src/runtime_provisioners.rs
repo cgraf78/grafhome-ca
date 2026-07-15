@@ -18,7 +18,10 @@ use serde_json::{Map, Value, json};
 use crate::enrollment::{parse_host_provisioner_name, parse_user_provisioner_name};
 use crate::error::{Error, Result};
 use crate::model::SiteModel;
-use crate::policy::{Provisioner, step_max_ttl};
+use crate::policy::{
+    PROVISIONER_ROLE_HOST_BOOTSTRAP, PROVISIONER_ROLE_PROXY_X509, PROVISIONER_ROLE_USER_ENROLLMENT,
+    Provisioner, ca_policy_field, step_max_ttl,
+};
 
 const USER_CLIENT_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome user renewal provisioner" }}"#;
@@ -61,9 +64,9 @@ pub fn reconcile_claims(
 ) -> Result<ClaimsReconciliation> {
     let ca_json = ca_json.as_ref();
     let mut config = read_json(ca_json)?;
-    let user = active_provisioner(model, "user_enrollment")?;
-    let host = active_provisioner(model, "host_bootstrap")?;
-    let proxy = active_provisioner(model, "proxy_x509")?;
+    let user = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
+    let host = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
+    let proxy = active_provisioner(model, PROVISIONER_ROLE_PROXY_X509)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
     let mut updated = Vec::new();
 
@@ -110,7 +113,7 @@ fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provis
         .iter()
         .find(|provisioner| provisioner.role == role && provisioner.status == "active")
         .ok_or_else(|| Error::Validation {
-            field: format!("policy/provisioners.toml:{role}"),
+            field: ca_policy_field("provisioners", role, "role"),
             message: "missing active provisioner".to_owned(),
         })
 }
@@ -268,11 +271,11 @@ fn reconcile_required_provisioner(
 
 fn enrollment_options(provisioner: &Provisioner) -> Option<Value> {
     let (x509, ssh) = match provisioner.role.as_str() {
-        "user_enrollment" => (
+        PROVISIONER_ROLE_USER_ENROLLMENT => (
             USER_ENROLLMENT_X509_DENY_TEMPLATE,
             USER_ENROLLMENT_SSH_TEMPLATE,
         ),
-        "host_bootstrap" => (
+        PROVISIONER_ROLE_HOST_BOOTSTRAP => (
             HOST_BOOTSTRAP_X509_DENY_TEMPLATE,
             HOST_BOOTSTRAP_SSH_TEMPLATE,
         ),
@@ -401,7 +404,10 @@ pub fn materialize(
     let jwk_dir = jwk_dir.as_ref();
     let live = read_json(live_ca_json)?;
     let live_jwks = live_jwk_provisioners(&live, live_ca_json)?;
-    for role in ["host_bootstrap", "user_enrollment"] {
+    for role in [
+        PROVISIONER_ROLE_HOST_BOOTSTRAP,
+        PROVISIONER_ROLE_USER_ENROLLMENT,
+    ] {
         let provisioner = active_provisioner(model, role)?;
         let canonical_path = jwk_dir.join(format!("{}.pub.json", provisioner.name));
         let canonical;
@@ -485,8 +491,8 @@ fn merge_materialized(
         .filter_map(|item| item.get("name").and_then(Value::as_str))
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    let user_policy = active_provisioner(model, "user_enrollment")?;
-    let host_policy = active_provisioner(model, "host_bootstrap")?;
+    let user_policy = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
+    let host_policy = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
     for (name, mut item) in live_jwks {
         let desired = if parse_user_provisioner_name(&name).is_some() {
             user_renewal_claims(model, user_policy)
@@ -555,7 +561,7 @@ pub fn reconcile_user_client(
     let mut config = read_json(ca_json)?;
     let key = read_public_jwk(public_key)?;
     let template = read_text(Path::new(template_file))?;
-    let policy = active_provisioner(model, "user_enrollment")?;
+    let policy = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
 
     reconcile_required_provisioner(provisioners, policy, user_claims(policy), ca_json)?;
@@ -606,7 +612,7 @@ pub fn reconcile_host(
     let mut config = read_json(ca_json)?;
     let key = read_public_jwk(public_key)?;
     let template = read_text(Path::new(template_file))?;
-    let policy = active_provisioner(model, "host_bootstrap")?;
+    let policy = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
     // A retained SSHPOP provisioner would bypass device-bound revocation.
     provisioners.retain(|item| item.get("type").and_then(Value::as_str) != Some("SSHPOP"));

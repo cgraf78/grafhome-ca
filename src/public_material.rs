@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::executable::root_step_bin;
 use crate::model::SiteModel;
-use crate::policy::Host;
+use crate::policy::{ENDPOINT_ROLE_CA_API, Host, ca_policy_field};
 use crate::render::RenderedFile;
 
 const ROOT_CERT: &str = "root_ca.crt";
@@ -57,9 +57,9 @@ pub struct PublicMaterialFiles {
 pub fn collect(model: &SiteModel) -> Result<Vec<RenderedFile>> {
     let ca_url = model
         .policy
-        .endpoint("ca_api")
+        .endpoint(ENDPOINT_ROLE_CA_API)
         .ok_or_else(|| Error::Validation {
-            field: "policy/endpoints.toml:ca_api".to_owned(),
+            field: ca_policy_field("endpoints", ENDPOINT_ROLE_CA_API, "role"),
             message: "missing required endpoint".to_owned(),
         })?
         .url();
@@ -188,7 +188,7 @@ fn host_principals(hosts: &[Host]) -> Vec<String> {
 fn known_hosts_line(principals: &[String], host_ca_key: &str) -> Result<String> {
     if principals.is_empty() {
         return Err(Error::Validation {
-            field: "policy/hosts.toml:principals".to_owned(),
+            field: "policy/hosts:principals".to_owned(),
             message: "at least one SSH server host principal is required".to_owned(),
         });
     }

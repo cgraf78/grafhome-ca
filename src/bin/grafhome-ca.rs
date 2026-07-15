@@ -23,8 +23,10 @@ use grafhome_ca::enrollment::{
 use grafhome_ca::executable::{root_step_bin, user_step_bin};
 use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{
-    Endpoint, Host, Provisioner, STEP_EFFECTIVE_UNLIMITED_TTL, UNLIMITED_TTL, User, UserClient,
-    duration_at_most, valid_step_duration_expression,
+    ENDPOINT_ROLE_CA_API, ENDPOINT_ROLE_CA_ORIGIN, Endpoint, Host, PROVISIONER_ROLE_HOST_BOOTSTRAP,
+    PROVISIONER_ROLE_USER_ENROLLMENT, Provisioner, STEP_EFFECTIVE_UNLIMITED_TTL, UNLIMITED_TTL,
+    User, UserClient, ca_policy_field, duration_at_most, host_policy_field, user_policy_field,
+    valid_step_duration_expression,
 };
 
 const USER_KEY_NAME: &str = "id_ed25519";
@@ -167,6 +169,15 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum MigrateCommand {
+    /// Convert legacy six-file policy into the canonical host-centric layout.
+    Policy {
+        /// Legacy site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// New policy directory to create atomically.
+        #[arg(long, value_name = "DIR")]
+        out_dir: PathBuf,
+    },
     /// Prepare enrollment signing JWK files with separate passwords for materialization.
     EnrollmentProvisionerKeys {
         /// Site config root containing config/ and policy/.
@@ -384,12 +395,12 @@ fn run() -> grafhome_ca::Result<()> {
                 "ok: config and policy valid; ca_api={} ca_origin={}",
                 model
                     .policy
-                    .endpoint("ca_api")
+                    .endpoint(ENDPOINT_ROLE_CA_API)
                     .expect("validated endpoint")
                     .url(),
                 model
                     .policy
-                    .endpoint("ca_origin")
+                    .endpoint(ENDPOINT_ROLE_CA_ORIGIN)
                     .expect("validated endpoint")
                     .url()
             );
@@ -480,6 +491,26 @@ fn run() -> grafhome_ca::Result<()> {
         } => {
             let model = load_root_model(config_root, "migrate enrollment provisioner keys", false)?;
             with_ca_lock(&model, || migrate_enrollment_provisioner_keys(&model))
+        }
+        Command::Migrate {
+            command:
+                MigrateCommand::Policy {
+                    config_root,
+                    out_dir,
+                },
+        } => {
+            let config_root = resolve_config_root(config_root)?;
+            if grafhome_ca::policy::format(&config_root)? != grafhome_ca::policy::Format::Legacy {
+                return Err(grafhome_ca::Error::Validation {
+                    field: "migrate policy".to_owned(),
+                    message: "source already uses the canonical policy format".to_owned(),
+                });
+            }
+            let model = load_valid_model_from_root(&config_root)?;
+            grafhome_ca::policy::write_canonical(&model.policy, &out_dir)?;
+            outln!("migrated canonical policy to {}", out_dir.display());
+            outln!("note: legacy TOML comments are not preserved; review the generated policy");
+            Ok(())
         }
         Command::Apply {
             command:
@@ -1278,15 +1309,16 @@ fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Resul
         .policy
         .endpoint(role)
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/endpoints.toml:{role}"),
+            field: ca_policy_field("endpoints", role, "role"),
             message: "missing required endpoint".to_owned(),
         })
 }
 
 fn ca_api_reachable(model: &SiteModel) -> grafhome_ca::Result<bool> {
-    endpoint_reachable_with(required_endpoint(model, "ca_api")?, |address, timeout| {
-        TcpStream::connect_timeout(address, timeout).map(drop)
-    })
+    endpoint_reachable_with(
+        required_endpoint(model, ENDPOINT_ROLE_CA_API)?,
+        |address, timeout| TcpStream::connect_timeout(address, timeout).map(drop),
+    )
 }
 
 fn endpoint_reachable_with(
@@ -1298,7 +1330,7 @@ fn endpoint_reachable_with(
             .address
             .parse::<IpAddr>()
             .map_err(|error| grafhome_ca::Error::Validation {
-                field: format!("policy/endpoints.toml:{}.address", endpoint.role),
+                field: ca_policy_field("endpoints", &endpoint.role, "address"),
                 message: format!("invalid IP address {}: {error}", endpoint.address),
             })?;
     let address = SocketAddr::new(address, endpoint.port);
@@ -1327,7 +1359,7 @@ fn required_host<'a>(model: &'a SiteModel, host: &str) -> grafhome_ca::Result<&'
         .policy
         .host(host)
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/hosts.toml:{host}"),
+            field: host_policy_field(host, "host"),
             message: "unknown host".to_owned(),
         })
 }
@@ -1337,12 +1369,12 @@ fn active_user<'a>(model: &'a SiteModel, user: &str) -> grafhome_ca::Result<&'a 
         .policy
         .user(user)
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/users.toml:{user}"),
+            field: user_policy_field(user, "user"),
             message: "unknown user".to_owned(),
         })?;
     if user.status != "active" {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/users.toml:{}.status", user.user),
+            field: user_policy_field(&user.user, "status"),
             message: "user must be active".to_owned(),
         });
     }
@@ -1359,7 +1391,7 @@ fn required_provisioner<'a>(
         .iter()
         .find(|entry| entry.role == role && entry.status == "active")
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/provisioners.toml:{role}"),
+            field: ca_policy_field("provisioners", role, "role"),
             message: "missing active provisioner role".to_owned(),
         })
 }
@@ -1375,7 +1407,7 @@ fn required_user_client<'a>(
         .iter()
         .find(|client| client.user == user && client.host == host && client.status == "active")
         .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: format!("policy/user-clients.toml:{user}:{host}"),
+            field: host_policy_field(host, &format!("user_access.{user}.enrollment")),
             message: "missing active user client for user and host".to_owned(),
         })
 }
@@ -1387,13 +1419,13 @@ fn select_single_user_client<'a>(
     let mut clients = model.policy.active_user_clients(user);
     let Some(client) = clients.next() else {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/user-clients.toml:{user}"),
+            field: format!("policy/hosts:user_access.{user}.enrollment"),
             message: "user has no active client hosts".to_owned(),
         });
     };
     if clients.next().is_some() {
         return Err(grafhome_ca::Error::Validation {
-            field: format!("policy/user-clients.toml:{user}"),
+            field: format!("policy/hosts:user_access.{user}.enrollment"),
             message: "user has multiple active client hosts; pass --host".to_owned(),
         });
     }
@@ -1639,7 +1671,10 @@ fn migrate_enrollment_provisioner_keys(model: &SiteModel) -> grafhome_ca::Result
     let old_password = Path::new(&model.deployment.values["GRAFHOME_CA_PASSWORD_FILE"]);
     let step_bin = root_step_bin(model)?;
 
-    for role in ["host_bootstrap", "user_enrollment"] {
+    for role in [
+        PROVISIONER_ROLE_HOST_BOOTSTRAP,
+        PROVISIONER_ROLE_USER_ENROLLMENT,
+    ] {
         let policy = required_provisioner(model, role)?;
         let public_path = enrollment_provisioner_public_key(model, &policy.name);
         let private_path = enrollment_provisioner_private_key(model, &policy.name);
@@ -2360,7 +2395,7 @@ fn approve_user_enrollment(
     let fingerprint = ca_fingerprint(model)?;
     let mut grant = UserGrant::new(
         request,
-        required_endpoint(model, "ca_api")?.url(),
+        required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
         fingerprint,
         String::from_utf8_lossy(&token).trim(),
     );
@@ -2384,21 +2419,21 @@ fn user_approval_cert_ttl(
 ) -> grafhome_ca::Result<String> {
     let user = active_user(model, &request.user)?;
     let client = required_user_client(model, &request.user, &request.host)?;
-    let provisioner = required_provisioner(model, "user_enrollment")?;
+    let provisioner = required_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
 
     if effectively_infinite {
         if !client.allow_effectively_infinite_cert {
             return Err(grafhome_ca::Error::Validation {
                 field: format!(
-                    "policy/user-clients.toml:{}:{}.allow_effectively_infinite_cert",
-                    request.user, request.host
+                    "policy/hosts/{}.toml:user_access.{}.enrollment.allow_effectively_infinite_cert",
+                    request.host, request.user
                 ),
                 message: "effectively-infinite certificate approval is not allowed".to_owned(),
             });
         }
         if provisioner.max_ttl != UNLIMITED_TTL {
             return Err(grafhome_ca::Error::Validation {
-                field: format!("policy/provisioners.toml:{}.max_ttl", provisioner.role),
+                field: ca_policy_field("provisioners", &provisioner.role, "max_ttl"),
                 message: "effectively-infinite approval requires max_ttl = \"unlimited\""
                     .to_owned(),
             });
@@ -2588,7 +2623,7 @@ fn approve_host_enrollment(
     })?;
     let grant = HostGrant::new(
         request,
-        required_endpoint(model, "ca_api")?.url(),
+        required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
         ca_fingerprint(model)?,
         String::from_utf8_lossy(&token).trim(),
     );
@@ -2620,7 +2655,7 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
 }
 
 fn validate_grant_ca_url(model: &SiteModel, ca_url: &str, field: &str) -> grafhome_ca::Result<()> {
-    let expected = required_endpoint(model, "ca_api")?.url();
+    let expected = required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url();
     if ca_url == expected {
         Ok(())
     } else {
@@ -2735,7 +2770,7 @@ fn desired_host_ssh_files(
 
 fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> {
     let local_host = resolve_host(None)?;
-    let ca_origin = required_endpoint(model, "ca_origin")?;
+    let ca_origin = required_endpoint(model, ENDPOINT_ROLE_CA_ORIGIN)?;
     if local_host != ca_origin.target {
         return Err(grafhome_ca::Error::Validation {
             field: "apply ca".to_owned(),
@@ -2762,7 +2797,7 @@ fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> 
             model,
             &ca_json,
             result.config.as_bytes(),
-            required_endpoint(model, "ca_api")?.url(),
+            required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
             || Ok(()),
         )?;
         print_ca_policy_changes(&result.updated, false)?;
@@ -2789,7 +2824,7 @@ fn apply_host_policy(
     dry_run: bool,
     quiet: bool,
 ) -> grafhome_ca::Result<()> {
-    let ca_url = required_endpoint(model, "ca_api")?.url();
+    let ca_url = required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url();
     let desired = desired_host_ssh_files(model, host_name, &ca_url)?;
     if dry_run {
         let changes = host_policy_changes(model, &desired)?;
@@ -3100,8 +3135,8 @@ fn create_host_token(
     cert_ttl: Option<&str>,
 ) -> grafhome_ca::Result<Vec<u8>> {
     let host = required_host(model, host)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
-    let provisioner = required_provisioner(model, "host_bootstrap")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
+    let provisioner = required_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
     let token_ttl = checked_ttl(
         "create-host-token.ttl",
         token_ttl.unwrap_or(DEFAULT_ENROLLMENT_TOKEN_TTL),
@@ -3144,7 +3179,7 @@ fn create_host_token(
 
 fn enroll_host(model: &SiteModel, host: &str, token: &str) -> grafhome_ca::Result<()> {
     let host = required_host(model, host)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let step_bin = root_step_bin(model)?;
     run_status_redacted(
         process(&step_bin)
@@ -3179,8 +3214,8 @@ fn enroll_host(model: &SiteModel, host: &str, token: &str) -> grafhome_ca::Resul
 
 fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::Result<()> {
     let host = required_host(model, host_name)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
-    let host_policy = required_provisioner(model, "host_bootstrap")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
+    let host_policy = required_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
     let material_dir = host_material_dir(model, &host.host);
     let private_jwk = material_dir.join("provisioner.priv.json");
     let password_file = material_dir.join("renewal-password");
@@ -3269,7 +3304,7 @@ fn create_user_token(
 ) -> grafhome_ca::Result<Vec<u8>> {
     let user = active_user(model, user)?;
     required_user_client(model, &user.user, host)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let token_ttl = checked_ttl(
         "create-user-token.ttl",
         token_ttl.unwrap_or(DEFAULT_ENROLLMENT_TOKEN_TTL),
@@ -3316,7 +3351,7 @@ fn issue_user_certificate(
     let step_bin = user_step_bin()?;
     let user = active_user(model, user_name)?;
     required_user_client(model, &user.user, host)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let public_key = user_public_key_path()?;
     let cert = user_cert_path()?;
     run_status_redacted(
@@ -3362,7 +3397,7 @@ fn authorize_user_locked<T>(
 ) -> grafhome_ca::Result<T> {
     let user = active_user(model, user_name)?;
     let client = required_user_client(model, &user.user, host)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let provisioner = user_provisioner_name(&user.user, &client.host);
     let template_dir = PathBuf::from(model.deployment.ca_steppath()).join("templates/ssh");
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
@@ -3417,7 +3452,7 @@ fn authorize_host_locked<T>(
     after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
 ) -> grafhome_ca::Result<T> {
     let host = required_host(model, host_name)?;
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let provisioner = host_provisioner_name(&host.host);
     let template_dir = PathBuf::from(model.deployment.ca_steppath()).join("templates/ssh");
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
@@ -3662,7 +3697,7 @@ fn remote_provisioner_names(
     user: Option<&str>,
     quiet: bool,
 ) -> grafhome_ca::Result<Option<Vec<String>>> {
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let Some((root, user_owned)) = status_root_cert_path(model, user)? else {
         if quiet {
             return Ok(None);
@@ -3841,7 +3876,7 @@ fn finish_revocation(
             model,
             ca_json,
             text.as_bytes(),
-            required_endpoint(model, "ca_api")?.url(),
+            required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
             || Ok(()),
         )?;
         outln!("Revoked {identity}: future issuance and renewal are disabled.");
@@ -4021,7 +4056,7 @@ fn renew_user_certificate(
     quiet: bool,
 ) -> grafhome_ca::Result<()> {
     let step_bin = user_step_bin()?;
-    let ca_api = required_endpoint(model, "ca_api")?;
+    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let provisioner = user_provisioner_name(&user.user, &client.host);
     let material_dir = user_client_material_dir(&user.user, &client.host)?;
     let private_jwk = material_dir.join("provisioner.priv.json");
@@ -4830,7 +4865,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("policy/endpoints.toml:ca_api.address"));
+        assert!(error.contains("policy/ca.toml:endpoints.ca_api.address"));
         assert!(error.contains("invalid IP address"));
     }
 

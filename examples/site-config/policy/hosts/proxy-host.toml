@@ -1,0 +1,10 @@
+ssh_server = true
+ssh_client = true
+principals = ["proxy-host", "ca.example.test"]
+
+[user_access.alice.enrollment]
+status = "active"
+
+[[user_access.alice.logins]]
+unix_account = "alice"
+status = "active"

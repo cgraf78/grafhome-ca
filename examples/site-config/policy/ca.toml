@@ -1,0 +1,36 @@
+[endpoints.ca_api]
+dns_name = "ca.example.test"
+target = "proxy-host"
+address = "198.51.100.21"
+port = 443
+
+[endpoints.ca_origin]
+dns_name = "ca-origin.example.test"
+target = "ca-host"
+address = "198.51.100.20"
+port = 8443
+
+[provisioners.host_bootstrap]
+name = "grafhome-host-bootstrap"
+type = "JWK"
+default_ttl = "168h"
+max_ttl = "720h"
+renewal_default_ttl = "168h"
+renewal_max_ttl = "720h"
+status = "active"
+
+[provisioners.user_enrollment]
+name = "grafhome-user-enrollment"
+type = "JWK"
+default_ttl = "24h"
+max_ttl = "unlimited"
+renewal_default_ttl = "24h"
+renewal_max_ttl = "48h"
+status = "active"
+
+[provisioners.proxy_x509]
+name = "grafhome-x509-ca-proxy"
+type = "ACME"
+default_ttl = "720h"
+max_ttl = "720h"
+status = "active"

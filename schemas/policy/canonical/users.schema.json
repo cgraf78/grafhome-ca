@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/canonical/users.schema.json",
+  "title": "Grafhome canonical user policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["users"],
+  "properties": {
+    "require_ssh_admin_access": { "type": "boolean" },
+    "users": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/definitions/account" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["principal", "cert_ttl", "status"],
+        "properties": {
+          "principal": { "$ref": "#/definitions/principal" },
+          "cert_ttl": { "$ref": "#/definitions/ttl" },
+          "ssh_admin": { "type": "boolean" },
+          "status": { "$ref": "#/definitions/status" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "account": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
+    },
+    "principal": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._@-]+$"
+    },
+    "ttl": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*[smh]$"
+    },
+    "status": {
+      "enum": ["active", "planned", "disabled"]
+    }
+  }
+}

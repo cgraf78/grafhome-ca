@@ -16,6 +16,10 @@ fn example_config_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config")
 }
 
+fn legacy_config_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/legacy-site-config")
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
@@ -435,7 +439,7 @@ esac
 
 #[cfg(unix)]
 fn configure_unreachable_ca(fixture: &ExecFixture) {
-    let path = fixture.config_root.join("policy/endpoints.toml");
+    let path = fixture.config_root.join("policy/ca.toml");
     let text = fs::read_to_string(&path).unwrap();
     let text = text
         .replacen("address = \"198.51.100.21\"", "address = \"127.0.0.1\"", 1)
@@ -712,11 +716,9 @@ fn help_exposes_only_supported_commands() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("enrollment-provisioner-keys")
-    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("policy"));
+    assert!(text.contains("enrollment-provisioner-keys"));
 }
 
 #[test]
@@ -1220,7 +1222,7 @@ fn apply_host_rejects_non_file_in_managed_principals_directory() {
 #[test]
 fn apply_host_rejects_locally_writable_policy() {
     let (dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-remotes.toml");
+    let policy = fixture.config_root.join("policy/hosts/ca-host.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     apply_host_command(&fixture, &dir.path().join("install"))
@@ -1228,7 +1230,7 @@ fn apply_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-remotes.toml"))
+        .stderr(predicate::str::contains("ca-host.toml"))
         .stderr(predicate::str::contains("permits group or world writes"));
 
     assert!(!fixture.log.exists());
@@ -1238,7 +1240,7 @@ fn apply_host_rejects_locally_writable_policy() {
 #[test]
 fn approve_host_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-remotes.toml");
+    let policy = fixture.config_root.join("policy/hosts/ca-host.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -1250,7 +1252,7 @@ fn approve_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-remotes.toml"));
+        .stderr(predicate::str::contains("ca-host.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -1259,7 +1261,7 @@ fn approve_host_rejects_locally_writable_policy() {
 #[test]
 fn approve_user_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-remotes.toml");
+    let policy = fixture.config_root.join("policy/hosts/ca-host.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -1271,7 +1273,7 @@ fn approve_user_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-remotes.toml"));
+        .stderr(predicate::str::contains("ca-host.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -1280,7 +1282,7 @@ fn approve_user_rejects_locally_writable_policy() {
 #[test]
 fn revoke_host_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-remotes.toml");
+    let policy = fixture.config_root.join("policy/hosts/ca-host.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -1292,7 +1294,7 @@ fn revoke_host_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-remotes.toml"));
+        .stderr(predicate::str::contains("ca-host.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -1301,7 +1303,7 @@ fn revoke_host_rejects_locally_writable_policy() {
 #[test]
 fn revoke_user_rejects_locally_writable_policy() {
     let (_dir, fixture) = exec_fixture();
-    let policy = fixture.config_root.join("policy/user-remotes.toml");
+    let policy = fixture.config_root.join("policy/hosts/ca-host.toml");
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o666)).unwrap();
 
     Command::cargo_bin("grafhome-ca")
@@ -1313,7 +1315,7 @@ fn revoke_user_rejects_locally_writable_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("config provenance"))
-        .stderr(predicate::str::contains("user-remotes.toml"));
+        .stderr(predicate::str::contains("ca-host.toml"));
 
     assert!(!fixture.log.exists());
 }
@@ -1323,10 +1325,10 @@ fn check_rejects_legacy_sshpop_policy() {
     let dir = tempdir().unwrap();
     let config_root = dir.path().join("grafhome-ca");
     copy_dir(&example_config_root(), &config_root);
-    let provisioners = config_root.join("policy/provisioners.toml");
+    let provisioners = config_root.join("policy/ca.toml");
     let mut text = fs::read_to_string(&provisioners).unwrap();
     text.push_str(
-        "\n[[provisioners]]\nrole = \"host_renew\"\nname = \"grafhome-host-renew\"\n\
+        "\n[provisioners.host_renew]\nname = \"grafhome-host-renew\"\n\
          type = \"SSHPOP\"\ndefault_ttl = \"168h\"\nmax_ttl = \"720h\"\n\
          status = \"active\"\n",
     );
@@ -1340,6 +1342,59 @@ fn check_rejects_legacy_sshpop_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("host_renew"));
+}
+
+#[test]
+fn migrate_policy_creates_a_valid_host_centric_tree() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("policy");
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["migrate", "policy", "--config-root"])
+        .arg(legacy_config_root())
+        .arg("--out-dir")
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("migrated canonical policy"));
+
+    let policy = grafhome_ca::policy::Policy::load(dir.path()).expect("migrated policy loads");
+    assert_eq!(policy.hosts.len(), 4);
+    assert_eq!(policy.user_clients.len(), 4);
+    assert_eq!(policy.user_remotes.len(), 4);
+    assert!(output.join("ca.toml").is_file());
+    assert!(output.join("users.toml").is_file());
+    assert!(output.join("hosts/ca-host.toml").is_file());
+    assert!(!output.join("hosts.toml").exists());
+}
+
+#[test]
+fn migrate_policy_rejects_canonical_sources_and_existing_outputs() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("policy");
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["migrate", "policy", "--config-root"])
+        .arg(example_config_root())
+        .arg("--out-dir")
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already uses the canonical"));
+    assert!(!output.exists());
+
+    fs::create_dir(&output).unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["migrate", "policy", "--config-root"])
+        .arg(legacy_config_root())
+        .arg("--out-dir")
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("migration output already exists"));
 }
 
 #[test]
@@ -2120,7 +2175,7 @@ fn enroll_host_uses_trusted_path_step_when_configured_path_is_missing() {
 fn renew_host_uses_trusted_path_step_when_configured_path_is_missing() {
     let (dir, fixture) = exec_fixture();
     let path = configure_step_path_fallback(&dir, &fixture);
-    let provisioners = fixture.config_root.join("policy/provisioners.toml");
+    let provisioners = fixture.config_root.join("policy/ca.toml");
     let text = fs::read_to_string(&provisioners).unwrap().replacen(
         "renewal_default_ttl = \"168h\"",
         "renewal_default_ttl = \"24h\"",

@@ -31,7 +31,7 @@ pub enum Error {
     /// A policy/config field failed validation.
     #[error("{field}: {message}")]
     Validation {
-        /// Owning field, such as `policy/endpoints.toml:ca_origin.port`.
+        /// Owning field, such as `policy/ca.toml:endpoints.ca_origin.port`.
         field: String,
         /// Human-readable validation failure.
         message: String,

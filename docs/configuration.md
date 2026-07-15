@@ -92,59 +92,96 @@ policy shape.
 
 ## Policy Terms
 
-Policy lives in typed TOML documents under `policy/`. Each file contains an
-array of tables named after the file with hyphens replaced by underscores. For
-example, `policy/user-remotes.toml` contains `[[user_remotes]]` entries.
-`users.toml` may additionally carry the file-level
-`require_ssh_admin_access` safety switch. TOML comments are supported,
-booleans are written as `true` or `false`, endpoint ports are integers, and
-host principals are arrays:
+Policy lives in typed, comment-friendly TOML under `policy/`. The authoring
+layout follows the units operators maintain instead of exposing normalized
+database-style relations:
+
+- `ca.toml`: keyed CA endpoints and provisioner roles
+- `users.toml`: keyed, stable user identities and certificate defaults
+- `hosts/<host>.toml`: one complete manifest for each physical machine
+
+The host filename is its stable policy name. Endpoint and provisioner table
+keys are their roles, and user table keys are their policy identities, so those
+values are not repeated as fields. HTTPS is the only supported endpoint scheme
+and is derived rather than configured. TOML comments are supported, booleans
+are written as `true` or `false`, endpoint ports are integers, and host
+principals are arrays:
 
 ```toml
-# This host accepts and initiates certificate-authenticated SSH connections.
-[[hosts]]
-host = "server-a"
+# policy/hosts/server-a.toml
 ssh_server = true
 ssh_client = true
 principals = ["server-a", "server-a.example.test"]
+
+[user_access.alice.enrollment]
+status = "active"
+
+[[user_access.alice.logins]]
+unix_account = "alice"
+status = "active"
 ```
 
-The executable policy surface contains six files:
-
-- `endpoints.toml`: the public and origin CA endpoints
-- `hosts.toml`: enrolled machines and their host certificate principals
-- `users.toml`: certificate users and their certificate settings
-- `provisioners.toml`: CA provisioner roles and certificate lifetimes
-- `user-clients.toml`: hosts where each user may enroll and renew a certificate
-- `user-remotes.toml`: remote accounts each user may access over SSH
+Each host's `user_access` tables colocate two independent capabilities without
+combining their meanings. `enrollment` authorizes that user to enroll and renew
+on the source host. Each `logins` row authorizes that certificate user to log
+into one Unix account on the destination host. Separately, `ssh_client = true`
+installs outbound host-CA trust. Relationship absence means deny; `planned` and
+`disabled` rows may be retained when lifecycle history matters.
 
 Operational inventories such as schedulers, static keys, emergency access, and
 CA operators are intentionally outside Grafhome CA policy. The CLI does not
 enforce them, so keeping them beside executable authorization policy would give
 a misleading impression that changing them affects the CA.
 
-The schemas in `schemas/policy/` validate the complete TOML documents. Run
-`grafhome-ca check` after editing policy; commands that mutate CA or host state
-also validate policy and its filesystem provenance before proceeding.
+The schemas in `schemas/policy/` validate the complete TOML documents. Canonical
+user policy uses `schemas/policy/canonical/users.schema.json`; the original
+six-file schema URLs remain compatibility entry points backed by the schemas in
+`schemas/policy/legacy/`. Run `grafhome-ca check` after editing policy; commands
+that mutate CA or host state also validate policy and its filesystem provenance
+before proceeding.
 
-`policy/user-remotes.toml` is the sole source of SSH login authorization. Each
-active row maps one active policy user's principal to one Unix account on one
+## Migrating Legacy Policy
+
+The compatibility reader accepts the previous normalized `endpoints.toml`,
+`hosts.toml`, `users.toml`, `provisioners.toml`, `user-clients.toml`, and
+`user-remotes.toml` set during the binary-first migration window. Convert it
+without changing the source tree:
+
+```sh
+grafhome-ca migrate policy \
+  --config-root /path/to/legacy-site-config \
+  --out-dir /path/to/review/policy
+```
+
+The output directory must not exist. The command writes into a sibling staging
+directory, parses and semantically validates every generated document, and
+renames the complete directory into place only after validation succeeds. An
+active legacy login with `allow_ssh = false` becomes a `disabled` historical
+login because canonical authorization is expressed by relationship presence
+and lifecycle state. Review the generated diff and replace the private policy
+directory atomically. The structural conversion does not preserve legacy TOML
+comments; carry forward any rationale that remains useful during review. Do
+not maintain two writable formats or mix canonical and legacy documents under
+one config root.
+
+Host-manifest login rows are the sole source of SSH login authorization. Each
+active row maps one active policy user's principal to one Unix account on that
 host. A user whose `status` is `planned` or `disabled` is omitted from rendered
-authorized-principals files even if historical access rows remain active.
+authorized-principals files even if historical login rows remain active.
 
 `users.toml` may set `require_ssh_admin_access = true` as a durable site safety
 switch and designate one or more active users with `ssh_admin = true`. Once
 enabled, every host with `ssh_server = true` must retain an active
-`user-remotes.toml` login mapping for at least one active SSH administrator.
+host-manifest login mapping for at least one active SSH administrator.
 The separate switch ensures that accidentally deleting every designation is an
 error rather than silently disabling the invariant. Policies that omit both
 fields retain their existing behavior. The designation does not grant Unix or
 sudo privileges; it identifies certificate users whose existing login mappings
 serve as the site's administrative recovery path.
 
-`users.principal` and `hosts.principals` directly own the user and host
-certificate namespaces. `grafhome-ca check` rejects duplicate principals,
-including collisions between user and host certificates.
+`users.<user>.principal` and each host manifest's `principals` directly own the
+user and host certificate namespaces. `grafhome-ca check` rejects duplicate
+principals, including collisions between user and host certificates.
 
 `ca_origin`
 : The private CA service endpoint hosted on the CA origin host.
@@ -172,13 +209,13 @@ including collisions between user and host certificates.
   name are both explicit issuance policy.
 
 The renderer also derives authority-wide SSH allow-lists directly from active
-`users.principal` values and every `hosts.principals` value. These are generated
-template variables rather than deployment settings. The CA rejects SSH user or
-host principals outside those policy-owned sets even if a provisioner token or
-template is misconfigured.
+keyed-user `principal` values and every host manifest's `principals`. These are
+generated template variables rather than deployment settings. The CA rejects
+SSH user or host principals outside those policy-owned sets even if a
+provisioner token or template is misconfigured.
 
 `GRAFHOME_CA_PROVISIONERS_JSON`
-: Template variable derived from active rows in `policy/provisioners.toml`.
+: Template variable derived from active `policy/ca.toml` provisioner tables.
   JWK rows render as whole-object runtime placeholders until a deployment step
   replaces them with complete Smallstep provisioner objects containing the
   public `key`, claims, and issuance templates. Private enrollment keys remain
@@ -230,8 +267,8 @@ template is misconfigured.
   inflate routine renewal authority.
 
 `allow_effectively_infinite_cert`
-: Optional `user-clients.toml` boolean, defaulting to `false`. When true on the
-  exact active user/client-host row, a root operator may use `approve user
+: Optional host enrollment boolean, defaulting to `false`. When true on the
+  exact active user/host relationship, a root operator may use `approve user
   --effectively-infinite`. The flag and allow-list entry are both required;
   routine renewal remains finite. Upgrade the target client before issuing this
   exceptional grant. It uses enrollment document version 2 so older clients

@@ -1,43 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/user-clients.schema.json",
-  "title": "user-clients policy",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["user_clients"],
-  "properties": {
-    "user_clients": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["user", "host", "status"],
-        "properties": {
-          "user": {
-            "$ref": "#/definitions/account"
-          },
-          "host": {
-            "$ref": "#/definitions/name"
-          },
-          "allow_effectively_infinite_cert": {
-            "type": "boolean",
-            "default": false
-          },
-          "status": {
-            "enum": ["active", "planned", "disabled"]
-          }
-        }
-      }
-    }
-  },
-  "definitions": {
-    "account": {
-      "type": "string",
-      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
-    },
-    "name": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._-]+$"
-    }
-  }
+  "title": "Grafhome legacy user clients policy compatibility entry point",
+  "$ref": "legacy/user-clients.schema.json"
 }

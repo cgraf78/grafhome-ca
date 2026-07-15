@@ -1,51 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/user-remotes.schema.json",
-  "title": "user-remotes policy",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["user_remotes"],
-  "properties": {
-    "user_remotes": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "user",
-          "host",
-          "unix_account",
-          "allow_ssh",
-          "status"
-        ],
-        "properties": {
-          "user": {
-            "$ref": "#/definitions/account"
-          },
-          "host": {
-            "$ref": "#/definitions/name"
-          },
-          "unix_account": {
-            "$ref": "#/definitions/account"
-          },
-          "allow_ssh": {
-            "type": "boolean"
-          },
-          "status": {
-            "enum": ["active", "planned", "disabled"]
-          }
-        }
-      }
-    }
-  },
-  "definitions": {
-    "account": {
-      "type": "string",
-      "pattern": "^[a-z_][a-z0-9_-]*[$]?$"
-    },
-    "name": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9._-]+$"
-    }
-  }
+  "title": "Grafhome legacy user remotes policy compatibility entry point",
+  "$ref": "legacy/user-remotes.schema.json"
 }

@@ -406,7 +406,9 @@ By default, `grafhome-ca` reads site config from:
 ```text
 ${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/
   config/deployment.env
-  policy/*.toml
+  policy/ca.toml
+  policy/users.toml
+  policy/hosts/<host>.toml
 ```
 
 The config root can be overridden for tests, examples, or private repos:
@@ -415,10 +417,33 @@ The config root can be overridden for tests, examples, or private repos:
 grafhome-ca check --config-root /path/to/site-config
 ```
 
-Policy files are typed TOML and support comments. Each file has a corresponding
-JSON Schema under `schemas/policy/`; see
+Policy files are typed TOML and support comments. `ca.toml` owns global CA
+endpoints and provisioners, `users.toml` owns stable user identities, and each
+host manifest owns that machine's principals, roles, enrollment permissions,
+and destination login accounts. Each document has a corresponding JSON Schema
+under `schemas/policy/`. The canonical keyed user schema is versioned under
+`schemas/policy/canonical/`; the original public schema URLs remain compatibility
+entry points for legacy editor and validator integrations. See
 [`docs/configuration.md`](docs/configuration.md) for the document shape and an
 example.
+
+New binaries retain read compatibility with the legacy six-file layout for a
+binary-first rollout. Convert a validated legacy config into a new directory
+without modifying the source:
+
+```sh
+grafhome-ca migrate policy \
+  --config-root /path/to/legacy-site-config \
+  --out-dir /path/to/review/policy
+```
+
+The destination must not exist. Migration stages every document beside the
+destination, parses and semantically validates the canonical result, then
+renames the complete policy directory into place. Review the resulting diff
+and cut the private policy over atomically. The structural conversion does not
+preserve legacy TOML comments, so carry forward any rationale that remains
+useful during review. Canonical and legacy documents may not be mixed in one
+config root.
 
 Runtime firewall, Apache, systemd, and DNS changes remain owned by private
 configuration management. `enroll host` deliberately installs only the

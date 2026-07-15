@@ -17,7 +17,25 @@ pub fn validate_config_root(config_root: impl AsRef<Path>, trusted_uid: u32) -> 
     let mut checked = BTreeSet::new();
     check_chain(&config_root, trusted_uid, &mut checked)?;
 
-    for relative in crate::schema::config_input_paths() {
+    // Canonical policy discovers per-host files dynamically. Protect both the
+    // lexical and resolved directory before trusting its directory entries.
+    if config_root.join(crate::policy::CA_POLICY_PATH).exists() {
+        let hosts = config_root.join(crate::policy::HOST_POLICY_DIR);
+        check_chain(&hosts, trusted_uid, &mut checked)?;
+        let resolved = std::fs::canonicalize(&hosts).map_err(|source| Error::io(&hosts, source))?;
+        check_chain(&resolved, trusted_uid, &mut checked)?;
+        if !std::fs::metadata(&resolved)
+            .map_err(|source| Error::io(&resolved, source))?
+            .is_dir()
+        {
+            return Err(provenance_error(
+                &resolved,
+                "host policy input is not a directory",
+            ));
+        }
+    }
+
+    for relative in crate::schema::config_input_paths(&config_root)? {
         let input = config_root.join(relative);
         check_chain(&input, trusted_uid, &mut checked)?;
         let resolved = std::fs::canonicalize(&input).map_err(|source| Error::io(&input, source))?;
@@ -134,13 +152,13 @@ mod tests {
     fn rejects_group_writable_policy_file() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
-        let input = root.join("policy/user-remotes.toml");
+        let input = root.join("policy/hosts/ca-host.toml");
         fs::set_permissions(&input, fs::Permissions::from_mode(0o664)).unwrap();
         let uid = fs::metadata(dir.path()).unwrap().uid();
 
         let error = validate_config_root(&root, uid).unwrap_err().to_string();
 
-        assert!(error.contains("user-remotes.toml"));
+        assert!(error.contains("ca-host.toml"));
         assert!(error.contains("permits group or world writes"));
     }
 
@@ -159,12 +177,70 @@ mod tests {
     }
 
     #[test]
+    fn rejects_world_writable_host_inventory_directory() {
+        let dir = fixture();
+        let root = dir.path().join("grafhome-ca");
+        let hosts = root.join("policy/hosts");
+        fs::set_permissions(&hosts, fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        let error = validate_config_root(&root, uid).unwrap_err().to_string();
+
+        assert!(error.contains("policy/hosts"));
+        assert!(error.contains("permits group or world writes"));
+    }
+
+    #[test]
+    fn accepts_protected_symlinked_host_inventory_directory() {
+        let dir = fixture();
+        let root = dir.path().join("grafhome-ca");
+        let hosts = root.join("policy/hosts");
+        let target = dir.path().join("external-hosts");
+        fs::rename(&hosts, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &hosts).unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        validate_config_root(&root, uid).unwrap();
+    }
+
+    #[test]
+    fn rejects_writable_symlinked_host_inventory_directory() {
+        let dir = fixture();
+        let root = dir.path().join("grafhome-ca");
+        let hosts = root.join("policy/hosts");
+        let target = dir.path().join("external-hosts");
+        fs::rename(&hosts, &target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&target, &hosts).unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        let error = validate_config_root(&root, uid).unwrap_err().to_string();
+
+        assert!(error.contains("external-hosts"));
+        assert!(error.contains("permits group or world writes"));
+    }
+
+    #[test]
+    fn rejects_host_inventory_that_resolves_to_a_regular_file() {
+        let dir = fixture();
+        let root = dir.path().join("grafhome-ca");
+        let hosts = root.join("policy/hosts");
+        fs::remove_dir_all(&hosts).unwrap();
+        fs::write(&hosts, "not a directory\n").unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        let error = validate_config_root(&root, uid).unwrap_err().to_string();
+
+        assert!(error.contains("host policy input is not a directory"));
+    }
+
+    #[test]
     fn rejects_untrusted_owner() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
         let uid = fs::metadata(dir.path()).unwrap().uid();
         let untrusted_uid = if uid == 0 {
-            let input = root.join("policy/user-remotes.toml");
+            let input = root.join("policy/hosts/ca-host.toml");
             rustix::fs::chown(&input, Some(rustix::fs::Uid::from_raw(1)), None).unwrap();
             2
         } else {
@@ -182,8 +258,8 @@ mod tests {
     fn rejects_writable_symlink_target() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
-        let original = root.join("policy/user-remotes.toml");
-        let target = dir.path().join("user-remotes.toml");
+        let original = root.join("policy/hosts/ca-host.toml");
+        let target = dir.path().join("ca-host.toml");
         fs::rename(&original, &target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
         std::os::unix::fs::symlink(&target, &original).unwrap();
@@ -191,7 +267,7 @@ mod tests {
 
         let error = validate_config_root(&root, uid).unwrap_err().to_string();
 
-        assert!(error.contains("user-remotes.toml"));
+        assert!(error.contains("ca-host.toml"));
         assert!(error.contains("permits group or world writes"));
     }
 
@@ -199,8 +275,8 @@ mod tests {
     fn accepts_protected_symlink_target() {
         let dir = fixture();
         let root = dir.path().join("grafhome-ca");
-        let original = root.join("policy/user-remotes.toml");
-        let target = dir.path().join("user-remotes.toml");
+        let original = root.join("policy/hosts/ca-host.toml");
+        let target = dir.path().join("ca-host.toml");
         fs::rename(&original, &target).unwrap();
         std::os::unix::fs::symlink(&target, &original).unwrap();
         let uid = fs::metadata(dir.path()).unwrap().uid();

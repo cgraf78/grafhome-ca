@@ -17,6 +17,14 @@ signing, ACME, OIDC, JWK handling, or SSH certificate wire formats.
 - Provide CLIs for validation, policy-controlled enrollment, renewal, and revocation.
 - Keep machine-readable statuses and identifiers centralized.
 
+The host-centric TOML documents are an authoring projection, not the runtime
+domain model. Loading derives stable names from map keys and host filenames,
+then normalizes CA settings, identities, hosts, enrollments, and login
+relationships into one typed `Policy`. Every renderer and authorization path
+consumes that model. The legacy compatibility reader and canonical reader
+therefore share semantic validation instead of maintaining parallel policy
+implementations.
+
 ## Non-Rust Responsibilities
 
 - `step-ca`: CA server and signing authority.
