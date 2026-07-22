@@ -724,11 +724,16 @@ fn run() -> grafhome_ca::Result<()> {
             let mut stdin = std::io::stdin().lock();
             let user = resolve_user(user.as_deref())?;
             let host = resolve_host(host.as_deref())?;
+            let mut stored_password = None;
             if if_enrolled {
-                let local_ready =
-                    user_local_renewal_ready(&model, &user, &host, password_file.is_none())?;
-                if !local_ready {
-                    return Ok(());
+                match user_local_renewal_readiness(&model, &user, &host, password_file.is_none())? {
+                    UserLocalRenewalReadiness::NotEnrolled => return Ok(()),
+                    UserLocalRenewalReadiness::Ready { password } => {
+                        stored_password = password;
+                    }
+                    UserLocalRenewalReadiness::CredentialUnavailable(error) => {
+                        return Err(error);
+                    }
                 }
             }
             let Some(_lock) = try_renewal_lock(&user_renewal_lock_path(&model)?)? else {
@@ -745,7 +750,10 @@ fn run() -> grafhome_ca::Result<()> {
             }
             let password = match password_file.as_deref() {
                 Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
-                None => lookup_renewal_password(&user, &host)?,
+                None => match stored_password {
+                    Some(password) => password,
+                    None => lookup_renewal_password(&user, &host)?,
+                },
             };
             renew_user(&model, &user, Some(&host), &password, quiet)
         }
@@ -3671,7 +3679,11 @@ fn local_renewal_ready(
         });
     };
     match user {
-        Some(user) => user_local_renewal_ready(model, user, host, true),
+        Some(user) => match user_local_renewal_readiness(model, user, host, true)? {
+            UserLocalRenewalReadiness::NotEnrolled => Ok(false),
+            UserLocalRenewalReadiness::Ready { .. } => Ok(true),
+            UserLocalRenewalReadiness::CredentialUnavailable(error) => Err(error),
+        },
         None => Ok(server_root_cert_path(model).is_file()
             && host_material_dir(model, host)
                 .join("provisioner.priv.json")
@@ -3679,17 +3691,34 @@ fn local_renewal_ready(
     }
 }
 
-fn user_local_renewal_ready(
+enum UserLocalRenewalReadiness {
+    NotEnrolled,
+    Ready { password: Option<String> },
+    CredentialUnavailable(grafhome_ca::Error),
+}
+
+fn user_local_renewal_readiness(
     model: &SiteModel,
     user: &str,
     host: &str,
     require_stored_credential: bool,
-) -> grafhome_ca::Result<bool> {
-    Ok(user_root_cert_path(model)?.is_file()
+) -> grafhome_ca::Result<UserLocalRenewalReadiness> {
+    let enrollment_material_present = user_root_cert_path(model)?.is_file()
         && user_client_material_dir(user, host)?
             .join("provisioner.priv.json")
-            .is_file()
-        && (!require_stored_credential || stored_renewal_credential_exists(user, host)?))
+            .is_file();
+    if !enrollment_material_present {
+        return Ok(UserLocalRenewalReadiness::NotEnrolled);
+    }
+    if !require_stored_credential {
+        return Ok(UserLocalRenewalReadiness::Ready { password: None });
+    }
+    Ok(match lookup_renewal_password(user, host) {
+        Ok(password) => UserLocalRenewalReadiness::Ready {
+            password: Some(password),
+        },
+        Err(error) => UserLocalRenewalReadiness::CredentialUnavailable(error),
+    })
 }
 
 fn remote_provisioner_names(
@@ -4548,7 +4577,7 @@ fn try_decrypt_systemd_credential(
     Ok(password)
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 fn backend_command_error(stderr: &[u8], fallback: &str, redactions: &[&str]) -> String {
     let message = redact_text(&String::from_utf8_lossy(stderr), redactions)
         .trim()
@@ -4646,29 +4675,19 @@ fn lookup_macos_keychain_password(user: &str, host: &str) -> grafhome_ca::Result
         .trim_end_matches(['\r', '\n'])
         .to_owned();
     if !output.status.success() || password.is_empty() {
+        let detail = backend_command_error(
+            &output.stderr,
+            "security did not return a renewal password",
+            &[],
+        );
         return Err(grafhome_ca::Error::Validation {
             field: "renewal credential storage".to_owned(),
             message: format!(
-                "no usable renewal password found in macOS Keychain for {user}@{host}; rerun enrollment or use --password-file"
+                "no usable renewal password found in macOS Keychain for {user}@{host}; {detail}. Rerun enrollment or use --password-file"
             ),
         });
     }
     Ok(password)
-}
-
-#[cfg(target_os = "macos")]
-fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
-    Ok(lookup_macos_keychain_password(user, host).is_ok())
-}
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
-fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
-    Ok(renewal_credential_path(user, host)?.is_file())
-}
-
-#[cfg(target_os = "android")]
-fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
-    Ok(read_app_private_credential(&renewal_credential_path(user, host)?)?.is_some())
 }
 
 fn with_password_file<T>(
