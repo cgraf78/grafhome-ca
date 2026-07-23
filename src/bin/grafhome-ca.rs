@@ -6,9 +6,7 @@ use std::fs::File;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
@@ -30,6 +28,16 @@ use grafhome_ca::policy::{
 };
 
 const USER_KEY_NAME: &str = "id_ed25519";
+const LOCAL_HOST_ENV: &str = "GRAFHOME_CA_LOCAL_HOST";
+const LOCAL_USER_ENV: &str = "GRAFHOME_CA_LOCAL_USER";
+const SYSTEM_SSH_DIR: &str = "GRAFHOME_CA_SYSTEM_SSH_DIR";
+const AUTH_PRINCIPALS_FILE: &str = "GRAFHOME_CA_AUTH_PRINCIPALS_FILE";
+const AUTHORIZED_KEYS_DIRECTIVE: &str = "GRAFHOME_CA_AUTHORIZED_KEYS_DIRECTIVE";
+const STRICT_MODES: &str = "GRAFHOME_CA_STRICT_MODES";
+const HOST_SSH_KEYGEN_BIN: &str = "GRAFHOME_CA_HOST_SSH_KEYGEN_BIN";
+const HOST_SSHD_BIN: &str = "GRAFHOME_CA_HOST_SSHD_BIN";
+const HOST_SSH_RELOAD_BIN: &str = "GRAFHOME_CA_HOST_SSH_RELOAD_BIN";
+const HOST_SSH_SERVICE_DIR: &str = "GRAFHOME_CA_HOST_SSH_SERVICE_DIR";
 #[cfg(target_os = "android")]
 const ANDROID_RENEWAL_CREDENTIAL_NAME: &str = "renewal-password.secret";
 const DEFAULT_ENROLLMENT_TOKEN_TTL: &str = "15m";
@@ -152,10 +160,10 @@ enum Command {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// Policy user. With no filters, defaults to the current non-root account.
+        /// Policy user. With no filters, defaults to GRAFHOME_CA_LOCAL_USER, then the current non-root account.
         #[arg(long)]
         user: Option<String>,
-        /// Policy host. With no filters, defaults to the short local hostname.
+        /// Policy host. With no filters, defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
         #[arg(long)]
         host: Option<String>,
         /// Print nothing and exit unsuccessfully when the requested enrollment is absent.
@@ -202,6 +210,9 @@ enum ApplyCommand {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
+        /// Local policy host identity instead of hostname or environment inference.
+        #[arg(long)]
+        host: Option<String>,
         /// Show changes without writing files or reloading SSH.
         #[arg(long)]
         dry_run: bool,
@@ -264,7 +275,7 @@ enum EnrollCommand {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// Host policy name. Defaults to the short local hostname.
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
         #[arg(long)]
         host: Option<String>,
         /// Read the host enrollment grant from this file instead of stdin.
@@ -282,10 +293,10 @@ enum EnrollCommand {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// User policy name. Defaults to the current account.
+        /// User policy name. Defaults to GRAFHOME_CA_LOCAL_USER, then the current account.
         #[arg(long)]
         user: Option<String>,
-        /// Client host policy name. Defaults to the short local hostname.
+        /// Client host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
         #[arg(long)]
         host: Option<String>,
         /// Complete enrollment using this grant instead of reading stdin.
@@ -310,7 +321,7 @@ enum RenewCommand {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// Host policy name. Defaults to the short local hostname.
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
         #[arg(long)]
         host: Option<String>,
         /// Exit successfully without output unless this host is enrolled and renewable.
@@ -328,10 +339,10 @@ enum RenewCommand {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// User policy name. Defaults to the current account.
+        /// User policy name. Defaults to GRAFHOME_CA_LOCAL_USER, then the current account.
         #[arg(long)]
         user: Option<String>,
-        /// Client host policy name. Defaults to the short local hostname.
+        /// Client host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
         #[arg(long)]
         host: Option<String>,
         /// Read the user-owned provisioner password from this file instead of stored credentials.
@@ -526,13 +537,14 @@ fn run() -> grafhome_ca::Result<()> {
             command:
                 ApplyCommand::Host {
                     config_root,
+                    host,
                     dry_run,
                     if_enrolled,
                     quiet,
                 },
         } => {
-            let model = load_root_model(config_root, "apply host", true)?;
-            let host = resolve_host(None)?;
+            let model = load_host_model(config_root, "apply host", true)?;
+            let host = resolve_host(host.as_deref())?;
             if if_enrolled && !local_renewal_ready(&model, None, Some(&host))? {
                 return Ok(());
             }
@@ -572,7 +584,7 @@ fn run() -> grafhome_ca::Result<()> {
                     restart,
                 },
         } => {
-            let model = load_root_model(config_root, "enroll host", !request_only)?;
+            let model = load_host_model(config_root, "enroll host", !request_only)?;
             enroll_host_flow(
                 &model,
                 host.as_deref(),
@@ -591,7 +603,7 @@ fn run() -> grafhome_ca::Result<()> {
                     quiet,
                 },
         } => {
-            let model = load_root_model(config_root, "renew host", false)?;
+            let model = load_host_model(config_root, "renew host", false)?;
             let host = resolve_host(host.as_deref())?;
             if if_enrolled && !local_renewal_ready(&model, None, Some(&host))? {
                 return Ok(());
@@ -700,8 +712,11 @@ fn run() -> grafhome_ca::Result<()> {
             quiet,
             renewable,
         } => {
-            let model = load_valid_model(config_root)?;
             let (user, host) = resolve_status_scope(user, host)?;
+            let mut model = load_valid_model(config_root)?;
+            if user.is_none() && host.is_some() {
+                localize_termux_host_model(&mut model)?;
+            }
             let enrolled = status(&model, user.as_deref(), host.as_deref(), quiet, renewable)?;
             if quiet && !enrolled {
                 std::process::exit(1);
@@ -724,11 +739,16 @@ fn run() -> grafhome_ca::Result<()> {
             let mut stdin = std::io::stdin().lock();
             let user = resolve_user(user.as_deref())?;
             let host = resolve_host(host.as_deref())?;
+            let mut stored_password = None;
             if if_enrolled {
-                let local_ready =
-                    user_local_renewal_ready(&model, &user, &host, password_file.is_none())?;
-                if !local_ready {
-                    return Ok(());
+                match user_local_renewal_readiness(&model, &user, &host, password_file.is_none())? {
+                    UserLocalRenewalReadiness::NotEnrolled => return Ok(()),
+                    UserLocalRenewalReadiness::Ready { password } => {
+                        stored_password = password;
+                    }
+                    UserLocalRenewalReadiness::CredentialUnavailable(error) => {
+                        return Err(error);
+                    }
                 }
             }
             let Some(_lock) = try_renewal_lock(&user_renewal_lock_path(&model)?)? else {
@@ -745,7 +765,10 @@ fn run() -> grafhome_ca::Result<()> {
             }
             let password = match password_file.as_deref() {
                 Some(file) => read_password_or_file(Some(file), &mut stdin, "renewal password")?,
-                None => lookup_renewal_password(&user, &host)?,
+                None => match stored_password {
+                    Some(password) => password,
+                    None => lookup_renewal_password(&user, &host)?,
+                },
             };
             renew_user(&model, &user, Some(&host), &password, quiet)
         }
@@ -762,6 +785,410 @@ fn resolve_config_root(config_root: Option<PathBuf>) -> grafhome_ca::Result<Path
 fn load_valid_model(config_root: Option<PathBuf>) -> grafhome_ca::Result<SiteModel> {
     let config_root = resolve_config_root(config_root)?;
     load_valid_model_from_root(&config_root)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TermuxHostRuntime {
+    home: PathBuf,
+    prefix: PathBuf,
+}
+
+impl TermuxHostRuntime {
+    fn detect() -> grafhome_ca::Result<Option<Self>> {
+        if !termux_host_runtime_enabled() {
+            return Ok(None);
+        }
+        let home = validate_termux_owned_directory(
+            &required_absolute_env_path("HOME", "Termux host runtime")?,
+            "HOME",
+        )?;
+        let prefix = validate_termux_owned_directory(
+            &required_absolute_env_path("PREFIX", "Termux host runtime")?,
+            "PREFIX",
+        )?;
+        validate_termux_tree(
+            &home,
+            &home.join(".config/grafhome/host-step"),
+            "host credential directory",
+        )?;
+        validate_termux_tree(
+            &home,
+            &home.join(".ssh/grafhome"),
+            "authorized principals directory",
+        )?;
+        validate_termux_tree(
+            &prefix,
+            &prefix.join("etc/ssh"),
+            "OpenSSH configuration directory",
+        )?;
+        for executable in ["step-cli", "ssh-keygen", "sshd", "sv"] {
+            validate_termux_executable(&prefix, executable)?;
+        }
+        Ok(Some(Self { home, prefix }))
+    }
+
+    fn localize(&self, model: &mut SiteModel) {
+        let values = &mut model.deployment.values;
+        values.insert(
+            "GRAFHOME_CA_SERVER_STEPPATH".to_owned(),
+            self.home
+                .join(".config/grafhome/host-step")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            "GRAFHOME_CA_SSH_TRUST_DIR".to_owned(),
+            self.prefix
+                .join("etc/ssh/grafhome")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            "GRAFHOME_CA_AUTH_PRINCIPALS_DIR".to_owned(),
+            self.home
+                .join(".ssh/grafhome")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            AUTH_PRINCIPALS_FILE.to_owned(),
+            self.home
+                .join(".ssh/grafhome/termux-owner")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            AUTHORIZED_KEYS_DIRECTIVE.to_owned(),
+            "AuthorizedKeysFile none".to_owned(),
+        );
+        values.insert(STRICT_MODES.to_owned(), "no".to_owned());
+        values.insert(
+            "GRAFHOME_CA_ROOT_STEP_BIN".to_owned(),
+            self.prefix
+                .join("bin/step-cli")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            "GRAFHOME_CA_HOST_KEY_PATH".to_owned(),
+            self.prefix
+                .join("etc/ssh/ssh_host_ed25519_key")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            SYSTEM_SSH_DIR.to_owned(),
+            self.prefix.join("etc/ssh").to_string_lossy().into_owned(),
+        );
+        values.insert(
+            HOST_SSH_KEYGEN_BIN.to_owned(),
+            self.prefix
+                .join("bin/ssh-keygen")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            HOST_SSHD_BIN.to_owned(),
+            self.prefix.join("bin/sshd").to_string_lossy().into_owned(),
+        );
+        values.insert(
+            HOST_SSH_RELOAD_BIN.to_owned(),
+            self.prefix.join("bin/sv").to_string_lossy().into_owned(),
+        );
+        values.insert(
+            HOST_SSH_SERVICE_DIR.to_owned(),
+            self.prefix
+                .join("var/service")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    fn prepare_private_directory(&self, directory: &Path, field: &str) -> grafhome_ca::Result<()> {
+        let relative =
+            directory
+                .strip_prefix(&self.home)
+                .map_err(|_| grafhome_ca::Error::Validation {
+                    field: field.to_owned(),
+                    message: format!("path must remain beneath HOME: {}", directory.display()),
+                })?;
+        let mut current = self.home.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(grafhome_ca::Error::Validation {
+                    field: field.to_owned(),
+                    message: format!(
+                        "path must contain only normal components: {}",
+                        directory.display()
+                    ),
+                });
+            };
+            current.push(name);
+            let created = match std::fs::create_dir(&current) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) => return Err(grafhome_ca::Error::io(&current, source)),
+            };
+            let metadata = std::fs::symlink_metadata(&current)
+                .map_err(|source| grafhome_ca::Error::io(&current, source))?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(grafhome_ca::Error::Validation {
+                    field: field.to_owned(),
+                    message: format!("path must be a real directory: {}", current.display()),
+                });
+            }
+            #[cfg(unix)]
+            if created {
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|source| grafhome_ca::Error::io(&current, source))?;
+            }
+        }
+        validate_termux_tree(&self.home, directory, field)
+    }
+
+    fn prepare_policy_directories(&self) -> grafhome_ca::Result<()> {
+        let ssh_dir = self.home.join(".ssh");
+        let principals_dir = ssh_dir.join("grafhome");
+        let system_ssh_dir = self.prefix.join("etc/ssh");
+        let directories = [
+            (&ssh_dir, true),
+            (&principals_dir, true),
+            (&system_ssh_dir.join("grafhome"), true),
+            (&system_ssh_dir.join("sshd_config.d"), false),
+            (&system_ssh_dir.join("ssh_config.d"), false),
+        ];
+        for (path, normalize_mode) in directories {
+            let created = match std::fs::create_dir(path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(source) => return Err(grafhome_ca::Error::io(path, source)),
+            };
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|source| grafhome_ca::Error::io(path, source))?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(grafhome_ca::Error::Validation {
+                    field: "Termux host runtime".to_owned(),
+                    message: format!(
+                        "authorized principals path must be a real directory: {}",
+                        path.display()
+                    ),
+                });
+            }
+            #[cfg(unix)]
+            if created || normalize_mode {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|source| grafhome_ca::Error::io(path, source))?;
+            }
+        }
+        validate_termux_tree(
+            &self.home,
+            &principals_dir,
+            "authorized principals directory",
+        )?;
+        validate_termux_tree(
+            &self.prefix,
+            &system_ssh_dir,
+            "OpenSSH configuration directory",
+        )
+    }
+}
+
+fn termux_host_runtime_enabled() -> bool {
+    cfg!(target_os = "android") && nonempty_env("TERMUX_VERSION").is_some()
+}
+
+fn required_absolute_env_path(name: &str, field: &str) -> grafhome_ca::Result<PathBuf> {
+    let path = std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| grafhome_ca::Error::Validation {
+            field: field.to_owned(),
+            message: format!("{name} must be set to an absolute path"),
+        })?;
+    if !path.is_absolute() {
+        return Err(grafhome_ca::Error::Validation {
+            field: field.to_owned(),
+            message: format!("{name} must be set to an absolute path"),
+        });
+    }
+    Ok(path)
+}
+
+fn validate_termux_owned_directory(path: &Path, name: &str) -> grafhome_ca::Result<PathBuf> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "Termux host runtime".to_owned(),
+            message: format!("{name} must name a real directory, not a symlink"),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != uid || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(grafhome_ca::Error::Validation {
+                field: "Termux host runtime".to_owned(),
+                message: format!(
+                    "{name} must be owned by the invoking user and not writable by group or others"
+                ),
+            });
+        }
+    }
+    std::fs::canonicalize(path).map_err(|source| grafhome_ca::Error::io(path, source))
+}
+
+fn validate_termux_descendant(root: &Path, path: &Path, name: &str) -> grafhome_ca::Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| grafhome_ca::Error::Validation {
+            field: "Termux host runtime".to_owned(),
+            message: format!("{name} must remain beneath {}", root.display()),
+        })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(source) => return Err(grafhome_ca::Error::io(&current, source)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "Termux host runtime".to_owned(),
+                message: format!("{name} must not contain symlinks: {}", current.display()),
+            });
+        }
+        validate_termux_owned_metadata(&current, &metadata, name)?;
+    }
+    Ok(())
+}
+
+fn validate_termux_tree(root: &Path, path: &Path, name: &str) -> grafhome_ca::Result<()> {
+    validate_termux_descendant(root, path, name)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(grafhome_ca::Error::io(path, source)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "Termux host runtime".to_owned(),
+            message: format!("{name} must be a directory: {}", path.display()),
+        });
+    }
+    validate_termux_tree_entries(path, name)
+}
+
+fn validate_termux_tree_entries(path: &Path, name: &str) -> grafhome_ca::Result<()> {
+    for entry in std::fs::read_dir(path).map_err(|source| grafhome_ca::Error::io(path, source))? {
+        let entry = entry.map_err(|source| grafhome_ca::Error::io(path, source))?;
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&entry_path)
+            .map_err(|source| grafhome_ca::Error::io(&entry_path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "Termux host runtime".to_owned(),
+                message: format!("{name} must not contain symlinks: {}", entry_path.display()),
+            });
+        }
+        validate_termux_owned_metadata(&entry_path, &metadata, name)?;
+        if metadata.file_type().is_dir() {
+            validate_termux_tree_entries(&entry_path, name)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_termux_owned_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    name: &str,
+) -> grafhome_ca::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != uid || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(grafhome_ca::Error::Validation {
+            field: "Termux host runtime".to_owned(),
+            message: format!(
+                "{name} must be owned by the invoking user and not writable by group or others: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_termux_owned_metadata(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+    _name: &str,
+) -> grafhome_ca::Result<()> {
+    Ok(())
+}
+
+fn validate_termux_executable(prefix: &Path, name: &str) -> grafhome_ca::Result<()> {
+    let path = prefix.join("bin").join(name);
+    validate_termux_descendant(prefix, &path, &format!("Termux executable {name}"))?;
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|source| grafhome_ca::Error::io(&path, source))?;
+    if !metadata.file_type().is_file() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "Termux host runtime".to_owned(),
+            message: format!("{} must be a regular file", path.display()),
+        });
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(grafhome_ca::Error::Validation {
+            field: "Termux host runtime".to_owned(),
+            message: format!("{} must be executable", path.display()),
+        });
+    }
+    Ok(())
+}
+
+fn localize_termux_host_model(model: &mut SiteModel) -> grafhome_ca::Result<()> {
+    if let Some(runtime) = TermuxHostRuntime::detect()? {
+        runtime.localize(model);
+    }
+    Ok(())
+}
+
+fn load_host_model(
+    config_root: Option<PathBuf>,
+    command: &str,
+    requires_install_root: bool,
+) -> grafhome_ca::Result<SiteModel> {
+    let mut config_root = resolve_config_root(config_root)?;
+    #[cfg(unix)]
+    let trusted_uid = rustix::process::geteuid().as_raw();
+    #[cfg(not(unix))]
+    let trusted_uid = 0;
+    let runtime = TermuxHostRuntime::detect()?;
+    match runtime.as_ref() {
+        Some(runtime) => {
+            config_root = grafhome_ca::provenance::validate_config_root_beneath(
+                &config_root,
+                trusted_uid,
+                &runtime.home,
+            )?;
+        }
+        None => grafhome_ca::provenance::validate_config_root(&config_root, trusted_uid)?,
+    }
+    if runtime.is_none() {
+        require_root_or_isolated_test(&config_root, trusted_uid, command, requires_install_root)?;
+    }
+    let mut model = load_valid_model_from_root(&config_root)?;
+    if let Some(runtime) = runtime {
+        runtime.localize(&mut model);
+    }
+    Ok(model)
 }
 
 fn load_root_model(
@@ -1465,6 +1892,39 @@ fn host_cert_path(model: &SiteModel) -> PathBuf {
     ))
 }
 
+fn normalize_regular_file_mode(path: &Path, field: &str, mode: u32) -> grafhome_ca::Result<()> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(grafhome_ca::Error::Validation {
+            field: field.to_owned(),
+            message: format!("output must be a regular file: {}", path.display()),
+        });
+    }
+    #[cfg(unix)]
+    {
+        let expected_uid = rustix::process::geteuid().as_raw();
+        if metadata.uid() != expected_uid {
+            return Err(grafhome_ca::Error::Validation {
+                field: field.to_owned(),
+                message: format!(
+                    "output must be owned by uid {expected_uid}: {}",
+                    path.display()
+                ),
+            });
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
+}
+
+fn normalize_host_certificate_mode(model: &SiteModel) -> grafhome_ca::Result<()> {
+    normalize_regular_file_mode(&host_cert_path(model), "host certificate", 0o644)
+}
+
 fn home_dir() -> grafhome_ca::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1887,17 +2347,21 @@ fn strip_enrollment_label(text: &str) -> Option<&str> {
 
 fn resolve_user(user: Option<&str>) -> grafhome_ca::Result<String> {
     user.map(ToOwned::to_owned)
+        .or_else(|| nonempty_env(LOCAL_USER_ENV))
         .or_else(|| std::env::var("USER").ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| grafhome_ca::Error::Validation {
             field: "user enrollment".to_owned(),
-            message: "could not determine the user; pass --user".to_owned(),
+            message: format!("could not determine the user; pass --user or set {LOCAL_USER_ENV}"),
         })
 }
 
 fn resolve_host(host: Option<&str>) -> grafhome_ca::Result<String> {
     if let Some(host) = host {
         return Ok(host.to_owned());
+    }
+    if let Some(host) = nonempty_env(LOCAL_HOST_ENV) {
+        return Ok(host);
     }
     if let Ok(host) = std::env::var("HOSTNAME")
         && !host.trim().is_empty()
@@ -1909,10 +2373,19 @@ fn resolve_host(host: Option<&str>) -> grafhome_ca::Result<String> {
     if host.is_empty() {
         return Err(grafhome_ca::Error::Validation {
             field: "user enrollment".to_owned(),
-            message: "could not determine the client host; pass --host".to_owned(),
+            message: format!(
+                "could not determine the client host; pass --host or set {LOCAL_HOST_ENV}"
+            ),
         });
     }
     Ok(host.split('.').next().unwrap_or(&host).to_owned())
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn enrollment_request_path(user: &str, host: &str) -> grafhome_ca::Result<PathBuf> {
@@ -2095,10 +2568,8 @@ fn ensure_user_keys(
     }
     #[cfg(unix)]
     {
-        std::fs::set_permissions(&private_jwk, std::fs::Permissions::from_mode(0o600))
-            .map_err(|source| grafhome_ca::Error::io(&private_jwk, source))?;
-        std::fs::set_permissions(&public_jwk, std::fs::Permissions::from_mode(0o644))
-            .map_err(|source| grafhome_ca::Error::io(&public_jwk, source))?;
+        normalize_regular_file_mode(&private_jwk, "user renewal private JWK", 0o600)?;
+        normalize_regular_file_mode(&public_jwk, "user renewal public JWK", 0o644)?;
     }
     user_request_from_material(model, &user.user, &client.host)
 }
@@ -2458,17 +2929,21 @@ fn user_approval_cert_ttl(
 fn ensure_host_keys(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<HostRequest> {
     required_host(model, host_name)?;
     let material_dir = host_material_dir(model, host_name);
-    std::fs::create_dir_all(&material_dir)
-        .map_err(|source| grafhome_ca::Error::io(&material_dir, source))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&material_dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|source| grafhome_ca::Error::io(&material_dir, source))?;
+    if let Some(runtime) = TermuxHostRuntime::detect()? {
+        runtime.prepare_private_directory(&material_dir, "host credential directory")?;
+    } else {
+        std::fs::create_dir_all(&material_dir)
+            .map_err(|source| grafhome_ca::Error::io(&material_dir, source))?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&material_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|source| grafhome_ca::Error::io(&material_dir, source))?;
+    }
     let public_jwk = material_dir.join("provisioner.pub.json");
     let private_jwk = material_dir.join("provisioner.priv.json");
     let password_file = material_dir.join("renewal-password");
     if !private_jwk.exists() {
         let password = random_secret()?;
-        write_secret_file(&password_file, password.as_bytes())?;
+        write_secret_file_atomic(&password_file, password.as_bytes())?;
         let step_bin = root_step_bin(model)?;
         run_status(
             process(&step_bin)
@@ -2486,6 +2961,11 @@ fn ensure_host_keys(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<H
             message: "incomplete host renewal credential; remove this directory and enroll again"
                 .to_owned(),
         });
+    }
+    #[cfg(unix)]
+    {
+        normalize_regular_file_mode(&private_jwk, "host renewal private JWK", 0o600)?;
+        normalize_regular_file_mode(&public_jwk, "host renewal public JWK", 0o644)?;
     }
     host_request_from_material(model, host_name)
 }
@@ -2647,9 +3127,10 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
         &grant.root_fingerprint,
     )?;
     enroll_host(model, &grant.host, &grant.token)?;
-    install_host_ssh_trust(model, &grant.host, &grant.ca_url)?;
-    run_status(process("sshd").arg("-t"))?;
-    reload_ssh()?;
+    let desired = desired_host_ssh_files(model, &grant.host, &grant.ca_url)?;
+    with_host_policy_lock(model, || {
+        apply_host_policy_locked(model, &grant.host, &desired, true, true)
+    })?;
     outln!("Host enrollment complete: {}", grant.host);
     Ok(())
 }
@@ -2664,17 +3145,6 @@ fn validate_grant_ca_url(model: &SiteModel, ca_url: &str, field: &str) -> grafho
             message: format!("CA URL {ca_url} does not match configured CA URL {expected}"),
         })
     }
-}
-
-fn install_host_ssh_trust(
-    model: &SiteModel,
-    host_name: &str,
-    ca_url: &str,
-) -> grafhome_ca::Result<()> {
-    for (path, file) in desired_host_ssh_files(model, host_name, ca_url)? {
-        write_public_file_atomic(&path, &file.content, file.mode)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2696,6 +3166,9 @@ fn desired_host_ssh_files(
     ca_url: &str,
 ) -> grafhome_ca::Result<BTreeMap<PathBuf, HostPolicyFile>> {
     let host = required_host(model, host_name)?;
+    let ssh_system_dir = system_ssh_dir(model);
+    let trust_dir = Path::new(&model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"]);
+    let auth_dir = Path::new(&model.deployment.values["GRAFHOME_CA_AUTH_PRINCIPALS_DIR"]);
     let step_bin = root_step_bin(model)?;
     let steppath = Path::new(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]);
     let root = server_root_cert_path(model);
@@ -2738,7 +3211,11 @@ fn desired_host_ssh_files(
         let Some(target) = rendered_host_target(&file.path, host_name) else {
             continue;
         };
-        if !target.starts_with("/etc/ssh/") {
+        let target_path = Path::new(&target);
+        if !target_path.starts_with(ssh_system_dir)
+            && !target_path.starts_with(trust_dir)
+            && !target_path.starts_with(auth_dir)
+        {
             continue;
         }
         let content = if target.ends_with("/user_ca_keys.pem") {
@@ -2833,7 +3310,7 @@ fn apply_host_policy(
     }
 
     with_host_policy_lock(model, || {
-        apply_host_policy_locked(model, host_name, &desired, quiet)
+        apply_host_policy_locked(model, host_name, &desired, quiet, false)
     })
 }
 
@@ -2842,9 +3319,13 @@ fn apply_host_policy_locked(
     host_name: &str,
     desired: &BTreeMap<PathBuf, HostPolicyFile>,
     quiet: bool,
+    validate_when_current: bool,
 ) -> grafhome_ca::Result<()> {
     let changes = host_policy_changes(model, desired)?;
     if changes.is_empty() {
+        if validate_when_current {
+            validate_and_reload_ssh(model)?;
+        }
         if !quiet {
             outln!("Host policy already current: {host_name}");
         }
@@ -2866,12 +3347,12 @@ fn apply_host_policy_locked(
                 HostPolicyChange::Remove => remove_host_policy_file(path)?,
             }
         }
-        validate_and_reload_ssh()
+        validate_and_reload_ssh(model)
     })();
 
     if let Err(error) = apply {
         let rollback =
-            restore_host_policy_files(&previous).and_then(|()| validate_and_reload_ssh());
+            restore_host_policy_files(&previous).and_then(|()| validate_and_reload_ssh(model));
         return Err(grafhome_ca::Error::Validation {
             field: "apply host".to_owned(),
             message: match rollback {
@@ -2916,10 +3397,14 @@ fn host_policy_managed_paths(
 ) -> grafhome_ca::Result<BTreeSet<PathBuf>> {
     let trust_dir = &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"];
     let auth_dir = install_target(&model.deployment.values["GRAFHOME_CA_AUTH_PRINCIPALS_DIR"]);
+    let ssh_system_dir = system_ssh_dir(model);
     let mut paths = desired.keys().cloned().collect::<BTreeSet<_>>();
     for path in [
-        "/etc/ssh/sshd_config.d/grafhome-ca.conf".to_owned(),
-        "/etc/ssh/ssh_config.d/grafhome-ca.conf".to_owned(),
+        format!(
+            "{}/sshd_config.d/grafhome-ca.conf",
+            ssh_system_dir.display()
+        ),
+        format!("{}/ssh_config.d/grafhome-ca.conf", ssh_system_dir.display()),
         format!("{trust_dir}/user_ca_keys.pem"),
         format!("{trust_dir}/revoked_user_certs"),
         format!("{trust_dir}/ssh_known_hosts"),
@@ -2987,9 +3472,13 @@ fn restore_host_policy_files(
     Ok(())
 }
 
-fn validate_and_reload_ssh() -> grafhome_ca::Result<()> {
-    run_status_quiet(process("sshd").arg("-t"), &[], true)?;
-    reload_ssh()
+fn validate_and_reload_ssh(model: &SiteModel) -> grafhome_ca::Result<()> {
+    run_status_quiet(
+        process(host_program(model, HOST_SSHD_BIN, "sshd")).arg("-t"),
+        &[],
+        true,
+    )?;
+    reload_ssh(model)
 }
 
 fn print_host_policy_changes(
@@ -3031,6 +3520,9 @@ fn with_host_policy_lock<T>(
     model: &SiteModel,
     action: impl FnOnce() -> grafhome_ca::Result<T>,
 ) -> grafhome_ca::Result<T> {
+    if let Some(runtime) = TermuxHostRuntime::detect()? {
+        runtime.prepare_policy_directories()?;
+    }
     let trust_dir = install_target(&model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"]);
     std::fs::create_dir_all(&trust_dir)
         .map_err(|source| grafhome_ca::Error::io(&trust_dir, source))?;
@@ -3083,6 +3575,24 @@ fn install_target(target: &str) -> PathBuf {
         Some(root) => PathBuf::from(root).join(target.trim_start_matches('/')),
         None => PathBuf::from(target),
     }
+}
+
+fn system_ssh_dir(model: &SiteModel) -> &Path {
+    model
+        .deployment
+        .values
+        .get(SYSTEM_SSH_DIR)
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("/etc/ssh"))
+}
+
+fn host_program<'a>(model: &'a SiteModel, key: &str, fallback: &'a str) -> &'a str {
+    model
+        .deployment
+        .values
+        .get(key)
+        .map(String::as_str)
+        .unwrap_or(fallback)
 }
 
 fn write_public_file_atomic(path: &Path, content: &[u8], mode: u32) -> grafhome_ca::Result<()> {
@@ -3202,14 +3712,15 @@ fn enroll_host(model: &SiteModel, host: &str, token: &str) -> grafhome_ca::Resul
             .arg("--force"),
         &[token],
     )?;
+    normalize_host_certificate_mode(model)?;
     run_status(
-        process("ssh-keygen")
+        process(host_program(model, HOST_SSH_KEYGEN_BIN, "ssh-keygen"))
             .arg("-L")
             .arg("-f")
             .arg(host_cert_path(model)),
     )?;
-    run_status(process("sshd").arg("-t"))?;
-    reload_ssh()
+    run_status(process(host_program(model, HOST_SSHD_BIN, "sshd")).arg("-t"))?;
+    reload_ssh(model)
 }
 
 fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::Result<()> {
@@ -3283,16 +3794,21 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
         &[token.trim()],
         quiet,
     )?;
+    normalize_host_certificate_mode(model)?;
     run_status_quiet(
-        process("ssh-keygen")
+        process(host_program(model, HOST_SSH_KEYGEN_BIN, "ssh-keygen"))
             .arg("-L")
             .arg("-f")
             .arg(host_cert_path(model)),
         &[],
         quiet,
     )?;
-    run_status_quiet(process("sshd").arg("-t"), &[], quiet)?;
-    reload_ssh()
+    run_status_quiet(
+        process(host_program(model, HOST_SSHD_BIN, "sshd")).arg("-t"),
+        &[],
+        quiet,
+    )?;
+    reload_ssh(model)
 }
 
 fn create_user_token(
@@ -3651,7 +4167,9 @@ fn resolve_status_scope(
         return Ok((user, host));
     }
     let host = Some(resolve_host(None)?);
-    let user = if std::env::var("USER").as_deref() == Ok("root") {
+    let user = if nonempty_env(LOCAL_USER_ENV).is_none()
+        && std::env::var("USER").as_deref() == Ok("root")
+    {
         None
     } else {
         Some(resolve_user(None)?)
@@ -3671,7 +4189,11 @@ fn local_renewal_ready(
         });
     };
     match user {
-        Some(user) => user_local_renewal_ready(model, user, host, true),
+        Some(user) => match user_local_renewal_readiness(model, user, host, true)? {
+            UserLocalRenewalReadiness::NotEnrolled => Ok(false),
+            UserLocalRenewalReadiness::Ready { .. } => Ok(true),
+            UserLocalRenewalReadiness::CredentialUnavailable(error) => Err(error),
+        },
         None => Ok(server_root_cert_path(model).is_file()
             && host_material_dir(model, host)
                 .join("provisioner.priv.json")
@@ -3679,17 +4201,34 @@ fn local_renewal_ready(
     }
 }
 
-fn user_local_renewal_ready(
+enum UserLocalRenewalReadiness {
+    NotEnrolled,
+    Ready { password: Option<String> },
+    CredentialUnavailable(grafhome_ca::Error),
+}
+
+fn user_local_renewal_readiness(
     model: &SiteModel,
     user: &str,
     host: &str,
     require_stored_credential: bool,
-) -> grafhome_ca::Result<bool> {
-    Ok(user_root_cert_path(model)?.is_file()
+) -> grafhome_ca::Result<UserLocalRenewalReadiness> {
+    let enrollment_material_present = user_root_cert_path(model)?.is_file()
         && user_client_material_dir(user, host)?
             .join("provisioner.priv.json")
-            .is_file()
-        && (!require_stored_credential || stored_renewal_credential_exists(user, host)?))
+            .is_file();
+    if !enrollment_material_present {
+        return Ok(UserLocalRenewalReadiness::NotEnrolled);
+    }
+    if !require_stored_credential {
+        return Ok(UserLocalRenewalReadiness::Ready { password: None });
+    }
+    Ok(match lookup_renewal_password(user, host) {
+        Ok(password) => UserLocalRenewalReadiness::Ready {
+            password: Some(password),
+        },
+        Err(error) => UserLocalRenewalReadiness::CredentialUnavailable(error),
+    })
 }
 
 fn remote_provisioner_names(
@@ -4548,7 +5087,7 @@ fn try_decrypt_systemd_credential(
     Ok(password)
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 fn backend_command_error(stderr: &[u8], fallback: &str, redactions: &[&str]) -> String {
     let message = redact_text(&String::from_utf8_lossy(stderr), redactions)
         .trim()
@@ -4646,29 +5185,19 @@ fn lookup_macos_keychain_password(user: &str, host: &str) -> grafhome_ca::Result
         .trim_end_matches(['\r', '\n'])
         .to_owned();
     if !output.status.success() || password.is_empty() {
+        let detail = backend_command_error(
+            &output.stderr,
+            "security did not return a renewal password",
+            &[],
+        );
         return Err(grafhome_ca::Error::Validation {
             field: "renewal credential storage".to_owned(),
             message: format!(
-                "no usable renewal password found in macOS Keychain for {user}@{host}; rerun enrollment or use --password-file"
+                "no usable renewal password found in macOS Keychain for {user}@{host}; {detail}. Rerun enrollment or use --password-file"
             ),
         });
     }
     Ok(password)
-}
-
-#[cfg(target_os = "macos")]
-fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
-    Ok(lookup_macos_keychain_password(user, host).is_ok())
-}
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
-fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
-    Ok(renewal_credential_path(user, host)?.is_file())
-}
-
-#[cfg(target_os = "android")]
-fn stored_renewal_credential_exists(user: &str, host: &str) -> grafhome_ca::Result<bool> {
-    Ok(read_app_private_credential(&renewal_credential_path(user, host)?)?.is_some())
 }
 
 fn with_password_file<T>(
@@ -4700,7 +5229,24 @@ fn with_temp_file<T>(
     action(file.path())
 }
 
-fn reload_ssh() -> grafhome_ca::Result<()> {
+fn reload_ssh(model: &SiteModel) -> grafhome_ca::Result<()> {
+    if let Some(sv) = model.deployment.values.get(HOST_SSH_RELOAD_BIN) {
+        let service_dir = &model.deployment.values[HOST_SSH_SERVICE_DIR];
+        return run_status_quiet(
+            process(sv)
+                .env("SVDIR", service_dir)
+                .arg("hup")
+                .arg("sshd"),
+            &[],
+            true,
+        )
+        .map_err(|error| grafhome_ca::Error::Validation {
+                field: "SSH reload".to_owned(),
+                message: format!(
+                    "could not signal the Termux sshd service with `sv hup sshd`: {error}; install termux-services and enable sshd with `sv-enable sshd`"
+                ),
+            });
+    }
     let sshd_error = match run_status_quiet(
         process("systemctl").arg("reload").arg("sshd.service"),
         &[],
@@ -4818,12 +5364,73 @@ mod tests {
 
     use super::{
         CA_REACHABILITY_TIMEOUT, Endpoint, ExistingIdentityChoice, NoncanonicalTerminalMode,
-        effectively_infinite_warning, endpoint_reachable_with, parse_enrollment_document,
-        prepare_existing_user_identity, read_app_private_credential, read_interactive_document,
-        read_terminal_document, renewal_already_running, require_effectively_infinite_confirmation,
-        ssh_public_keys_match, store_app_private_credential, try_renewal_lock,
-        validate_grant_ca_url,
+        TermuxHostRuntime, effectively_infinite_warning, endpoint_reachable_with,
+        normalize_regular_file_mode, parse_enrollment_document, prepare_existing_user_identity,
+        read_app_private_credential, read_interactive_document, read_terminal_document,
+        renewal_already_running, require_effectively_infinite_confirmation, ssh_public_keys_match,
+        store_app_private_credential, try_renewal_lock, validate_grant_ca_url,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_mode_normalization_rejects_symlink_outputs() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let output = dir.path().join("output");
+        fs::write(&target, "content\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &output).unwrap();
+
+        let error = normalize_regular_file_mode(&output, "test output", 0o644)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("output must be a regular file"));
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn termux_private_directories_ignore_a_permissive_umask() {
+        const CHILD: &str = "GRAFHOME_CA_TERMUX_DIRECTORY_UMASK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::termux_private_directories_ignore_a_permissive_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let previous_umask = rustix::process::umask(rustix::fs::Mode::empty());
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = TermuxHostRuntime {
+            home: home.clone(),
+            prefix: dir.path().join("prefix"),
+        };
+        let material = home.join(".config/grafhome/host-step/secrets/hosts/phone");
+
+        runtime
+            .prepare_private_directory(&material, "host credential directory")
+            .unwrap();
+
+        for path in material.ancestors().take_while(|path| *path != home) {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", path.display());
+        }
+        rustix::process::umask(previous_umask);
+    }
 
     fn test_endpoint(address: &str) -> Endpoint {
         Endpoint {
