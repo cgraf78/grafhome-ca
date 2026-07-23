@@ -196,12 +196,12 @@ enum MigrateCommand {
 
 #[derive(Debug, Subcommand)]
 enum ApplyCommand {
-    /// Reconcile live Smallstep provisioner claims with site policy.
+    /// Reconcile live Smallstep CA policy with site policy.
     Ca {
         /// Site config root containing config/ and policy/.
         #[arg(long, value_name = "DIR")]
         config_root: Option<PathBuf>,
-        /// Show affected provisioners without changing or restarting the CA.
+        /// Show affected authority and provisioner policy without changing the CA.
         #[arg(long)]
         dry_run: bool,
     },
@@ -3260,13 +3260,13 @@ fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> 
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
     if dry_run {
         let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
-        print_ca_policy_changes(&result.updated, true)?;
+        print_ca_policy_changes(result.authority_policy_updated, &result.updated, true)?;
         return Ok(());
     }
 
     with_ca_lock(model, || {
         let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
-        if result.updated.is_empty() {
+        if !result.authority_policy_updated && result.updated.is_empty() {
             outln!("CA policy already current.");
             return Ok(());
         }
@@ -3277,21 +3277,35 @@ fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> 
             required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
             || Ok(()),
         )?;
-        print_ca_policy_changes(&result.updated, false)?;
+        print_ca_policy_changes(result.authority_policy_updated, &result.updated, false)?;
         Ok(())
     })
 }
 
-fn print_ca_policy_changes(updated: &[String], dry_run: bool) -> grafhome_ca::Result<()> {
-    if updated.is_empty() {
+fn print_ca_policy_changes(
+    authority_policy_updated: bool,
+    updated: &[String],
+    dry_run: bool,
+) -> grafhome_ca::Result<()> {
+    if !authority_policy_updated && updated.is_empty() {
         outln!("CA policy already current.");
         return Ok(());
+    }
+    if authority_policy_updated {
+        outln!("update\tauthority.policy");
     }
     for name in updated {
         outln!("update\t{name}");
     }
     let action = if dry_run { "Would apply" } else { "Applied" };
-    outln!("{action} CA policy to {} provisioner(s).", updated.len());
+    match (authority_policy_updated, updated.is_empty()) {
+        (true, true) => outln!("{action} CA authority policy."),
+        (true, false) => outln!(
+            "{action} CA authority policy and policy for {} provisioner(s).",
+            updated.len()
+        ),
+        (false, _) => outln!("{action} CA policy to {} provisioner(s).", updated.len()),
+    }
     Ok(())
 }
 

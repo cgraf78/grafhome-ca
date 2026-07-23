@@ -1180,7 +1180,10 @@ fn apply_exposes_only_supported_local_nouns() {
         .args(["apply", "ca", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--dry-run"));
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains(
+            "affected authority and provisioner policy",
+        ));
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -1213,7 +1216,7 @@ fn apply_ca_dry_run_reports_changes_without_writing_or_restarting() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Would apply CA policy to 2 provisioner(s)",
+            "Would apply CA authority policy and policy for 2 provisioner(s)",
         ));
 
     assert_eq!(fs::read(ca_json).unwrap(), original);
@@ -1230,7 +1233,7 @@ fn apply_ca_updates_live_claims_and_skips_a_second_restart() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Applied CA policy to 2 provisioner(s)",
+            "Applied CA authority policy and policy for 2 provisioner(s)",
         ));
 
     let value: serde_json::Value =
@@ -1262,6 +1265,57 @@ fn apply_ca_updates_live_claims_and_skips_a_second_restart() {
     let second_log = fs::read_to_string(&fixture.log).unwrap();
     assert_eq!(
         second_log
+            .matches("systemctl args=restart step-ca.service")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_updates_authority_policy_only_and_removes_retired_principals() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    apply_ca_command(&fixture).assert().success();
+    fs::write(&fixture.log, "").unwrap();
+
+    let mut stale: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
+    stale["authority"]["policy"]["ssh"]["host"]["allow"]["dns"] =
+        serde_json::json!(["retired-host"]);
+    stale["authority"]["policy"]["operatorOwned"] = serde_json::json!({"preserve": true});
+    fs::write(&ca_json, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+    let stale_bytes = fs::read(&ca_json).unwrap();
+
+    apply_ca_command(&fixture)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update\tauthority.policy"))
+        .stdout(predicate::str::contains("Would apply CA authority policy."))
+        .stdout(predicate::str::contains("provisioner(s)").not());
+    assert_eq!(fs::read(&ca_json).unwrap(), stale_bytes);
+    assert_eq!(fs::read_to_string(&fixture.log).unwrap(), "");
+
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Applied CA authority policy."));
+
+    let updated: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&ca_json).unwrap()).unwrap();
+    let dns = updated["authority"]["policy"]["ssh"]["host"]["allow"]["dns"]
+        .as_array()
+        .unwrap();
+    assert!(dns.contains(&serde_json::json!("proxy-host")));
+    assert!(!dns.contains(&serde_json::json!("retired-host")));
+    assert_eq!(
+        updated["authority"]["policy"]["operatorOwned"],
+        serde_json::json!({"preserve": true})
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.log)
+            .unwrap()
             .matches("systemctl args=restart step-ca.service")
             .count(),
         1

@@ -268,6 +268,18 @@ fn rendered_config_can_start_throwaway_step_ca() {
     std::fs::create_dir_all(temp.path().join("step/valuedb")).unwrap();
 
     let config_path = steppath.join("config/rendered-ca.json");
+    config["authority"]["policy"]["ssh"]["host"]["allow"]["dns"] =
+        serde_json::json!(["retired-host"]);
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    let reconciled =
+        grafhome_ca::runtime_provisioners::reconcile_claims(&model, &config_path).unwrap();
+    assert!(reconciled.authority_policy_updated);
+    config = serde_json::from_str(&reconciled.config).unwrap();
+    let host_dns = config["authority"]["policy"]["ssh"]["host"]["allow"]["dns"]
+        .as_array()
+        .unwrap();
+    assert!(host_dns.contains(&serde_json::json!("proxy-host")));
+    assert!(!host_dns.contains(&serde_json::json!("retired-host")));
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
     {
         let mut child = start_step_ca(&config_path, &password);
