@@ -232,21 +232,23 @@ and mark one or more active users with `ssh_admin = true`; policy validation
 then requires every SSH server to retain an active login mapping for at least
 one such user.
 
-After changing CA issuance policy, reconcile the live provisioners on the CA
+After changing CA issuance policy, reconcile the live CA policy on the CA
 origin:
 
 ```sh
-# CA origin as root. Dry-run lists provisioners whose managed claims differ.
+# CA origin as root. Dry-run lists changed authority and provisioner policy.
 grafhome-ca apply ca --dry-run
 grafhome-ca apply ca
 ```
 
-`apply ca` updates Grafhome-owned duration and SSH-CA claims. It preserves
-provisioner keys, unknown claims, renewal-provisioner restrictions, and
-operator-owned provisioners. It also enforces the enrollment provisioners'
-X.509-deny and fixed SSH user/host templates. A change is installed with the
-same backup, restart, health-check, and rollback path used by enrollment; a
-no-op does not restart the CA.
+`apply ca` updates Grafhome-owned authority allow-lists, duration claims, and
+SSH-CA claims. Adding or removing a policy principal therefore updates the live
+CA without redeploying its initial configuration. The command preserves
+unmanaged authority policy fields, provisioner keys, unknown claims,
+renewal-provisioner restrictions, and operator-owned provisioners. It also
+enforces the enrollment provisioners' X.509-deny and fixed SSH user/host
+templates. A change is installed with the same backup, restart, health-check,
+and rollback path used by enrollment; a no-op does not restart the CA.
 
 User enrollment requires one public request copied to the CA and one secret
 grant copied back. User and host default to `GRAFHOME_CA_LOCAL_USER` and

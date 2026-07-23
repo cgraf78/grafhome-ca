@@ -53,6 +53,8 @@ const HOST_BOOTSTRAP_SSH_TEMPLATE: &str = r#"{
 pub struct ClaimsReconciliation {
     /// Updated serialized CA configuration.
     pub config: String,
+    /// Whether the authority-level issuance policy changed.
+    pub authority_policy_updated: bool,
     /// Provisioner names whose managed claims changed.
     pub updated: Vec<String>,
 }
@@ -67,6 +69,7 @@ pub fn reconcile_claims(
     let user = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
     let host = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
     let proxy = active_provisioner(model, PROVISIONER_ROLE_PROXY_X509)?;
+    let authority_policy_updated = reconcile_authority_policy(model, &mut config, ca_json)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
     let mut updated = Vec::new();
 
@@ -102,8 +105,64 @@ pub fn reconcile_claims(
 
     Ok(ClaimsReconciliation {
         config: serialize_config(config, ca_json)?,
+        authority_policy_updated,
         updated,
     })
+}
+
+fn reconcile_authority_policy(
+    model: &SiteModel,
+    config: &mut Value,
+    ca_json: &Path,
+) -> Result<bool> {
+    let desired = crate::render::ca_authority_policy(model)?;
+    let authority = config
+        .get_mut("authority")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority", ca_json.display()),
+            message: "expected object".to_owned(),
+        })?;
+    let live = authority.entry("policy").or_insert_with(|| json!({}));
+    let mut changed = false;
+    for path in [
+        &["x509", "allow", "dns"][..],
+        &["x509", "allowWildcardNames"],
+        &["ssh", "user", "allow", "principal"],
+        &["ssh", "host", "allow", "dns"],
+        &["ssh", "host", "allow", "ip"],
+    ] {
+        changed |= reconcile_managed_value(live, &desired, path, ca_json)?;
+    }
+    Ok(changed)
+}
+
+fn reconcile_managed_value(
+    live: &mut Value,
+    desired: &Value,
+    path: &[&str],
+    ca_json: &Path,
+) -> Result<bool> {
+    let Some((field, rest)) = path.split_first() else {
+        return Ok(false);
+    };
+    let desired = desired.get(*field).ok_or_else(|| Error::Validation {
+        field: format!("rendered authority policy:{}", path.join(".")),
+        message: "missing managed field".to_owned(),
+    })?;
+    let live = live.as_object_mut().ok_or_else(|| Error::Validation {
+        field: format!("{}:authority.policy.{}", ca_json.display(), path.join(".")),
+        message: "expected object".to_owned(),
+    })?;
+    if rest.is_empty() {
+        if live.get(*field) == Some(desired) {
+            return Ok(false);
+        }
+        live.insert((*field).to_owned(), desired.clone());
+        return Ok(true);
+    }
+    let child = live.entry((*field).to_owned()).or_insert_with(|| json!({}));
+    reconcile_managed_value(child, desired, rest, ca_json)
 }
 
 fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provisioner> {
@@ -1036,6 +1095,62 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn reconciles_authority_policy_allow_lists_without_replacing_other_state() {
+        let dir = tempdir().unwrap();
+        let model = SiteModel::load(crate::example_config_root()).unwrap();
+        let rendered = crate::render::render(&model).unwrap();
+        let rendered_ca_json = rendered
+            .iter()
+            .find(|file| file.path.ends_with("step/config/ca.json"))
+            .unwrap();
+        let desired: Value = serde_json::from_str(&rendered_ca_json.content).unwrap();
+        let mut live = desired.clone();
+        live["authority"]["policy"]["x509"]["allow"]["dns"] = json!(["stale.example.test"]);
+        live["authority"]["policy"]["x509"]["allowWildcardNames"] = json!(true);
+        live["authority"]["policy"]["ssh"]["user"]["allow"]["principal"] = json!(["stale-user"]);
+        live["authority"]["policy"]["ssh"]["host"]["allow"]["dns"] = json!(["retired-host"]);
+        live["authority"]["policy"]["ssh"]["host"]["allow"]["ip"] = json!(["192.0.2.1"]);
+        live["authority"]["policy"]["x509"]["operatorOwned"] = json!({"preserve": "x509"});
+        live["authority"]["policy"]["ssh"]["host"]["operatorOwned"] =
+            json!({"preserve": "ssh-host"});
+        live["authority"]["policy"]["operatorOwned"] = json!({"preserve": true});
+
+        let ca_json = dir.path().join("ca.json");
+        fs::write(&ca_json, serde_json::to_vec_pretty(&live).unwrap()).unwrap();
+
+        let result = reconcile_claims(&model, &ca_json).unwrap();
+        let updated: Value = serde_json::from_str(&result.config).unwrap();
+        assert_eq!(
+            updated["authority"]["policy"]["x509"]["allow"],
+            desired["authority"]["policy"]["x509"]["allow"]
+        );
+        assert_eq!(
+            updated["authority"]["policy"]["x509"]["allowWildcardNames"],
+            desired["authority"]["policy"]["x509"]["allowWildcardNames"]
+        );
+        assert_eq!(
+            updated["authority"]["policy"]["ssh"]["user"]["allow"],
+            desired["authority"]["policy"]["ssh"]["user"]["allow"]
+        );
+        assert_eq!(
+            updated["authority"]["policy"]["ssh"]["host"]["allow"],
+            desired["authority"]["policy"]["ssh"]["host"]["allow"]
+        );
+        assert_eq!(
+            updated["authority"]["policy"]["x509"]["operatorOwned"],
+            json!({"preserve": "x509"})
+        );
+        assert_eq!(
+            updated["authority"]["policy"]["ssh"]["host"]["operatorOwned"],
+            json!({"preserve": "ssh-host"})
+        );
+        assert_eq!(
+            updated["authority"]["policy"]["operatorOwned"],
+            json!({"preserve": true})
+        );
+    }
 
     #[test]
     fn reconciles_live_managed_claims_without_replacing_other_state() {

@@ -480,6 +480,23 @@ fn rendered_ca_json(model: &SiteModel) -> Result<String> {
     )
 }
 
+/// Return the authority policy rendered from the current site policy.
+pub fn ca_authority_policy(model: &SiteModel) -> Result<Value> {
+    let path = PathBuf::from("rendered/step/config/ca.json");
+    let config: Value =
+        serde_json::from_str(&rendered_ca_json(model)?).map_err(|source| Error::Json {
+            path: path.clone(),
+            source,
+        })?;
+    config
+        .pointer("/authority/policy")
+        .cloned()
+        .ok_or_else(|| Error::Validation {
+            field: path.display().to_string(),
+            message: "rendered CA configuration is missing authority policy".to_owned(),
+        })
+}
+
 fn provisioners_json(provisioners: &[Provisioner]) -> Result<String> {
     let mut rendered = Vec::new();
     for provisioner in provisioners.iter().filter(|entry| entry.status.is_active()) {
