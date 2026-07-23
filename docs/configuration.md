@@ -5,6 +5,37 @@ belongs under `${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/config/deployment.env`
 in private site configuration. Derived values are computed by code instead of
 being stored independently.
 
+## Local Policy Identity Overrides
+
+`GRAFHOME_CA_LOCAL_HOST` and `GRAFHOME_CA_LOCAL_USER` override operating-system
+hostname and account-name inference for commands that operate on the local
+identity. They also define the default scope for `status` when it has no
+filters; an explicit `status --host` or `status --user` remains a deliberate
+query and does not fill the other filter from the environment. The variables
+identify the stable policy host and policy user for the machine running
+`grafhome-ca`; they do not select a remote SSH destination or login account.
+Explicit CLI flags take precedence over these variables.
+
+Set these process environment variables only on systems whose local identities
+do not match policy, such as Termux. They are runtime inputs, not
+`config/deployment.env` keys. Empty values are ignored.
+
+Termux host lifecycle commands also use the standard `TERMUX_VERSION`, `HOME`,
+and `PREFIX` environment to select the app-owned OpenSSH runtime. Host Step
+state and the app owner's explicit SSH principals file are derived under
+`HOME`; `step-cli`, SSH host keys, trust files, and configuration are derived
+under `PREFIX`. Android's system-owned app-data ancestors do not satisfy
+OpenSSH's POSIX ownership checks, so the Termux-only fragment disables
+`StrictModes`. The backend instead validates the app-owned trees recursively,
+rejects symlinks and group- or other-writable paths, and creates the dedicated
+principals directories with owner-only permissions. Android's application
+sandbox protects the system-owned ancestors. The Termux fragment also sets
+`AuthorizedKeysFile none`, so SSH public-key authentication there is CA-only
+and cannot bypass these checks through an unrelated static key file. The
+site-wide deployment values stay portable and are not rewritten with one
+device's application path. Policy host and user names remain site choices; the
+Termux backend does not prescribe particular identity values.
+
 ## `config/deployment.env`
 
 This file uses literal `KEY=value` lines. It is not shell-sourced; do not quote

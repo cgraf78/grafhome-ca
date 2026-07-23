@@ -177,13 +177,32 @@ host certificate and trust configuration, proves JWK renewal works, validates
 `sshd`, and reloads it. Scheduled renewal runs `grafhome-ca renew host`; site
 policy retains each host's configured renewal owner.
 
+On Termux, run host lifecycle commands as the Termux app owner rather than
+through `sudo`. When `TERMUX_VERSION`, `HOME`, and `PREFIX` identify a protected
+Termux installation, `grafhome-ca` keeps host Step state under
+`$HOME/.config/grafhome/host-step`, uses `$PREFIX/bin/step-cli`, and installs
+OpenSSH policy and the host certificate under `$PREFIX/etc/ssh`. The app
+owner's explicit principals file lives under `$HOME/.ssh/grafhome` and is
+protected by Grafhome's recursive ownership, mode, and symlink checks plus
+Android's app sandbox. The Termux-only fragment disables `StrictModes` because
+Android's system-owned app-data ancestors cannot satisfy its POSIX checks;
+it also disables static `authorized_keys`, making Termux public-key login
+CA-only. System OpenSSH hosts retain their existing behavior. Grafhome reloads an enabled
+`termux-services` job with `sv hup sshd`. Install `termux-services` and run
+`sv-enable sshd` before enrollment. Because Termux maps SSH logins onto one
+Android app account, the generated server policy uses one explicit app-owner
+principals file containing the principals authorized by site policy; it does
+not depend on Android's device-specific account name.
+
 After changing and distributing site policy, preview and activate the affected
 host's OpenSSH policy locally:
 
 ```sh
-# Affected host as root. The hostname is inferred and cannot target another host.
+# Affected system host as root, or Termux host as its app owner.
 grafhome-ca apply host --dry-run
 grafhome-ca apply host
+# When OS inference is unsuitable, select the local policy identity explicitly.
+grafhome-ca apply host --host policy-host
 ```
 
 `apply host` uses the same validated site model and pinned CA trust as
@@ -191,6 +210,8 @@ enrollment. It reconciles only Grafhome-managed OpenSSH files for the local
 host, including the dedicated authorized-principals directory, then validates
 `sshd` and reloads SSH. A no-op does not reload SSH. If validation or reload
 fails, the command restores the previous files and reloads that configuration.
+`--host` selects the policy identity applied to this machine and overrides
+`GRAFHOME_CA_LOCAL_HOST`; it is not a remote destination.
 Removing an authorization row therefore removes its stale principals file on
 the affected host. This changes login authorization; it does not revoke an
 enrollment or an already-issued certificate, which remains the responsibility
@@ -228,8 +249,11 @@ same backup, restart, health-check, and rollback path used by enrollment; a
 no-op does not restart the CA.
 
 User enrollment requires one public request copied to the CA and one secret
-grant copied back. User and host default to the current account and short
-hostname, so normal enrollment needs no identity flags:
+grant copied back. User and host default to `GRAFHOME_CA_LOCAL_USER` and
+`GRAFHOME_CA_LOCAL_HOST` when set, then to the current account and short
+hostname, so normal enrollment needs no identity flags. The environment
+variables describe local policy identities, not a remote SSH destination or
+login account, and explicit `--user` and `--host` flags take precedence:
 
 ```sh
 # Client host. Enter the renewal password once and leave this running.
@@ -252,7 +276,8 @@ to use it (the default), replace it, or cancel. Reuse verifies that the public
 key matches the private key before creating the Grafhome renewal credential.
 
 Scheduled renewal should run
-`grafhome-ca renew host --if-enrolled --if-reachable --quiet` as root and
+`grafhome-ca renew host --if-enrolled --if-reachable --quiet` as root on a
+system OpenSSH host or as the app owner on Termux, and
 `grafhome-ca renew user --if-enrolled --if-reachable --quiet` as the enrolled
 user. Both commands infer the local identity, skip fresh certificates, and
 return successfully without output when enrollment or local renewal material
@@ -376,11 +401,14 @@ input chain must be root-owned.
 System host lifecycle commands (`enroll host`, `renew host`, and `apply host`)
 and CA state commands (`materialize`, `migrate enrollment-provisioner-keys`,
 `apply ca`, `approve host`, `approve user`, `revoke host`, and `revoke user`)
-enforce an effective UID of root. A non-root invocation fails before reading
-enrollment input or changing state. The test suite may exercise these paths
-without root only when configuration, CA state, keys, helper tools, and any
-redirected installation targets are all confined beneath one protected
-temporary sandbox; normal site configuration cannot use that exception.
+enforce an effective UID of root. Termux host lifecycle commands instead accept
+the unprivileged app owner after verifying that `HOME` and `PREFIX` are absolute,
+owner-controlled directories without group or other write access; all host
+state and OpenSSH targets are then derived beneath those roots. Other non-root
+invocations fail before reading enrollment input or changing state. The test
+suite may also exercise system paths without root only when configuration, CA
+state, keys, helper tools, and redirected installation targets are confined
+beneath one protected temporary sandbox.
 
 This release replaces the old direct `user-login` and shared SSHPOP renewal
 flows. Site policy should use

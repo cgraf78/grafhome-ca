@@ -101,7 +101,16 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
             content: String::new(),
         });
         files.push(RenderedFile {
-            path: host_path(&host.host, "etc/ssh/sshd_config.d/grafhome-ca.conf")?,
+            path: host_path(
+                &host.host,
+                absolute_child(
+                    variables
+                        .get("GRAFHOME_CA_SYSTEM_SSH_DIR")
+                        .map(String::as_str)
+                        .unwrap_or("/etc/ssh"),
+                    "sshd_config.d/grafhome-ca.conf",
+                )?,
+            )?,
             mode: 0o644,
             content: render_template(
                 include_str!("../templates/sshd_config.d/grafhome-ca.conf.template"),
@@ -131,7 +140,16 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
             content: String::new(),
         });
         files.push(RenderedFile {
-            path: host_path(&host.host, "etc/ssh/ssh_config.d/grafhome-ca.conf")?,
+            path: host_path(
+                &host.host,
+                absolute_child(
+                    variables
+                        .get("GRAFHOME_CA_SYSTEM_SSH_DIR")
+                        .map(String::as_str)
+                        .unwrap_or("/etc/ssh"),
+                    "ssh_config.d/grafhome-ca.conf",
+                )?,
+            )?,
             mode: 0o644,
             content: render_template(
                 include_str!("../templates/ssh_config.d/grafhome-ca.conf.template"),
@@ -353,6 +371,23 @@ fn required_host<'a>(model: &'a SiteModel, name: &str) -> Result<&'a Host> {
 
 fn variables(model: &SiteModel) -> Result<BTreeMap<String, String>> {
     let mut variables = model.deployment.values.clone();
+    variables
+        .entry("GRAFHOME_CA_SYSTEM_SSH_DIR".to_owned())
+        .or_insert_with(|| "/etc/ssh".to_owned());
+    variables
+        .entry("GRAFHOME_CA_AUTH_PRINCIPALS_FILE".to_owned())
+        .or_insert_with(|| {
+            format!(
+                "{}/%u",
+                model.deployment.values["GRAFHOME_CA_AUTH_PRINCIPALS_DIR"]
+            )
+        });
+    variables
+        .entry("GRAFHOME_CA_STRICT_MODES".to_owned())
+        .or_insert_with(|| "yes".to_owned());
+    variables
+        .entry("GRAFHOME_CA_AUTHORIZED_KEYS_DIRECTIVE".to_owned())
+        .or_default();
     let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let ca_origin = required_endpoint(model, ENDPOINT_ROLE_CA_ORIGIN)?;
     variables.insert(
@@ -571,6 +606,21 @@ fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedF
             .entry(access.unix_account.clone())
             .or_default()
             .push(user.principal.clone());
+    }
+
+    if let Some(path) = model
+        .deployment
+        .values
+        .get("GRAFHOME_CA_AUTH_PRINCIPALS_FILE")
+    {
+        let mut principals = by_account.into_values().flatten().collect::<Vec<_>>();
+        principals.sort();
+        principals.dedup();
+        return Ok(vec![RenderedFile {
+            path: host_path(&host.host, path)?,
+            mode: 0o644,
+            content: format!("{}\n", principals.join("\n")),
+        }]);
     }
 
     let mut files = Vec::new();
@@ -814,6 +864,63 @@ mod tests {
     }
 
     #[test]
+    fn custom_trust_directory_does_not_relocate_openssh_fragments() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.deployment.values.insert(
+            "GRAFHOME_CA_SSH_TRUST_DIR".to_owned(),
+            "/var/lib/grafhome/trust".to_owned(),
+        );
+
+        let files = render(&model).unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains("hosts/ca-host/etc/ssh/sshd_config.d/grafhome-ca.conf"));
+        assert!(paths.contains("hosts/ca-host/etc/ssh/ssh_config.d/grafhome-ca.conf"));
+        assert!(paths.contains("hosts/ca-host/var/lib/grafhome/trust/user_ca_keys.pem"));
+        assert!(paths.contains("hosts/ca-host/etc/ssh/auth_principals/alice"));
+    }
+
+    #[test]
+    fn termux_owner_uses_one_explicit_principals_file() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.deployment.values.insert(
+            "GRAFHOME_CA_AUTH_PRINCIPALS_FILE".to_owned(),
+            "/data/data/com.termux/files/home/.ssh/grafhome/termux-owner".to_owned(),
+        );
+        model
+            .deployment
+            .values
+            .insert("GRAFHOME_CA_STRICT_MODES".to_owned(), "no".to_owned());
+        model.deployment.values.insert(
+            "GRAFHOME_CA_AUTHORIZED_KEYS_DIRECTIVE".to_owned(),
+            "AuthorizedKeysFile none".to_owned(),
+        );
+
+        let files = render(&model).unwrap();
+        let principals = files
+            .iter()
+            .find(|file| file.path.ends_with(".ssh/grafhome/termux-owner"))
+            .unwrap();
+        let sshd = files
+            .iter()
+            .find(|file| {
+                file.path
+                    .ends_with("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            })
+            .unwrap();
+
+        assert_eq!(principals.content, "alice\n");
+        assert!(sshd.content.contains(
+            "AuthorizedPrincipalsFile /data/data/com.termux/files/home/.ssh/grafhome/termux-owner"
+        ));
+        assert!(sshd.content.contains("StrictModes no"));
+        assert!(sshd.content.contains("AuthorizedKeysFile none"));
+    }
+
+    #[test]
     fn rendered_apache_proxy_fragment_verifies_https_origin() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
         let files = render(&model).unwrap();
@@ -949,6 +1056,8 @@ mod tests {
                 .ends_with("etc/ssh/sshd_config.d/grafhome-ca.conf")
         }) {
             assert!(file.content.contains("PermitRootLogin no"));
+            assert!(file.content.contains("StrictModes yes"));
+            assert!(!file.content.contains("AuthorizedKeysFile"));
             assert!(
                 file.content
                     .contains("HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub")

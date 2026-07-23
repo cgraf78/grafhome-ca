@@ -13,17 +13,76 @@ use crate::error::{Error, Result};
 /// rename rules still protect entries owned by the trusted account.
 #[cfg(unix)]
 pub fn validate_config_root(config_root: impl AsRef<Path>, trusted_uid: u32) -> Result<()> {
+    validate_config_root_with_boundary(config_root.as_ref(), trusted_uid, None)
+}
+
+/// Validate config provenance beneath an already trusted filesystem boundary.
+///
+/// This is intended for application sandboxes whose system-owned ancestors do
+/// not use ordinary root ownership. Lexical paths and resolved symlink targets
+/// must remain beneath `boundary`. The returned canonical path must be used for
+/// subsequent reads so a validated config-root alias cannot be swapped.
+#[cfg(unix)]
+pub fn validate_config_root_beneath(
+    config_root: impl AsRef<Path>,
+    trusted_uid: u32,
+    boundary: impl AsRef<Path>,
+) -> Result<PathBuf> {
     let config_root = absolute(config_root.as_ref())?;
+    let lexical_boundary = absolute(boundary.as_ref())?;
+    if config_root
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+        || lexical_boundary
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        || !config_root.starts_with(&lexical_boundary)
+    {
+        return Err(provenance_error(
+            &config_root,
+            &format!("path must remain beneath {}", lexical_boundary.display()),
+        ));
+    }
+
+    let boundary = std::fs::canonicalize(&lexical_boundary)
+        .map_err(|source| Error::io(&lexical_boundary, source))?;
+    let resolved_config_root =
+        std::fs::canonicalize(&config_root).map_err(|source| Error::io(&config_root, source))?;
+    if !resolved_config_root.starts_with(&boundary) {
+        return Err(provenance_error(
+            &resolved_config_root,
+            &format!("path must remain beneath {}", boundary.display()),
+        ));
+    }
+
     let mut checked = BTreeSet::new();
-    check_chain(&config_root, trusted_uid, &mut checked)?;
+    check_chain(
+        &config_root,
+        trusted_uid,
+        Some(&lexical_boundary),
+        &mut checked,
+    )?;
+    validate_config_root_with_boundary(&resolved_config_root, trusted_uid, Some(&boundary))?;
+    Ok(resolved_config_root)
+}
+
+#[cfg(unix)]
+fn validate_config_root_with_boundary(
+    config_root: &Path,
+    trusted_uid: u32,
+    boundary: Option<&Path>,
+) -> Result<()> {
+    let config_root = absolute(config_root)?;
+    let mut checked = BTreeSet::new();
+    check_chain(&config_root, trusted_uid, boundary, &mut checked)?;
 
     // Canonical policy discovers per-host files dynamically. Protect both the
     // lexical and resolved directory before trusting its directory entries.
     if config_root.join(crate::policy::CA_POLICY_PATH).exists() {
         let hosts = config_root.join(crate::policy::HOST_POLICY_DIR);
-        check_chain(&hosts, trusted_uid, &mut checked)?;
+        check_chain(&hosts, trusted_uid, boundary, &mut checked)?;
         let resolved = std::fs::canonicalize(&hosts).map_err(|source| Error::io(&hosts, source))?;
-        check_chain(&resolved, trusted_uid, &mut checked)?;
+        check_chain(&resolved, trusted_uid, boundary, &mut checked)?;
         if !std::fs::metadata(&resolved)
             .map_err(|source| Error::io(&resolved, source))?
             .is_dir()
@@ -37,9 +96,9 @@ pub fn validate_config_root(config_root: impl AsRef<Path>, trusted_uid: u32) -> 
 
     for relative in crate::schema::config_input_paths(&config_root)? {
         let input = config_root.join(relative);
-        check_chain(&input, trusted_uid, &mut checked)?;
+        check_chain(&input, trusted_uid, boundary, &mut checked)?;
         let resolved = std::fs::canonicalize(&input).map_err(|source| Error::io(&input, source))?;
-        check_chain(&resolved, trusted_uid, &mut checked)?;
+        check_chain(&resolved, trusted_uid, boundary, &mut checked)?;
         let metadata =
             std::fs::metadata(&resolved).map_err(|source| Error::io(&resolved, source))?;
         if !metadata.is_file() {
@@ -58,6 +117,19 @@ pub fn validate_config_root(_config_root: impl AsRef<Path>, _trusted_uid: u32) -
     })
 }
 
+/// Report that bounded filesystem provenance is unsupported on this platform.
+#[cfg(not(unix))]
+pub fn validate_config_root_beneath(
+    _config_root: impl AsRef<Path>,
+    _trusted_uid: u32,
+    _boundary: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    Err(Error::Validation {
+        field: "config provenance".to_owned(),
+        message: "privileged policy commands require Unix ownership semantics".to_owned(),
+    })
+}
+
 #[cfg(unix)]
 fn absolute(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
@@ -69,10 +141,31 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn check_chain(path: &Path, trusted_uid: u32, checked: &mut BTreeSet<PathBuf>) -> Result<()> {
+fn check_chain(
+    path: &Path,
+    trusted_uid: u32,
+    boundary: Option<&Path>,
+    checked: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    for component in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+    if let Some(boundary) = boundary {
+        if path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+            || !path.starts_with(boundary)
+        {
+            return Err(provenance_error(
+                path,
+                &format!("path must remain beneath {}", boundary.display()),
+            ));
+        }
+    }
+    let components = path
+        .ancestors()
+        .take_while(|component| boundary.is_none_or(|root| component.starts_with(root)))
+        .collect::<Vec<_>>();
+    for component in components.into_iter().rev() {
         if component.as_os_str().is_empty() || !checked.insert(component.to_path_buf()) {
             continue;
         }
@@ -117,7 +210,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::validate_config_root;
+    use super::{validate_config_root, validate_config_root_beneath};
 
     fn fixture() -> tempfile::TempDir {
         let dir = tempdir().expect("temporary config root");
@@ -146,6 +239,68 @@ mod tests {
         let uid = fs::metadata(dir.path()).unwrap().uid();
 
         validate_config_root(dir.path().join("grafhome-ca"), uid).unwrap();
+    }
+
+    #[test]
+    fn bounded_validation_accepts_inputs_beneath_the_trusted_boundary() {
+        let dir = fixture();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        validate_config_root_beneath(dir.path().join("grafhome-ca"), uid, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn bounded_validation_accepts_a_canonical_alias_of_the_boundary() {
+        let dir = fixture();
+        let boundary = dir.path().join("sandbox");
+        let alias = dir.path().join("sandbox-alias");
+        fs::create_dir(&boundary).unwrap();
+        fs::rename(dir.path().join("grafhome-ca"), boundary.join("grafhome-ca")).unwrap();
+        std::os::unix::fs::symlink(&boundary, &alias).unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        let validated =
+            validate_config_root_beneath(alias.join("grafhome-ca"), uid, &alias).unwrap();
+
+        assert_eq!(
+            validated,
+            fs::canonicalize(boundary.join("grafhome-ca")).unwrap()
+        );
+    }
+
+    #[test]
+    fn bounded_validation_rejects_a_config_root_outside_the_boundary() {
+        let dir = fixture();
+        let boundary = dir.path().join("sandbox");
+        fs::create_dir(&boundary).unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        let error = validate_config_root_beneath(dir.path().join("grafhome-ca"), uid, &boundary)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("must remain beneath"));
+    }
+
+    #[test]
+    fn bounded_validation_rejects_a_resolved_input_outside_the_boundary() {
+        let dir = fixture();
+        let root = dir.path().join("grafhome-ca");
+        let boundary = dir.path().join("sandbox");
+        fs::create_dir(&boundary).unwrap();
+        fs::rename(&root, boundary.join("grafhome-ca")).unwrap();
+        let root = boundary.join("grafhome-ca");
+        let input = root.join("policy/hosts/ca-host.toml");
+        let outside = dir.path().join("outside-host.toml");
+        fs::rename(&input, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &input).unwrap();
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+
+        let error = validate_config_root_beneath(&root, uid, &boundary)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("must remain beneath"));
     }
 
     #[test]

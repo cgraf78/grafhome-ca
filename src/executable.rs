@@ -46,7 +46,7 @@ fn user_step_bin_in(path: Option<&OsStr>, names: &[&str]) -> Result<String> {
     })
 }
 
-/// Resolve the Smallstep CLI used by privileged operations.
+/// Resolve the Smallstep CLI used by system or host-owner operations.
 ///
 /// The configured path remains authoritative when it is usable. Standard
 /// system locations and `PATH` provide cross-platform fallback, but a root
@@ -64,11 +64,16 @@ pub fn root_step_bin(model: &SiteModel) -> Result<String> {
             return Ok(path.to_string_lossy().into_owned());
         }
     }
+    let guidance = if std::env::var("TERMUX_VERSION").is_ok() && cfg!(target_os = "android") {
+        "Install Termux's `step-cli` package"
+    } else {
+        "Install a root-owned copy at /usr/local/bin/step"
+    };
     Err(Error::Validation {
         field: "step executable".to_owned(),
         message: format!(
-            "no trusted step executable is available; configured path {} is missing or unsafe. Install a root-owned copy at /usr/local/bin/step",
-            configured.display()
+            "no trusted step executable is available; configured path {} is missing or unsafe. {guidance}",
+            configured.display(),
         ),
     })
 }

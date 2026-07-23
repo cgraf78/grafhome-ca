@@ -228,7 +228,15 @@ case "$1 $2" in
     fi
     pub="$4"
     cert="${pub%.pub}-cert.pub"
+    if [ "${FAKE_REQUIRE_PRIOR_HOST_CERT_MODE:-}" = "1" ] && [ -e "$cert" ]; then
+      permissions=$(LC_ALL=C ls -ld "$cert" | cut -c 1-10)
+      if [ "$permissions" != "-rw-r--r--" ]; then
+        printf 'prior host certificate mode was %s, expected -rw-r--r--\n' "$permissions" >&2
+        exit 43
+      fi
+    fi
     printf 'cert token=%s\n' "$token" > "$cert"
+    chmod 0666 "$cert"
     printf 'signed %s\n' "$cert"
     ;;
   "ssh config")
@@ -338,6 +346,13 @@ if [ "${FAKE_SYSTEMCTL_RELOAD_FAIL_PAIR:-}" = "1" ] && [ "$1" = "reload" ]; then
 fi
 if [ "$1" = "restart" ]; then touch "$FAKE_LOG.restarted"; fi
 if [ "$1" = "is-active" ]; then printf 'active\n'; fi
+"#,
+    );
+    write_executable(
+        &fake_bin.join("sv"),
+        r#"#!/bin/sh
+set -eu
+printf 'sv args=%s\n' "$*" >> "$FAKE_LOG"
 "#,
     );
     write_executable(
@@ -564,6 +579,33 @@ fn configure_step_path_fallback(dir: &tempfile::TempDir, fixture: &ExecFixture) 
     );
     fs::write(deployment_path, deployment).unwrap();
     format!("{}:{}", path_bin.display(), prepend_path(&fixture.fake_bin))
+}
+
+#[cfg(unix)]
+fn prepare_termux_host_runtime(
+    dir: &tempfile::TempDir,
+    fixture: &ExecFixture,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let home = dir.path().join("termux-home");
+    let prefix = dir.path().join("termux-prefix");
+    let bin = prefix.join("bin");
+    let ssh = prefix.join("etc/ssh");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&ssh).unwrap();
+    for executable in ["ssh-keygen", "sshd", "sv"] {
+        fs::copy(fixture.fake_bin.join(executable), bin.join(executable)).unwrap();
+        fs::set_permissions(bin.join(executable), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::copy(fixture.fake_bin.join("step"), bin.join("step-cli")).unwrap();
+    fs::set_permissions(bin.join("step-cli"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(ssh.join("ssh_host_ed25519_key"), "host-private\n").unwrap();
+    fs::write(
+        ssh.join("ssh_host_ed25519_key.pub"),
+        "ssh-ed25519 AAAAhostpublic fixture\n",
+    )
+    .unwrap();
+    (home, prefix, bin)
 }
 
 #[cfg(unix)]
@@ -855,6 +897,23 @@ fn apply_host_dry_run_does_not_write_or_reload() {
 
 #[cfg(unix)]
 #[test]
+fn apply_host_explicit_host_overrides_the_policy_identity_environment() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .args(["--host", "proxy-host", "--dry-run"])
+        .env("GRAFHOME_CA_LOCAL_HOST", "wrong-host")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Would apply 6 host policy change(s) for proxy-host",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
 fn apply_host_installs_fresh_local_policy() {
     let (dir, fixture) = exec_fixture();
     let install_root = dir.path().join("install");
@@ -927,6 +986,160 @@ fn quiet_apply_host_reconciles_an_enrolled_host_without_routine_output() {
     assert!(log.contains("systemctl args=reload sshd.service"));
 }
 
+#[cfg(all(unix, target_os = "android"))]
+#[test]
+fn termux_owner_applies_host_policy_under_the_app_prefix() {
+    let (dir, fixture) = exec_fixture();
+    let (home, prefix, bin) = prepare_termux_host_runtime(&dir, &fixture);
+    let config_root = home.join("grafhome-ca");
+    copy_dir(&fixture.config_root, &config_root);
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "host", "--config-root"])
+        .arg(&config_root)
+        .env("HOME", &home)
+        .env("PREFIX", &prefix)
+        .env("TERMUX_VERSION", "0.118-test")
+        .env("GRAFHOME_CA_LOCAL_HOST", "proxy-host")
+        .env("PATH", &bin)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied 6 host policy change(s) for proxy-host",
+        ));
+
+    let ssh_dir = prefix.join("etc/ssh");
+    let server_config = fs::read_to_string(ssh_dir.join("sshd_config.d/grafhome-ca.conf")).unwrap();
+    assert!(server_config.contains(&format!(
+        "HostCertificate {}/etc/ssh/ssh_host_ed25519_key-cert.pub",
+        prefix.display()
+    )));
+    assert!(server_config.contains(&format!(
+        "TrustedUserCAKeys {}/etc/ssh/grafhome/user_ca_keys.pem",
+        prefix.display()
+    )));
+    assert!(server_config.contains(&format!(
+        "AuthorizedPrincipalsFile {}/.ssh/grafhome/termux-owner",
+        home.display()
+    )));
+    assert!(server_config.contains("StrictModes no"));
+    assert!(server_config.contains("AuthorizedKeysFile none"));
+    assert_eq!(
+        fs::read_to_string(home.join(".ssh/grafhome/termux-owner")).unwrap(),
+        "alice\n"
+    );
+    assert!(ssh_dir.join("ssh_config.d/grafhome-ca.conf").is_file());
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("step STEPPATH="));
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("sv args=hup sshd"));
+    assert!(!log.contains("systemctl args="));
+}
+
+#[cfg(all(unix, target_os = "android"))]
+#[test]
+fn termux_owner_creates_and_renews_host_enrollment_under_home() {
+    let (dir, fixture) = exec_fixture();
+    let (home, prefix, bin) = prepare_termux_host_runtime(&dir, &fixture);
+    let config_root = home.join("grafhome-ca");
+    copy_dir(&fixture.config_root, &config_root);
+    let mut enroll = Command::cargo_bin("grafhome-ca").unwrap();
+    enroll
+        .args(["enroll", "host", "--request-only", "--config-root"])
+        .arg(&config_root)
+        .env("HOME", &home)
+        .env("PREFIX", &prefix)
+        .env("TERMUX_VERSION", "0.118-test")
+        .env("GRAFHOME_CA_LOCAL_HOST", "proxy-host")
+        .env("PATH", &bin)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("REQUEST:{\"version\":1"));
+
+    let host_step = home.join(".config/grafhome/host-step");
+    let material = host_step.join("secrets/hosts/proxy-host");
+    assert!(material.join("pending-enrollment.json").is_file());
+    assert!(material.join("provisioner.priv.json").is_file());
+    assert!(material.join("renewal-password").is_file());
+    fs::create_dir_all(host_step.join("certs")).unwrap();
+    fs::write(host_step.join("certs/root_ca.crt"), "root\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["renew", "host", "--config-root"])
+        .arg(&config_root)
+        .env("HOME", &home)
+        .env("PREFIX", &prefix)
+        .env("TERMUX_VERSION", "0.118-test")
+        .env("GRAFHOME_CA_LOCAL_HOST", "proxy-host")
+        .env("PATH", &bin)
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    assert!(
+        prefix
+            .join("etc/ssh/ssh_host_ed25519_key-cert.pub")
+            .is_file()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("step STEPPATH="));
+    assert!(log.contains("ca token proxy-host --ssh --host"));
+    assert!(log.contains("sv args=hup sshd"));
+    assert!(!log.contains("systemctl args="));
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+#[test]
+fn termux_environment_alone_does_not_enable_desktop_owner_mode() {
+    let (dir, fixture) = exec_fixture();
+    let (home, prefix, bin) = prepare_termux_host_runtime(&dir, &fixture);
+    let install_root = dir.path().join("desktop-install-root");
+
+    let mut command = Command::cargo_bin("grafhome-ca").unwrap();
+    command
+        .args(["apply", "host", "--config-root"])
+        .arg(&fixture.config_root)
+        .arg("--dry-run")
+        .env("HOME", &home)
+        .env("PREFIX", &prefix)
+        .env("TERMUX_VERSION", "injected")
+        .env("GRAFHOME_CA_INSTALL_ROOT", &install_root)
+        .env("GRAFHOME_CA_LOCAL_HOST", "proxy-host")
+        .env("PATH", &bin)
+        .env("FAKE_LOG", &fixture.log);
+
+    if rustix::process::geteuid().as_raw() == 0 {
+        command.assert().success().stdout(predicate::str::contains(
+            install_root.join("etc/ssh").display().to_string(),
+        ));
+    } else {
+        command
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("must be run as root"));
+    }
+
+    let log = fs::read_to_string(&fixture.log).unwrap_or_default();
+    assert!(!log.contains("sv args="));
+    assert!(!log.contains("sshd args="));
+    assert!(!log.contains("systemctl args="));
+    assert!(
+        !prefix
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .exists()
+    );
+    assert!(
+        !install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .exists()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn apply_host_silently_falls_back_to_ssh_service() {
@@ -978,7 +1191,7 @@ fn apply_exposes_only_supported_local_nouns() {
         .stdout(predicate::str::contains("--if-enrolled"))
         .stdout(predicate::str::contains("--quiet"))
         .stdout(predicate::str::contains("--if-reachable").not())
-        .stdout(predicate::str::contains("--host").not());
+        .stdout(predicate::str::contains("--host"));
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -1141,6 +1354,45 @@ fn apply_host_removes_stale_principal_files() {
     assert!(!auth_dir.join("departed").exists());
     assert_eq!(
         fs::read_to_string(auth_dir.join("alice")).unwrap(),
+        "alice\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_host_preserves_custom_trust_and_principals_paths() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let deployment_path = fixture.config_root.join("config/deployment.env");
+    let deployment = fs::read_to_string(&deployment_path)
+        .unwrap()
+        .replace(
+            "GRAFHOME_CA_SSH_TRUST_DIR=/etc/ssh/grafhome",
+            "GRAFHOME_CA_SSH_TRUST_DIR=/var/lib/grafhome/trust",
+        )
+        .replace(
+            "GRAFHOME_CA_AUTH_PRINCIPALS_DIR=/etc/ssh/auth_principals",
+            "GRAFHOME_CA_AUTH_PRINCIPALS_DIR=/var/lib/grafhome/principals",
+        );
+    fs::write(deployment_path, deployment).unwrap();
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+
+    assert!(
+        install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .is_file()
+    );
+    assert!(
+        install_root
+            .join("var/lib/grafhome/trust/user_ca_keys.pem")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read_to_string(install_root.join("var/lib/grafhome/principals/alice")).unwrap(),
         "alice\n"
     );
 }
@@ -2272,6 +2524,14 @@ fn renew_host_uses_trusted_path_step_when_configured_path_is_missing() {
     assert!(log.contains("ca token proxy-host"));
     assert!(log.contains("--cert-not-after 24h"));
     assert!(log.contains("ssh certificate proxy-host"));
+    assert_eq!(
+        fs::metadata(format!("{}-cert.pub", fixture.host_key.display()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
 }
 
 #[cfg(unix)]
@@ -2298,6 +2558,7 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
         .arg("proxy-host")
         .env("PATH", prepend_path(&fixture.fake_bin))
         .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_REQUIRE_PRIOR_HOST_CERT_MODE", "1")
         .env("GRAFHOME_CA_INSTALL_ROOT", &install_root)
         .write_stdin(format!("GRANT:{grant}\n"))
         .assert()
@@ -2313,6 +2574,14 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
         ));
 
     assert!(PathBuf::from(format!("{}-cert.pub", fixture.host_key.display())).exists());
+    assert_eq!(
+        fs::metadata(format!("{}-cert.pub", fixture.host_key.display()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
     assert!(
         install_root
             .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
@@ -4339,6 +4608,56 @@ fn status_reports_host_and_user_clients_from_live_ca_state() {
         .failure()
         .stdout("")
         .stderr("");
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_identity_environment_overrides_os_inference_but_not_cli_flags() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let root = home.join(".config/grafhome/step/certs/root_ca.crt");
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    fs::write(root, "root\n").unwrap();
+    let provisioners = r#"[{"name":"grafhome-host-70726f78792d686f7374"},{"name":"grafhome-user-616c696365-70726f78792d686f7374"}]"#;
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["status", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("USER", "u0_a123")
+        .env("HOSTNAME", "localhost")
+        .env("GRAFHOME_CA_LOCAL_USER", "alice")
+        .env("GRAFHOME_CA_LOCAL_HOST", "proxy-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_PROVISIONER_LIST", provisioners)
+        .assert()
+        .success()
+        .stdout("user alice on proxy-host: enrolled\n");
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "status",
+            "--user",
+            "alice",
+            "--host",
+            "proxy-host",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("USER", "u0_a123")
+        .env("HOSTNAME", "localhost")
+        .env("GRAFHOME_CA_LOCAL_USER", "wrong-user")
+        .env("GRAFHOME_CA_LOCAL_HOST", "wrong-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_PROVISIONER_LIST", provisioners)
+        .assert()
+        .success()
+        .stdout("user alice on proxy-host: enrolled\n");
 }
 
 #[cfg(unix)]
