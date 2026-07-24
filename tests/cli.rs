@@ -349,6 +349,22 @@ if [ "$1" = "is-active" ]; then printf 'active\n'; fi
 "#,
     );
     write_executable(
+        &fake_bin.join("launchctl"),
+        r#"#!/bin/sh
+set -eu
+printf 'launchctl args=%s\n' "$*" >> "$FAKE_LOG"
+if [ "${FAKE_LAUNCHCTL_KICKSTART_FAIL:-}" = "1" ] && [ "$1" = "kickstart" ]; then
+  printf 'Could not kickstart service "system/com.openssh.sshd": 3: No such process\n' >&2
+  exit 3
+fi
+if [ "${FAKE_LAUNCHCTL_KICKSTART_FAIL_ONCE:-}" = "1" ] && [ "$1" = "kickstart" ] && [ ! -e "$FAKE_LOG.kickstart_failed" ]; then
+  touch "$FAKE_LOG.kickstart_failed"
+  printf 'Could not kickstart service "system/com.openssh.sshd": 3: No such process\n' >&2
+  exit 3
+fi
+"#,
+    );
+    write_executable(
         &fake_bin.join("sv"),
         r#"#!/bin/sh
 set -eu
@@ -912,7 +928,10 @@ fn apply_host_explicit_host_overrides_the_policy_identity_environment() {
         ));
 }
 
-#[cfg(unix)]
+// macOS has its own reload branch (`launchctl kickstart`, not `systemctl`),
+// so this and its sibling tests below are excluded here and duplicated with
+// a `target_os = "macos"` twin that asserts on the launchd invocation.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn apply_host_installs_fresh_local_policy() {
     let (dir, fixture) = exec_fixture();
@@ -945,6 +964,39 @@ fn apply_host_installs_fresh_local_policy() {
     assert!(log.contains("systemctl args=reload sshd.service"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn apply_host_installs_fresh_local_policy_macos() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Applied 6 host policy change(s) for proxy-host",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(install_root.join("etc/ssh/auth_principals/alice")).unwrap(),
+        "alice\n"
+    );
+    assert!(
+        fs::read_to_string(install_root.join("etc/ssh/grafhome/ssh_known_hosts"))
+            .unwrap()
+            .contains("@cert-authority")
+    );
+    assert!(
+        fs::read_to_string(install_root.join("etc/ssh/grafhome/user_ca_keys.pem"))
+            .unwrap()
+            .contains("AAAAuserca")
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("launchctl args=kickstart -k system/com.openssh.sshd"));
+}
+
 #[cfg(unix)]
 #[test]
 fn apply_host_if_enrolled_silently_skips_an_unenrolled_host() {
@@ -962,7 +1014,7 @@ fn apply_host_if_enrolled_silently_skips_an_unenrolled_host() {
     assert!(!fixture.log.exists());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn quiet_apply_host_reconciles_an_enrolled_host_without_routine_output() {
     let (dir, fixture) = exec_fixture();
@@ -984,6 +1036,30 @@ fn quiet_apply_host_reconciles_an_enrolled_host_without_routine_output() {
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains("sshd args=-t"));
     assert!(log.contains("systemctl args=reload sshd.service"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn quiet_apply_host_reconciles_an_enrolled_host_without_routine_output_macos() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_host_renewal(&fixture, "proxy-host");
+
+    apply_host_command(&fixture, &install_root)
+        .args(["--if-enrolled", "--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert!(
+        install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .is_file()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("launchctl args=kickstart -k system/com.openssh.sshd"));
 }
 
 #[cfg(all(unix, target_os = "android"))]
@@ -1140,7 +1216,9 @@ fn termux_environment_alone_does_not_enable_desktop_owner_mode() {
     );
 }
 
-#[cfg(unix)]
+// macOS has a single launchd job, not a sshd.service/ssh.service pair, so
+// there is no fallback behavior to mirror here.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn apply_host_silently_falls_back_to_ssh_service() {
     let (dir, fixture) = exec_fixture();
@@ -1520,7 +1598,7 @@ fn apply_host_restores_previous_policy_when_sshd_validation_fails() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn apply_host_restores_previous_policy_when_ssh_reload_fails() {
     let (dir, fixture) = exec_fixture();
@@ -1548,6 +1626,86 @@ fn apply_host_restores_previous_policy_when_ssh_reload_fails() {
     assert_eq!(
         fs::read_to_string(format!("{}.reload_failures", fixture.log.display())).unwrap(),
         "3\n"
+    );
+}
+
+// macOS twin of the test above: the initial reload fails once, and
+// rollback's own reload (the second `launchctl kickstart` invocation)
+// succeeds, so this proves the fix's actual purpose end-to-end — a
+// transient reload failure results in a clean, successfully-reported
+// restore rather than the double-failure path covered separately below.
+#[cfg(target_os = "macos")]
+#[test]
+fn apply_host_restores_previous_policy_when_macos_ssh_reload_fails_once() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let sshd_config = install_root.join("etc/ssh/sshd_config.d/grafhome-ca.conf");
+    prepare_apply_host(&fixture);
+    fs::create_dir_all(sshd_config.parent().unwrap()).unwrap();
+    fs::write(&sshd_config, "previous config\n").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_LAUNCHCTL_KICKSTART_FAIL_ONCE", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not restart the macOS sshd launchd job",
+        ))
+        .stderr(predicate::str::contains(
+            "restored the previous host policy",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(sshd_config).unwrap(),
+        "previous config\n"
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        log.matches("launchctl args=kickstart -k system/com.openssh.sshd")
+            .count(),
+        2
+    );
+}
+
+// Unlike the systemd fail-pair fixture (which eventually succeeds and lets
+// rollback's own reload go through), this fake fails every invocation, so
+// rollback's reload attempt fails too. That's a real, previously untested
+// path: policy files still get restored (the write step precedes the
+// reload step in the rollback closure), but the reported error must surface
+// both the original failure and the rollback failure rather than claiming a
+// clean restore.
+#[cfg(target_os = "macos")]
+#[test]
+fn apply_host_reports_rollback_failure_when_macos_reload_fails_twice() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let sshd_config = install_root.join("etc/ssh/sshd_config.d/grafhome-ca.conf");
+    prepare_apply_host(&fixture);
+    fs::create_dir_all(sshd_config.parent().unwrap()).unwrap();
+    fs::write(&sshd_config, "previous config\n").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_LAUNCHCTL_KICKSTART_FAIL", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not restart the macOS sshd launchd job",
+        ))
+        .stderr(predicate::str::contains("rollback failed"));
+
+    // The file write half of rollback still runs (and succeeds) even though
+    // the trailing reload it also attempts fails.
+    assert_eq!(
+        fs::read_to_string(sshd_config).unwrap(),
+        "previous config\n"
+    );
+    // One call for the failed apply attempt, one for the failed rollback
+    // attempt.
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        log.matches("launchctl args=kickstart -k system/com.openssh.sshd")
+            .count(),
+        2
     );
 }
 
@@ -2588,7 +2746,7 @@ fn renew_host_uses_trusted_path_step_when_configured_path_is_missing() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
     let (dir, fixture) = exec_fixture();
@@ -2656,6 +2814,76 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
     assert!(log.contains("--token host-token"));
     assert!(log.contains("sshd args=-t"));
     assert!(log.contains("systemctl args=reload sshd.service"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn enroll_host_waits_for_grant_and_completes_in_one_invocation_macos() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install-root");
+    let grant = serde_json::json!({
+        "version": 1,
+        "kind": "grafhome-host-enrollment-grant",
+        "host": "proxy-host",
+        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
+        "ca_url": "https://ca.example.test",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "token": "host-token"
+    });
+
+    let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
+    cmd.args(["enroll", "host"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--host")
+        .arg("proxy-host")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_REQUIRE_PRIOR_HOST_CERT_MODE", "1")
+        .env("GRAFHOME_CA_INSTALL_ROOT", &install_root)
+        .write_stdin(format!("GRANT:{grant}\n"))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Created a public host enrollment request for proxy-host",
+        ))
+        .stderr(predicate::str::contains("Waiting for the enrollment grant"))
+        .stdout(predicate::str::contains("REQUEST:{\"version\":1"))
+        .stdout(predicate::str::contains("signed"))
+        .stdout(predicate::str::contains(
+            "Host enrollment complete: proxy-host",
+        ));
+
+    assert!(PathBuf::from(format!("{}-cert.pub", fixture.host_key.display())).exists());
+    assert_eq!(
+        fs::metadata(format!("{}-cert.pub", fixture.host_key.display()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert!(
+        install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(install_root.join("etc/ssh/grafhome/user_ca_keys.pem")).unwrap(),
+        "ssh-ed25519 AAAAuserca grafhome-user-ca\n"
+    );
+    assert!(
+        !install_root
+            .join("etc/systemd/system/step-ca.service")
+            .exists()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ca bootstrap"));
+    assert!(log.contains("ssh certificate proxy-host"));
+    assert!(log.contains("--token host-token"));
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("launchctl args=kickstart -k system/com.openssh.sshd"));
 }
 
 #[cfg(unix)]
