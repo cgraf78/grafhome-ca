@@ -5261,6 +5261,22 @@ fn reload_ssh(model: &SiteModel) -> grafhome_ca::Result<()> {
                 ),
             });
     }
+    if cfg!(target_os = "macos") {
+        return run_status_quiet(
+            process("launchctl")
+                .arg("kickstart")
+                .arg("-k")
+                .arg("system/com.openssh.sshd"),
+            &[],
+            true,
+        )
+        .map_err(|error| grafhome_ca::Error::Validation {
+            field: "SSH reload".to_owned(),
+            message: format!(
+                "could not restart the macOS sshd launchd job with `launchctl kickstart -k system/com.openssh.sshd`: {error}; enable Remote Login in System Settings > General > Sharing"
+            ),
+        });
+    }
     let sshd_error = match run_status_quiet(
         process("systemctl").arg("reload").arg("sshd.service"),
         &[],
