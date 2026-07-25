@@ -4399,9 +4399,10 @@ fn protected_directory_chain(path: &Path, expected_uid: u32) -> grafhome_ca::Res
     for component in path.ancestors() {
         let metadata = std::fs::metadata(component)
             .map_err(|source| grafhome_ca::Error::io(component, source))?;
+        let root_owned_sticky = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
         if !metadata.file_type().is_dir()
             || (metadata.uid() != expected_uid && metadata.uid() != 0)
-            || metadata.mode() & 0o022 != 0
+            || (metadata.mode() & 0o022 != 0 && !root_owned_sticky)
         {
             return Ok(false);
         }
@@ -6615,7 +6616,7 @@ mod tests {
 
         let directory = tempfile::Builder::new()
             .prefix("grafhome-ca-system-symlink-")
-            .tempdir_in(std::env::current_dir().unwrap())
+            .tempdir()
             .unwrap();
         let target = directory.path().join("private-etc");
         let link = directory.path().join("etc");
