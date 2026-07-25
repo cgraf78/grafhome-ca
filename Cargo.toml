@@ -2,7 +2,7 @@
 name = "grafhome-ca"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 build = "build.rs"
 
 [[bin]]
@@ -22,7 +22,7 @@ sha2 = "0.10.9"
 ssh-key = { version = "0.6.7", default-features = false, features = ["ecdsa", "std"] }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
-time = { version = "0.3.45", features = ["formatting", "parsing"] }
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
 toml = "0.8.23"
 
 [dev-dependencies]
