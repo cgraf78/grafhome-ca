@@ -36,6 +36,12 @@ site-wide deployment values stay portable and are not rewritten with one
 device's application path. Policy host and user names remain site choices; the
 Termux backend does not prescribe particular identity values.
 
+`TMPDIR` selects where short-lived working files, such as the staging area for
+KRL compilation, are written. Unattended callers often run host commands from a
+scrubbed environment, and Android's platform fallback, `/data/local/tmp`, is
+closed to the Termux app user. Termux hosts therefore fall back to the
+app-private `$PREFIX/tmp` rather than requiring an inherited `TMPDIR`.
+
 ## `config/deployment.env`
 
 This file uses literal `KEY=value` lines. It is not shell-sourced; do not quote

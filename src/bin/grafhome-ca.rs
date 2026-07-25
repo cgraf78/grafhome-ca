@@ -1117,6 +1117,35 @@ fn termux_host_runtime_enabled() -> bool {
     cfg!(target_os = "android") && nonempty_env("TERMUX_VERSION").is_some()
 }
 
+/// Directory that holds short-lived working files.
+///
+/// `std::env::temp_dir()` answers `TMPDIR` when it is set and a per-platform
+/// default otherwise. Android's default is `/data/local/tmp`, which the
+/// application sandbox denies to the Termux app user, and host commands
+/// routinely run from environments that scrub `TMPDIR` — `dot` merge hooks,
+/// cron jobs, anything launched through `env -i`. Fall back to Termux's own
+/// app-private `$PREFIX/tmp` there rather than to a directory this process can
+/// never write.
+fn scratch_root() -> PathBuf {
+    scratch_root_from(nonempty_env("TMPDIR").map(PathBuf::from), termux_prefix())
+}
+
+/// Resolve the scratch root from an explicit environment view, so the Termux
+/// fallback stays testable on hosts that are not Android.
+fn scratch_root_from(tmpdir: Option<PathBuf>, termux_prefix: Option<PathBuf>) -> PathBuf {
+    tmpdir
+        .or_else(|| termux_prefix.map(|prefix| prefix.join("tmp")))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Termux's installation prefix, when this process is running as a Termux host.
+fn termux_prefix() -> Option<PathBuf> {
+    termux_host_runtime_enabled()
+        .then(|| nonempty_env("PREFIX").map(PathBuf::from))
+        .flatten()
+        .filter(|prefix| prefix.is_absolute())
+}
+
 fn required_absolute_env_path(name: &str, field: &str) -> grafhome_ca::Result<PathBuf> {
     let path = std::env::var_os(name)
         .filter(|value| !value.is_empty())
@@ -3929,7 +3958,7 @@ fn compile_krl(
 
     let temp = tempfile::Builder::new()
         .prefix("grafhome-ca-krl-")
-        .tempdir()
+        .tempdir_in(scratch_root())
         .map_err(|source| grafhome_ca::Error::io("temporary KRL directory", source))?;
     let source_path = temp.path().join("revoked_keys");
     write_secret_file(&source_path, source)?;
@@ -3986,7 +4015,7 @@ fn validate_krl_file(model: &SiteModel, path: &Path) -> grafhome_ca::Result<()> 
 fn krl_revokes_key(model: &SiteModel, krl: &Path, key: &str) -> grafhome_ca::Result<bool> {
     let temp = tempfile::Builder::new()
         .prefix("grafhome-ca-krl-query-")
-        .tempfile()
+        .tempfile_in(scratch_root())
         .map_err(|source| grafhome_ca::Error::io("temporary KRL query", source))?;
     std::fs::write(temp.path(), format!("{key}\n"))
         .map_err(|source| grafhome_ca::Error::io(temp.path(), source))?;
@@ -6577,9 +6606,11 @@ mod tests {
         parse_enrollment_document, prepare_existing_user_identity,
         prepare_revocation_policy_update, read_app_private_credential, read_interactive_document,
         read_terminal_document, renewal_already_running, require_effectively_infinite_confirmation,
-        ssh_public_keys_match, store_app_private_credential, try_renewal_lock,
+        scratch_root_from, ssh_public_keys_match, store_app_private_credential, try_renewal_lock,
         validate_grant_ca_url,
     };
+
+    const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
 
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         fs::create_dir_all(to).unwrap();
@@ -6760,6 +6791,30 @@ revoked_at = "2026-07-24T20:14:15Z"
             assert_eq!(mode, 0o700, "{}", path.display());
         }
         rustix::process::umask(previous_umask);
+    }
+
+    #[test]
+    fn scratch_root_prefers_an_explicit_temporary_directory() {
+        assert_eq!(
+            scratch_root_from(
+                Some(PathBuf::from("/session/tmp")),
+                Some(PathBuf::from(TERMUX_PREFIX)),
+            ),
+            PathBuf::from("/session/tmp")
+        );
+    }
+
+    #[test]
+    fn scratch_root_falls_back_to_the_termux_prefix_without_tmpdir() {
+        assert_eq!(
+            scratch_root_from(None, Some(PathBuf::from(TERMUX_PREFIX))),
+            PathBuf::from(TERMUX_PREFIX).join("tmp")
+        );
+    }
+
+    #[test]
+    fn scratch_root_uses_the_platform_temporary_directory_off_termux() {
+        assert_eq!(scratch_root_from(None, None), std::env::temp_dir());
     }
 
     fn test_endpoint(address: &str) -> Endpoint {

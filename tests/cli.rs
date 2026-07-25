@@ -1140,6 +1140,36 @@ revoked_at = "2026-07-24T20:14:15Z"
     assert!(!second_log.contains("systemctl args=reload"));
 }
 
+// KRL compilation is the only host-policy step that needs scratch space
+// outside the install root, so pin where that scratch space comes from.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_compiles_krls_inside_the_resolved_scratch_root() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let scratch = dir.path().join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .env("TMPDIR", &scratch)
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    let compiled = log
+        .lines()
+        .filter(|line| line.starts_with("ssh-keygen args=-k "))
+        .collect::<Vec<_>>();
+    assert_eq!(compiled.len(), 2, "{log}");
+    for line in compiled {
+        assert!(
+            line.contains(&format!("-f {}/", scratch.display())),
+            "{line}"
+        );
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn apply_host_krl_generation_failure_writes_no_managed_files() {
