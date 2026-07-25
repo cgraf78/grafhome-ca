@@ -75,7 +75,7 @@ sshd -t
 # preflight without changing either tree. This exercises package modes,
 # executable provenance, and the complete existing OpenSSH subtree.
 set +e
-.termux-ci/grafhome-ca status \
+TERMUX_VERSION="${TERMUX_VERSION:-ci}" .termux-ci/grafhome-ca status \
   --config-root examples/site-config \
   --host proxy-host \
   --quiet >"$tmp/real-prefix-status.out" 2>"$tmp/real-prefix-status.err"
@@ -88,7 +88,8 @@ if [[ "$status_rc" -ne 1 ]] || [[ -s "$tmp/real-prefix-status.out" ]] ||
   exit 1
 fi
 mkdir -p "$tmp/home"
-printf '%s\n' 'termux-ci-renewal-password' | HOME="$tmp/home" .termux-ci/grafhome-ca enroll user \
+printf '%s\n' 'termux-ci-renewal-password' | env -u TERMUX_VERSION HOME="$tmp/home" \
+  .termux-ci/grafhome-ca enroll user \
   --config-root examples/site-config \
   --user alice \
   --host ca-host \
@@ -105,7 +106,7 @@ test "$(stat -c '%a' "$credential")" = 600
 # validate and reuse it.
 rm "$tmp/home/.config/grafhome-ca/users/alice/hosts/ca-host/pending-enrollment.json"
 rm "$tmp/home/.ssh/id_ed25519" "$tmp/home/.ssh/id_ed25519.pub"
-HOME="$tmp/home" .termux-ci/grafhome-ca enroll user \
+env -u TERMUX_VERSION HOME="$tmp/home" .termux-ci/grafhome-ca enroll user \
   --config-root examples/site-config \
   --user alice \
   --host ca-host \

@@ -79,10 +79,12 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 `GRAFHOME_CA_ROOT_STEP_BIN`
 : Preferred absolute path to the `step` client binary. If it is absent,
   `grafhome-ca` checks `/usr/local/bin/step`, `/usr/bin/step`, and `PATH`. The
-  selected executable must be owned by root or the invoking user and must not
-  be group- or world-writable. When invoked as root, the executable and every
-  parent directory must be root-owned and not group- or world-writable. On
-  macOS, install `step` with
+  selected executable and every parent directory must be owned by root or the
+  invoking user and must not be group- or world-writable, except for root-owned
+  sticky directories such as `/tmp`. When invoked as root, the complete path
+  must be root-owned. On Termux, these checks stop at the validated app-owned
+  `PREFIX`; Android's application sandbox protects its system-owned ancestors.
+  On macOS, install `step` with
   Homebrew as a normal user and copy it into `/usr/local/bin/step` with root
   ownership for privileged host operations; never run Homebrew as root.
 
