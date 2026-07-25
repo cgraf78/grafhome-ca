@@ -7,15 +7,21 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// Whether a certificate certifies a host key or a user key.
 pub enum CertKind {
     User,
     Host,
 }
+
+/// Directories that hold `sshd` on distributions that keep it out of an
+/// unprivileged `PATH`.
+const SBIN_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/local/sbin", "/usr/libexec"];
 
 /// Resolve a real system executable from the inherited `PATH`.
 ///
@@ -24,14 +30,31 @@ pub enum CertKind {
 /// fakes. The executable bit is required so a same-named data file earlier in
 /// `PATH` cannot shadow the tool and fail later with a bare exit code 126.
 pub fn real_program(name: &str) -> PathBuf {
+    find_program(name).unwrap_or_else(|| panic!("{name} must be installed to run this test"))
+}
+
+/// Locate `sshd`, which unprivileged accounts frequently cannot reach through
+/// `PATH` alone. `sshd` refuses to daemonize unless it was started through an
+/// absolute path, so callers need the resolved location either way.
+pub fn find_sshd() -> Option<PathBuf> {
+    find_program("sshd").or_else(|| {
+        SBIN_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join("sshd"))
+            .find(|candidate| is_executable(candidate))
+    })
+}
+
+fn find_program(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|dir| dir.join(name))
-        .find(|candidate| {
-            candidate
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-        .unwrap_or_else(|| panic!("{name} must be installed to run this test"))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(candidate: &Path) -> bool {
+    candidate
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Shell source for a shim that logs its arguments and then execs the real
@@ -164,4 +187,83 @@ pub fn assert_valid_krl(krl: &Path) {
         "{} is not a valid KRL: {output:?}",
         krl.display()
     );
+}
+
+/// A throwaway `sshd` listening on the loopback interface.
+///
+/// The server runs as the invoking account rather than root, so it can only
+/// authenticate that same account. That is the arrangement Termux uses on a
+/// phone, and it lets the test exercise a genuine server without privileges.
+pub struct SshServer {
+    child: Child,
+    port: u16,
+    log: PathBuf,
+}
+
+impl SshServer {
+    /// Start `sshd` with `config` and wait until it answers on its port.
+    pub fn start(sshd: &Path, config: &Path, port: u16, log: PathBuf) -> Self {
+        let handle = fs::File::create(&log).unwrap();
+        // sshd refuses to daemonize unless it was started through an absolute
+        // path, so callers resolve the binary before getting here.
+        let child = Command::new(sshd)
+            .arg("-D")
+            .arg("-e")
+            .arg("-f")
+            .arg(config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(handle.try_clone().unwrap()))
+            .stderr(Stdio::from(handle))
+            .spawn()
+            .unwrap_or_else(|err| panic!("could not start {}: {err}", sshd.display()));
+        let mut server = Self { child, port, log };
+        server.wait_until_listening();
+        server
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Wait for sshd's own readiness line rather than for the port to accept.
+    ///
+    /// The port is only reserved by binding and releasing it, so another
+    /// process can win the race. A successful connection would then prove
+    /// nothing about which server answered; sshd announcing the port it bound
+    /// is both a readiness and an identity signal, and it turns a collision
+    /// into an early exit this loop reports verbatim.
+    fn wait_until_listening(&mut self) {
+        let ready = format!("Server listening on 127.0.0.1 port {}.", self.port);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!("sshd exited early with {status}: {}", self.log());
+            }
+            if self.log().contains(&ready) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("sshd did not listen on port {}: {}", self.port, self.log());
+    }
+}
+
+impl Drop for SshServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Reserve a loopback port by binding and immediately releasing it.
+pub fn free_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }

@@ -1391,6 +1391,359 @@ fn apply_host_installs_krls_that_revoke_real_user_and_host_keys() {
     assert!(!common::krl_revokes(&user_krl, &retained_user_pub));
 }
 
+/// The OS account the test authenticates as. An unprivileged `sshd` can only
+/// authenticate the account that started it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn login_account() -> String {
+    let output = std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .expect("id -un");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// Rewrite the `/etc/ssh` paths a rendered fragment refers to so they point at
+/// the staged install root.
+///
+/// `grafhome-ca` renders directive values as the live system paths and applies
+/// `GRAFHOME_CA_INSTALL_ROOT` only when choosing where to write, which is what
+/// lets these tests run unprivileged. Only that documented prefix indirection
+/// is undone here; the directives, their filenames, and the KRL bytes are the
+/// product's own output. `expected` names the revocation list the fragment
+/// must point at, so a dropped or relocated directive fails here rather than
+/// as a puzzling authentication error later.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn staged_fragment(rendered: &Path, install_root: &Path, staged: &Path, expected: &Path) {
+    let text = fs::read_to_string(rendered).unwrap();
+    let rewritten = text.replace("/etc/ssh", &format!("{}/etc/ssh", install_root.display()));
+    assert!(
+        rewritten.contains(&expected.display().to_string()),
+        "fragment does not reference {}: {rewritten}",
+        expected.display()
+    );
+    assert!(
+        expected.is_file(),
+        "{} was not installed",
+        expected.display()
+    );
+    fs::write(staged, rewritten).unwrap();
+}
+
+/// Assert a refusal names `fingerprint` and cites `krl`.
+///
+/// The server log accumulates across every connection the test makes, so an
+/// unscoped search would eventually pass on an earlier refusal.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn assert_refused_by_krl(log: &str, fingerprint: &str, krl: &Path) {
+    let expected = format!("{fingerprint} revoked by file {}", krl.display());
+    assert!(log.contains(&expected), "missing '{expected}' in: {log}");
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ssh_connect(
+    port: u16,
+    account: &str,
+    key: &Path,
+    extra: &[&std::ffi::OsStr],
+) -> std::process::Output {
+    let certificate = common::certificate_path(key);
+    let mut command = std::process::Command::new(common::real_program("ssh"));
+    command
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-i")
+        .arg(key)
+        .arg("-o")
+        .arg(format!("CertificateFile={}", certificate.display()))
+        // `-F none` keeps the run hermetic against the invoking account's own
+        // SSH configuration, which on a host that actually runs grafhome-ca
+        // includes a live client fragment with its own RevokedHostKeys. A
+        // later `-F` in `extra` still wins.
+        .args(["-F", "none"])
+        .args(["-o", "IdentitiesOnly=yes"])
+        .args(["-o", "StrictHostKeyChecking=no"])
+        .args(["-o", "UserKnownHostsFile=/dev/null"])
+        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "ConnectTimeout=10"])
+        .args(extra)
+        .arg(format!("{account}@127.0.0.1"))
+        .arg("true");
+    command.output().unwrap()
+}
+
+// The closing link in the revocation chain: a real OpenSSH server and client,
+// configured by `grafhome-ca`'s own rendered policy and compiled KRLs, must
+// actually refuse the keys site policy revoked. Everything else stops at
+// asserting file contents.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn real_sshd_and_client_refuse_revoked_keys_from_applied_policy() {
+    if std::env::var("GRAFHOME_CA_RUN_SSH_REVOCATION").as_deref() != Ok("1") {
+        let message = "skipping sshd revocation test; set GRAFHOME_CA_RUN_SSH_REVOCATION=1";
+        if std::env::var("GRAFHOME_CA_REQUIRE_SSH_REVOCATION").as_deref() == Ok("1") {
+            panic!("{message}");
+        }
+        eprintln!("{message}");
+        return;
+    }
+    // The rendered server policy sets `PermitRootLogin no`, and an
+    // unprivileged sshd can only authenticate its own account, so the test
+    // logs in as itself and therefore cannot run as root.
+    assert!(
+        !rustix::process::geteuid().is_root(),
+        "this test must run as an unprivileged account"
+    );
+    let sshd = common::find_sshd().expect("sshd must be installed for this test");
+
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    write_executable(
+        &fixture.fake_bin.join("ssh-keygen"),
+        &common::real_ssh_keygen_shim(),
+    );
+
+    // Serve real certificate authorities from the step shim so the installed
+    // trust files carry keys OpenSSH can actually verify against.
+    let step = fs::read_to_string(fixture.fake_bin.join("step")).unwrap();
+    let patched = step
+        .replace(
+            r"printf 'ssh-ed25519 AAAAhostca grafhome-host-ca\n'",
+            r#"cat "$FAKE_HOST_CA_PUB""#,
+        )
+        .replace(
+            r"printf 'ssh-ed25519 AAAAuserca grafhome-user-ca\n'",
+            r#"cat "$FAKE_USER_CA_PUB""#,
+        );
+    assert_ne!(step, patched, "step shim CA output was not replaced");
+    write_executable(&fixture.fake_bin.join("step"), &patched);
+
+    let keys = dir.path().join("keys");
+    fs::create_dir_all(&keys).unwrap();
+    let user_ca = keys.join("user-ca");
+    let host_ca = keys.join("host-ca");
+    let revoked_user = keys.join("revoked-user");
+    let retained_user = keys.join("retained-user");
+    for key in [&user_ca, &host_ca, &revoked_user, &retained_user] {
+        common::generate_key(key);
+    }
+
+    // Replace the fixture's placeholder host key with a real one, and give it
+    // the certificate the rendered `HostCertificate` directive expects.
+    fs::remove_file(&fixture.host_key).unwrap();
+    fs::remove_file(common::public_key_path(&fixture.host_key)).unwrap();
+    common::generate_key(&fixture.host_key);
+    common::sign_certificate(
+        &host_ca,
+        &fixture.host_key,
+        "127.0.0.1",
+        1,
+        common::CertKind::Host,
+    );
+
+    // Point site policy at the account this test can log in as, so
+    // `apply host` renders the authorized principals file the server actually
+    // reads. Writing that file by hand would skip the product's principals
+    // rendering, and the next apply would delete it as unmanaged.
+    let account = login_account();
+    assert!(
+        account
+            .chars()
+            .all(|character| character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-')),
+        "site policy cannot name the account {account}"
+    );
+    let host_policy = fixture.config_root.join("policy/hosts/proxy-host.toml");
+    let policy = fs::read_to_string(&host_policy).unwrap();
+    let localized = policy.replace(
+        "unix_account = \"alice\"",
+        &format!("unix_account = \"{account}\""),
+    );
+    assert_ne!(policy, localized, "host policy login was not localized");
+    fs::write(&host_policy, localized).unwrap();
+
+    // Certificates carry the policy principal, which is what the rendered
+    // principals file lists for that login account.
+    common::sign_certificate(&user_ca, &revoked_user, "alice", 1, common::CertKind::User);
+    common::sign_certificate(&user_ca, &retained_user, "alice", 2, common::CertKind::User);
+
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        format!(
+            "format_version = 1\n{}",
+            user_revocation(
+                "alice",
+                "retired-client",
+                &revoked_user,
+                "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg",
+            )
+        ),
+    )
+    .unwrap();
+
+    let apply = |fixture: &ExecFixture| {
+        apply_host_command(fixture, &install_root)
+            .env("FAKE_USER_CA_PUB", common::public_key_path(&user_ca))
+            .env("FAKE_HOST_CA_PUB", common::public_key_path(&host_ca))
+            .assert()
+            .success();
+    };
+    apply(&fixture);
+
+    let system_ssh = install_root.join("etc/ssh");
+    let trust = system_ssh.join("grafhome");
+    let user_krl = trust.join("revoked_user_certs");
+    let host_krl = trust.join("revoked_host_keys");
+    let server_fragment = dir.path().join("sshd_config.d-grafhome-ca.conf");
+    staged_fragment(
+        &system_ssh.join("sshd_config.d/grafhome-ca.conf"),
+        &install_root,
+        &server_fragment,
+        &user_krl,
+    );
+
+    // The product renders the principals file for the localized login.
+    assert_eq!(
+        fs::read_to_string(system_ssh.join("auth_principals").join(&account)).unwrap(),
+        "alice\n"
+    );
+
+    let port = common::free_port();
+    let sshd_config = dir.path().join("sshd_config");
+    fs::write(
+        &sshd_config,
+        format!(
+            // sshd takes the first value it obtains for a keyword, so these
+            // precede the Include and the fragment supplies everything else.
+            // `AuthorizedKeysFile none` matters: without it sshd would fall
+            // back to the account's own authorized_keys, and an authentication
+            // that never touched the rendered CA trust could stand in for one
+            // that did.
+            "Port {port}\n\
+             ListenAddress 127.0.0.1\n\
+             PidFile {pid}\n\
+             HostKey {host_key}\n\
+             AuthorizedKeysFile none\n\
+             StrictModes no\n\
+             UsePAM no\n\
+             PasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\n\
+             LogLevel VERBOSE\n\
+             Include {fragment}\n",
+            pid = dir.path().join("sshd.pid").display(),
+            host_key = fixture.host_key.display(),
+            fragment = server_fragment.display(),
+        ),
+    )
+    .unwrap();
+
+    let server = common::SshServer::start(&sshd, &sshd_config, port, dir.path().join("sshd.log"));
+
+    // Positive control first: if the applied policy could not authenticate
+    // anyone, the revocation assertion below would pass for the wrong reason.
+    let allowed = ssh_connect(server.port(), &account, &retained_user, &[]);
+    assert!(
+        allowed.status.success(),
+        "retained certificate was refused: {} {}",
+        String::from_utf8_lossy(&allowed.stderr),
+        server.log()
+    );
+    // ...and it must have been the rendered CA trust that accepted it.
+    let trusted_via = format!("via {}", trust.join("user_ca_keys.pem").display());
+    assert!(
+        server.log().contains(&trusted_via),
+        "certificate was not accepted through {trusted_via}: {}",
+        server.log()
+    );
+
+    let refused = ssh_connect(server.port(), &account, &revoked_user, &[]);
+    assert!(
+        !refused.status.success(),
+        "revoked certificate authenticated: {}",
+        server.log()
+    );
+    assert_refused_by_krl(
+        &server.log(),
+        &common::key_fingerprint(&revoked_user),
+        &user_krl,
+    );
+    assert!(
+        !server.log().contains(&format!(
+            "{} revoked",
+            common::key_fingerprint(&retained_user)
+        )),
+        "sshd reported the retained key as revoked: {}",
+        server.log()
+    );
+
+    // Client side: the same host key must become unusable once policy revokes
+    // it and `apply host` recompiles the client KRL.
+    let client_fragment = dir.path().join("ssh_config.d-grafhome-ca.conf");
+    let stage_client = |fragment: &Path| {
+        staged_fragment(
+            &system_ssh.join("ssh_config.d/grafhome-ca.conf"),
+            &install_root,
+            fragment,
+            &host_krl,
+        );
+    };
+    stage_client(&client_fragment);
+    let client_config: Vec<&std::ffi::OsStr> = vec!["-F".as_ref(), client_fragment.as_ref()];
+
+    let before = ssh_connect(server.port(), &account, &retained_user, &client_config);
+    assert!(
+        before.status.success(),
+        "client policy refused a host that policy had not revoked: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        format!(
+            "format_version = 1\n{}{}",
+            user_revocation(
+                "alice",
+                "retired-client",
+                &revoked_user,
+                "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg",
+            ),
+            host_revocation(
+                "retired-host",
+                &fixture.host_key,
+                "SHA256:grNhYzQm8G7RLKOUx2vpN4lqVj0aFJsYYfM1GxKXDnE",
+            ),
+        ),
+    )
+    .unwrap();
+    apply(&fixture);
+    stage_client(&client_fragment);
+
+    let after = ssh_connect(server.port(), &account, &retained_user, &client_config);
+    let stderr = String::from_utf8_lossy(&after.stderr).into_owned();
+    assert!(
+        !after.status.success(),
+        "client accepted a revoked host key: {stderr}"
+    );
+    assert_refused_by_krl(
+        &stderr,
+        &common::key_fingerprint(&fixture.host_key),
+        &host_krl,
+    );
+
+    // Only the client's view changed: the server still authenticates the same
+    // certificate for a caller that is not consulting the host revocation
+    // list, so the refusal above is attributable to that list alone.
+    let unaffected = ssh_connect(server.port(), &account, &retained_user, &[]);
+    assert!(
+        unaffected.status.success(),
+        "reapplying policy broke server authentication: {} {}",
+        String::from_utf8_lossy(&unaffected.stderr),
+        server.log()
+    );
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn apply_host_krl_generation_failure_writes_no_managed_files() {
