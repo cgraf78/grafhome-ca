@@ -21,6 +21,26 @@ jobs:
   rust:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
+      setup-command: |
+        as_root() {
+          if [ "$(id -u)" -eq 0 ]; then
+            "$@"
+          else
+            sudo "$@"
+          fi
+        }
+        case "$MATRIX_NAME" in
+          Arch)
+            as_root pacman -S --noconfirm openssh
+            ;;
+          "CentOS Stream")
+            as_root dnf install -y openssh-clients
+            ;;
+          Debian | Ubuntu | WSL)
+            as_root apt-get update
+            as_root apt-get install -y --no-install-recommends openssh-client
+            ;;
+        esac
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
