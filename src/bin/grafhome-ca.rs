@@ -6565,6 +6565,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
@@ -6911,7 +6912,15 @@ revoked_at = "2026-07-24T20:14:15Z"
 
         assert!(try_renewal_lock(&path).unwrap().is_none());
         drop(first);
-        assert!(try_renewal_lock(&path).unwrap().is_some());
+        // A parallel test can briefly inherit the locked file across fork until exec.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while try_renewal_lock(&path).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "renewal lock remained held after its file was dropped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
