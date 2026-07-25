@@ -89,6 +89,32 @@ jobs:
       profiles: base,shellcheck
       test-command: tests/shell/release-scripts-test
 
+  ssh-revocation:
+    name: SSH Revocation / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install OpenSSH server
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+
+      # The whole binary runs rather than a name filter: a filter that matches
+      # nothing still exits 0, which would leave this job green while testing
+      # nothing. Every other test here is unaffected by the flags below.
+      - name: Run sshd revocation test
+        env:
+          GRAFHOME_CA_RUN_SSH_REVOCATION: "1"
+          GRAFHOME_CA_REQUIRE_SSH_REVOCATION: "1"
+        run: cargo test --locked --test cli
+
   step-ca-integration:
     name: Step CA Integration / Ubuntu
     runs-on: ubuntu-latest
