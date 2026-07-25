@@ -186,6 +186,54 @@ kill "$sshd_pid" 2>/dev/null || true
 wait "$sshd_pid" 2>/dev/null || true
 sshd_pid=
 
+# Revoke the underlying user key, restart the real Termux sshd with the KRL,
+# and prove that neither the existing certificate nor a renewed certificate
+# for that same key can authenticate.
+ssh-keygen -q -k -f "$real_sshd/revoked.krl" "$real_sshd/user-key.pub"
+printf 'RevokedKeys %s\n' "$real_sshd/revoked.krl" >>"$real_sshd/sshd_config"
+sshd -t -f "$real_sshd/sshd_config"
+sshd -D -e -f "$real_sshd/sshd_config" >"$real_sshd/sshd.log" 2>&1 &
+sshd_pid=$!
+listener_ready=false
+for _ in $(seq 1 40); do
+  if ssh-keyscan -p "$port" 127.0.0.1 >/dev/null 2>&1; then
+    listener_ready=true
+    break
+  fi
+  kill -0 "$sshd_pid" 2>/dev/null || break
+  sleep 0.25
+done
+if [[ "$listener_ready" != true ]]; then
+  cat "$real_sshd/sshd.log" >&2
+  exit 1
+fi
+for certificate_id in existing renewed; do
+  if [[ "$certificate_id" == renewed ]]; then
+    ssh-keygen -q -s "$real_sshd/user-ca" -I termux-ci-user-renewed \
+      -n policyuser -V -1m:+5m "$real_sshd/user-key.pub"
+  fi
+  set +e
+  ssh -F /dev/null -p "$port" \
+    -i "$real_sshd/user-key" \
+    -o CertificateFile="$real_sshd/user-key-cert.pub" \
+    -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o BatchMode=yes \
+    policyuser@127.0.0.1 true
+  revoked_key_rc=$?
+  set -e
+  if [[ "$revoked_key_rc" -eq 0 ]]; then
+    printf 'Termux sshd accepted the %s certificate for a revoked key\n' \
+      "$certificate_id" >&2
+    exit 1
+  fi
+done
+printf '%s\n' 'ok: Termux sshd KRL rejected existing and renewed certificates for the revoked key'
+kill "$sshd_pid" 2>/dev/null || true
+wait "$sshd_pid" 2>/dev/null || true
+sshd_pid=
+
 # Exercise the rootless Termux SSH-server backend with an isolated app prefix.
 # Command shims keep this deterministic while the Android binary owns path
 # localization, host enrollment state, rendered OpenSSH policy, and reload
@@ -239,6 +287,50 @@ cat >"$termux_bin/ssh-keygen" <<'SH'
 #!/data/data/com.termux/files/usr/bin/sh
 set -eu
 printf 'ssh-keygen args=%s\n' "$*" >>"$TERMUX_SERVER_LOG"
+if [ "$1" = "-k" ]; then
+  out=""
+  source=""
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = "-f" ]; then out="$argument"; fi
+    source="$argument"
+    previous="$argument"
+  done
+  if [ ! -e "$out" ]; then printf 'FAKE-KRL\n' >"$out"; fi
+  while IFS= read -r key || [ -n "$key" ]; do
+    [ -z "$key" ] || printf '%s\n' "$key" >>"$out"
+  done <"$source"
+elif [ "$1" = "-Q" ]; then
+  krl=""
+  source=""
+  previous=""
+  list=0
+  for argument in "$@"; do
+    if [ "$argument" = "-l" ]; then list=1; fi
+    if [ "$previous" = "-f" ]; then krl="$argument"; fi
+    source="$argument"
+    previous="$argument"
+  done
+  header=""
+  IFS= read -r header <"$krl" || true
+  [ "$header" = "FAKE-KRL" ] || exit 44
+  [ "$list" -eq 0 ] || exit 0
+  while IFS= read -r key || [ -n "$key" ]; do
+    [ -n "$key" ] || continue
+    found=0
+    while IFS= read -r candidate || [ -n "$candidate" ]; do
+      if [ "$candidate" = "$key" ]; then found=1; fi
+    done <"$krl"
+    [ "$found" -eq 1 ] || exit 0
+  done <"$source"
+  exit 1
+fi
+SH
+
+cat >"$termux_bin/ssh" <<'SH'
+#!/data/data/com.termux/files/usr/bin/sh
+set -eu
+printf 'ssh args=%s\n' "$*" >>"$TERMUX_SERVER_LOG"
 SH
 
 cat >"$termux_bin/sshd" <<'SH'
@@ -252,10 +344,10 @@ cat >"$termux_bin/sv" <<'SH'
 set -eu
 printf 'sv args=%s\n' "$*" >>"$TERMUX_SERVER_LOG"
 SH
-chmod 0755 "$termux_bin/step-cli" "$termux_bin/ssh-keygen" \
+chmod 0755 "$termux_bin/step-cli" "$termux_bin/ssh" "$termux_bin/ssh-keygen" \
   "$termux_bin/sshd" "$termux_bin/sv"
 
-for executable in step-cli ssh-keygen sshd sv; do
+for executable in step-cli ssh ssh-keygen sshd sv; do
   cat >"$hostile_bin/$executable" <<'SH'
 #!/data/data/com.termux/files/usr/bin/sh
 printf '%s\n' "$0" >>"$TERMUX_HOSTILE_LOG"
@@ -337,14 +429,21 @@ chmod 0644 "$host_step/certs/root_ca.crt"
     --config-root "$termux_config"
 )
 server_config="$termux_ssh/sshd_config.d/grafhome-ca.conf"
+client_config="$termux_ssh/ssh_config.d/grafhome-ca.conf"
 grep -F "HostCertificate $termux_ssh/ssh_host_ed25519_key-cert.pub" "$server_config"
 grep -F "TrustedUserCAKeys $termux_ssh/grafhome/user_ca_keys.pem" "$server_config"
+grep -F "RevokedKeys $termux_ssh/grafhome/revoked_user_certs" "$server_config"
+grep -F "RevokedHostKeys $termux_ssh/grafhome/revoked_host_keys" "$client_config"
 test "$(cat "$termux_home/.ssh/grafhome/termux-owner")" = alice
 test "$(stat -c '%a' "$termux_home/.ssh")" = 700
 test "$(stat -c '%a' "$termux_home/.ssh/grafhome")" = 700
 test "$(stat -c '%a' "$termux_ssh/grafhome")" = 700
 test "$(stat -c '%a' "$termux_ssh/sshd_config.d")" = 700
 test "$(stat -c '%a' "$termux_ssh/ssh_config.d")" = 700
+for krl in revoked_user_certs revoked_host_keys; do
+  test "$(stat -c '%a' "$termux_ssh/grafhome/$krl")" = 644
+  test "$(head -n 1 "$termux_ssh/grafhome/$krl")" = FAKE-KRL
+done
 
 "${termux_env[@]}" .termux-ci/grafhome-ca renew host \
   --host proxy-host \
@@ -352,6 +451,7 @@ test "$(stat -c '%a' "$termux_ssh/ssh_config.d")" = 700
 test -s "$termux_ssh/ssh_host_ed25519_key-cert.pub"
 test "$(stat -c '%a' "$termux_ssh/ssh_host_ed25519_key-cert.pub")" = 644
 grep -F 'sshd args=-t' "$termux_log"
+grep -F 'ssh args=-G -F' "$termux_log"
 grep -F 'sv args=hup sshd' "$termux_log"
 test ! -e "$hostile_log"
 if grep -Fq 'systemctl' "$termux_log"; then

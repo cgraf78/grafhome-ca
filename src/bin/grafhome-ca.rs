@@ -18,6 +18,9 @@ use grafhome_ca::enrollment::{
     parse_host_provisioner_name, parse_user_provisioner_name, user_provisioner_host_suffix,
     user_provisioner_name, user_provisioner_prefix,
 };
+use grafhome_ca::enrollment_registry::{
+    EnrollmentRecord, EnrollmentRegistry, RecordStatus, canonical_jwk, now_utc,
+};
 use grafhome_ca::executable::{root_step_bin, user_step_bin};
 use grafhome_ca::model::SiteModel;
 use grafhome_ca::policy::{
@@ -35,6 +38,7 @@ const AUTH_PRINCIPALS_FILE: &str = "GRAFHOME_CA_AUTH_PRINCIPALS_FILE";
 const AUTHORIZED_KEYS_DIRECTIVE: &str = "GRAFHOME_CA_AUTHORIZED_KEYS_DIRECTIVE";
 const STRICT_MODES: &str = "GRAFHOME_CA_STRICT_MODES";
 const HOST_SSH_KEYGEN_BIN: &str = "GRAFHOME_CA_HOST_SSH_KEYGEN_BIN";
+const HOST_SSH_BIN: &str = "GRAFHOME_CA_HOST_SSH_BIN";
 const HOST_SSHD_BIN: &str = "GRAFHOME_CA_HOST_SSHD_BIN";
 const HOST_SSH_RELOAD_BIN: &str = "GRAFHOME_CA_HOST_SSH_RELOAD_BIN";
 const HOST_SSH_SERVICE_DIR: &str = "GRAFHOME_CA_HOST_SSH_SERVICE_DIR";
@@ -155,6 +159,11 @@ enum Command {
         #[command(subcommand)]
         command: RevokeCommand,
     },
+    /// Export or import public enrollment key inventory.
+    Enrollment {
+        #[command(subcommand)]
+        command: EnrollmentCommand,
+    },
     /// Report enrollment and local renewal readiness from live CA state.
     Status {
         /// Site config root containing config/ and policy/.
@@ -172,6 +181,49 @@ enum Command {
         /// Also require the local credential material needed for unattended renewal.
         #[arg(long)]
         renewable: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnrollmentCommand {
+    /// Export existing target-local public keys without rotating them.
+    Export {
+        #[command(subcommand)]
+        command: EnrollmentExportCommand,
+    },
+    /// Import an exported enrollment after verifying its live CA provisioner.
+    Import {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Read the public enrollment export from this file instead of stdin.
+        #[arg(long, value_name = "FILE")]
+        request_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EnrollmentExportCommand {
+    /// Export this host's SSH and renewal public keys.
+    Host {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Export this user's SSH and renewal public keys on one client host.
+    User {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// User policy name. Defaults to GRAFHOME_CA_LOCAL_USER, then the current account.
+        #[arg(long)]
+        user: Option<String>,
+        /// Client host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -370,6 +422,9 @@ enum RevokeCommand {
         /// Policy host to revoke.
         #[arg(long)]
         host: String,
+        /// Optional audit reason stored with each newly revoked SSH key.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Disable issuance and renewal for one user's enrolled clients.
     User {
@@ -382,6 +437,9 @@ enum RevokeCommand {
         /// Revoke only the client on this host. Omit to revoke every client.
         #[arg(long)]
         host: Option<String>,
+        /// Optional audit reason stored with each newly revoked SSH key.
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -694,16 +752,74 @@ fn run() -> grafhome_ca::Result<()> {
                     config_root,
                     user,
                     host,
+                    reason,
                 },
         } => {
             let model = load_root_model(config_root, "revoke user", false)?;
-            revoke_user(&model, &user, host.as_deref())
+            revoke_user(&model, &user, host.as_deref(), reason.as_deref())
         }
         Command::Revoke {
-            command: RevokeCommand::Host { config_root, host },
+            command:
+                RevokeCommand::Host {
+                    config_root,
+                    host,
+                    reason,
+                },
         } => {
             let model = load_root_model(config_root, "revoke host", false)?;
-            revoke_host(&model, &host)
+            revoke_host(&model, &host, reason.as_deref())
+        }
+        Command::Enrollment {
+            command:
+                EnrollmentCommand::Export {
+                    command: EnrollmentExportCommand::Host { config_root, host },
+                },
+        } => {
+            let model = load_host_model(config_root, "enrollment export host", false)?;
+            let host = resolve_host(host.as_deref())?;
+            let request = host_request_from_material(&model, &host)?;
+            outln!(
+                "ENROLLMENT:{}",
+                serde_json::to_string(&request).expect("host enrollment export serializes")
+            );
+            Ok(())
+        }
+        Command::Enrollment {
+            command:
+                EnrollmentCommand::Export {
+                    command:
+                        EnrollmentExportCommand::User {
+                            config_root,
+                            user,
+                            host,
+                        },
+                },
+        } => {
+            let _model = load_valid_model(config_root)?;
+            let user = resolve_user(user.as_deref())?;
+            let host = resolve_host(host.as_deref())?;
+            let request = user_request_from_material(&user, &host)?;
+            outln!(
+                "ENROLLMENT:{}",
+                serde_json::to_string(&request).expect("user enrollment export serializes")
+            );
+            Ok(())
+        }
+        Command::Enrollment {
+            command:
+                EnrollmentCommand::Import {
+                    config_root,
+                    request_file,
+                },
+        } => {
+            let model = load_root_model(config_root, "enrollment import", false)?;
+            let mut stdin = std::io::stdin().lock();
+            let text = read_document_or_file(
+                request_file.as_deref(),
+                &mut stdin,
+                "public enrollment export",
+            )?;
+            import_enrollment(&model, &text)
         }
         Command::Status {
             config_root,
@@ -821,7 +937,7 @@ impl TermuxHostRuntime {
             &prefix.join("etc/ssh"),
             "OpenSSH configuration directory",
         )?;
-        for executable in ["step-cli", "ssh-keygen", "sshd", "sv"] {
+        for executable in ["step-cli", "ssh", "ssh-keygen", "sshd", "sv"] {
             validate_termux_executable(&prefix, executable)?;
         }
         Ok(Some(Self { home, prefix }))
@@ -886,6 +1002,10 @@ impl TermuxHostRuntime {
                 .join("bin/ssh-keygen")
                 .to_string_lossy()
                 .into_owned(),
+        );
+        values.insert(
+            HOST_SSH_BIN.to_owned(),
+            self.prefix.join("bin/ssh").to_string_lossy().into_owned(),
         );
         values.insert(
             HOST_SSHD_BIN.to_owned(),
@@ -1203,7 +1323,53 @@ fn load_root_model(
     let trusted_uid = 0;
     grafhome_ca::provenance::validate_config_root(&config_root, trusted_uid)?;
     require_root_or_isolated_test(&config_root, trusted_uid, command, requires_install_root)?;
-    load_valid_model_from_root(&config_root)
+    let model = load_valid_model_from_root(&config_root)?;
+    require_ca_origin(&model, command)?;
+    Ok(model)
+}
+
+fn require_ca_origin(model: &SiteModel, command: &str) -> grafhome_ca::Result<()> {
+    let local_host = os_hostname()?;
+    let ca_origin = required_endpoint(model, ENDPOINT_ROLE_CA_ORIGIN)?;
+    if hostnames_match_origin(&local_host, &ca_origin.target) {
+        return Ok(());
+    }
+    Err(grafhome_ca::Error::Validation {
+        field: command.to_owned(),
+        message: format!(
+            "must be run on CA origin {}; local host is {local_host}",
+            ca_origin.target
+        ),
+    })
+}
+
+fn hostnames_match_origin(local: &str, configured: &str) -> bool {
+    local == configured
+        || (!configured.contains('.') && local.split('.').next() == Some(configured))
+}
+
+#[cfg(unix)]
+fn os_hostname() -> grafhome_ca::Result<String> {
+    let hostname = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    if hostname.is_empty() {
+        return Err(grafhome_ca::Error::Validation {
+            field: "local hostname".to_owned(),
+            message: "kernel hostname is empty".to_owned(),
+        });
+    }
+    Ok(hostname)
+}
+
+#[cfg(not(unix))]
+fn os_hostname() -> grafhome_ca::Result<String> {
+    Err(grafhome_ca::Error::Validation {
+        field: "local hostname".to_owned(),
+        message: "CA-origin commands require Unix hostname semantics".to_owned(),
+    })
 }
 
 fn require_root_or_isolated_test(
@@ -2337,12 +2503,258 @@ fn parse_enrollment_document<T: serde::de::DeserializeOwned>(
 
 fn strip_enrollment_label(text: &str) -> Option<&str> {
     let (prefix, document) = text.split_once(':')?;
-    if prefix.trim().eq_ignore_ascii_case("REQUEST") || prefix.trim().eq_ignore_ascii_case("GRANT")
+    if prefix.trim().eq_ignore_ascii_case("REQUEST")
+        || prefix.trim().eq_ignore_ascii_case("GRANT")
+        || prefix.trim().eq_ignore_ascii_case("ENROLLMENT")
     {
         Some(document.trim())
     } else {
         None
     }
+}
+
+fn enrollment_registry_path(model: &SiteModel) -> PathBuf {
+    PathBuf::from(&model.deployment.values["GRAFHOME_CA_STATE_DIR"])
+        .join("enrollments/registry.json")
+}
+
+enum ImportedEnrollment {
+    Host(HostRequest),
+    User(UserRequest),
+}
+
+fn parse_imported_enrollment(text: &str) -> grafhome_ca::Result<ImportedEnrollment> {
+    let value: serde_json::Value = parse_enrollment_document(text, "public enrollment export")?;
+    match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some("grafhome-host-enrollment-request") => {
+            let request =
+                serde_json::from_value(value).map_err(|source| grafhome_ca::Error::Json {
+                    path: PathBuf::from("public enrollment export"),
+                    source,
+                })?;
+            Ok(ImportedEnrollment::Host(request))
+        }
+        Some("grafhome-user-enrollment-request") => {
+            let request =
+                serde_json::from_value(value).map_err(|source| grafhome_ca::Error::Json {
+                    path: PathBuf::from("public enrollment export"),
+                    source,
+                })?;
+            Ok(ImportedEnrollment::User(request))
+        }
+        Some(kind) => Err(grafhome_ca::Error::Validation {
+            field: "public enrollment export.kind".to_owned(),
+            message: format!("unsupported enrollment document kind {kind}"),
+        }),
+        None => Err(grafhome_ca::Error::Validation {
+            field: "public enrollment export.kind".to_owned(),
+            message: "missing enrollment document kind".to_owned(),
+        }),
+    }
+}
+
+fn import_enrollment(model: &SiteModel, text: &str) -> grafhome_ca::Result<()> {
+    let imported = parse_imported_enrollment(text)?;
+    let timestamp = now_utc()?;
+    let (candidate, provisioner) = match &imported {
+        ImportedEnrollment::Host(request) => {
+            request.validate()?;
+            validate_explicit_host_identity("enrollment import host", &request.host)?;
+            (
+                EnrollmentRecord::pending_host(request, &timestamp)?,
+                host_provisioner_name(&request.host),
+            )
+        }
+        ImportedEnrollment::User(request) => {
+            request.validate()?;
+            validate_explicit_user_identity("enrollment import user", &request.user)?;
+            validate_explicit_host_identity("enrollment import client host", &request.host)?;
+            (
+                EnrollmentRecord::pending_user(request, &timestamp)?,
+                user_provisioner_name(&request.user, &request.host),
+            )
+        }
+    };
+    let identity = candidate.identity();
+    let ssh_fingerprint = candidate.ssh_fingerprint().to_owned();
+    let renewal_fingerprint = candidate.renewal_fingerprint().to_owned();
+    with_ca_lock(model, || {
+        ensure_enrollment_keys_not_revoked(model, &candidate)?;
+        let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+        let previous =
+            std::fs::read(&ca_json).map_err(|source| grafhome_ca::Error::io(&ca_json, source))?;
+        let text = grafhome_ca::runtime_provisioners::bind_existing_renewal_provisioner(
+            &ca_json,
+            &provisioner,
+            candidate.renewal_public_jwk(),
+            candidate.ssh_public_key(),
+        )?;
+        let path = enrollment_registry_path(model);
+        let registry = EnrollmentRegistry::load(&path)?;
+        let mut proposed = registry.clone();
+        let registry_changed = proposed.activate(candidate)?;
+        let ca_changed = previous != text.as_bytes();
+        if ca_changed || registry_changed {
+            install_ca_json_with_rollback(
+                model,
+                &ca_json,
+                text.as_bytes(),
+                required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
+                || {
+                    if registry_changed {
+                        proposed.save(&path)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        outln!(
+            "Imported {identity} into the CA enrollment registry (SSH {ssh_fingerprint}, renewal {renewal_fingerprint})."
+        );
+        Ok(())
+    })
+}
+
+fn reserve_approval_record(
+    model: &SiteModel,
+    registry: &mut EnrollmentRegistry,
+    registry_path: &Path,
+    candidate: &EnrollmentRecord,
+    provisioner: &str,
+) -> grafhome_ca::Result<()> {
+    ensure_enrollment_keys_not_revoked(model, candidate)?;
+    let existing_status = registry.matching_status(candidate);
+    let mut proposed = registry.clone();
+    let added = proposed.reserve(candidate.clone())?;
+    let live_key = live_enrollment_public_key(model, provisioner)?;
+    if let Some(live_key) = &live_key {
+        if live_key != candidate.renewal_public_jwk() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "approve enrollment".to_owned(),
+                message: format!(
+                    "live provisioner {provisioner} has a different public key from {}",
+                    candidate.identity(),
+                ),
+            });
+        }
+        if existing_status.is_none() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "approve enrollment".to_owned(),
+                message: format!(
+                    "{} is already live but is absent from the enrollment registry; run `grafhome-ca enrollment import` first",
+                    candidate.identity()
+                ),
+            });
+        }
+    } else if existing_status == Some(RecordStatus::Active) {
+        return Err(grafhome_ca::Error::Validation {
+            field: "approve enrollment".to_owned(),
+            message: format!(
+                "{} is active in the enrollment registry but its live provisioner is missing; revoke or repair it before approval",
+                candidate.identity()
+            ),
+        });
+    }
+    if added {
+        proposed.save(registry_path)?;
+        *registry = proposed;
+    }
+    Ok(())
+}
+
+fn ensure_enrollment_keys_not_revoked(
+    model: &SiteModel,
+    candidate: &EnrollmentRecord,
+) -> grafhome_ca::Result<()> {
+    let policy = grafhome_ca::policy::Policy::load(&model.policy.root)?;
+    if policy
+        .revoked_ssh_keys
+        .iter()
+        .any(|entry| entry.fingerprint() == candidate.ssh_fingerprint())
+    {
+        return Err(grafhome_ca::Error::Validation {
+            field: "enrollment SSH public key".to_owned(),
+            message: format!(
+                "{} reuses a previously revoked SSH key; generate a new SSH key before enrolling",
+                candidate.identity()
+            ),
+        });
+    }
+    if policy
+        .revoked_ssh_keys
+        .iter()
+        .any(|entry| entry.renewal_fingerprint() == candidate.renewal_fingerprint())
+    {
+        return Err(grafhome_ca::Error::Validation {
+            field: "enrollment renewal public key".to_owned(),
+            message: format!(
+                "{} reuses a previously revoked renewal key; generate a new renewal key before enrolling",
+                candidate.identity()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_explicit_host_identity(field: &str, value: &str) -> grafhome_ca::Result<()> {
+    if grafhome_ca::policy::valid_host_identity(value) {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: field.to_owned(),
+            message: "must match [A-Za-z0-9._-]+".to_owned(),
+        })
+    }
+}
+
+fn validate_explicit_user_identity(field: &str, value: &str) -> grafhome_ca::Result<()> {
+    if grafhome_ca::policy::valid_user_identity(value) {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: field.to_owned(),
+            message: "must match [a-z_][a-z0-9_-]*[$]?".to_owned(),
+        })
+    }
+}
+
+fn live_enrollment_public_key(
+    model: &SiteModel,
+    provisioner: &str,
+) -> grafhome_ca::Result<Option<serde_json::Value>> {
+    let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+    let live = read_json_file(&ca_json)?;
+    let provisioners = live_provisioners(&live, &ca_json)?;
+    let matching = provisioners
+        .iter()
+        .filter(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(provisioner))
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [live] => {
+            let key = live
+                .get("key")
+                .ok_or_else(|| grafhome_ca::Error::Validation {
+                    field: format!("{}:authority.provisioners", ca_json.display()),
+                    message: format!("live enrollment provisioner {provisioner} has no public key"),
+                })?;
+            canonical_jwk(key).map(|(key, _)| Some(key))
+        }
+        _ => Err(grafhome_ca::Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("live enrollment provisioner {provisioner} is duplicated"),
+        }),
+    }
+}
+
+fn read_json_file(path: &Path) -> grafhome_ca::Result<serde_json::Value> {
+    serde_json::from_slice(
+        &std::fs::read(path).map_err(|source| grafhome_ca::Error::io(path, source))?,
+    )
+    .map_err(|source| grafhome_ca::Error::Json {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn resolve_user(user: Option<&str>) -> grafhome_ca::Result<String> {
@@ -2571,29 +2983,20 @@ fn ensure_user_keys(
         normalize_regular_file_mode(&private_jwk, "user renewal private JWK", 0o600)?;
         normalize_regular_file_mode(&public_jwk, "user renewal public JWK", 0o644)?;
     }
-    user_request_from_material(model, &user.user, &client.host)
+    user_request_from_material(&user.user, &client.host)
 }
 
-fn user_request_from_material(
-    model: &SiteModel,
-    user_name: &str,
-    host: &str,
-) -> grafhome_ca::Result<UserRequest> {
-    let user = active_user(model, user_name)?;
-    let client = required_user_client(model, &user.user, host)?;
-    let private_key = user_private_key_path()?;
+fn user_request_from_material(user_name: &str, host: &str) -> grafhome_ca::Result<UserRequest> {
+    validate_explicit_user_identity("enrollment export user", user_name)?;
+    validate_explicit_host_identity("enrollment export client host", host)?;
     let public_key = user_public_key_path()?;
-    let material_dir = user_client_material_dir(&user.user, &client.host)?;
-    let private_jwk = material_dir.join("provisioner.priv.json");
+    let material_dir = user_client_material_dir(user_name, host)?;
     let public_jwk = material_dir.join("provisioner.pub.json");
-    for path in [&private_key, &public_key, &private_jwk, &public_jwk] {
+    for path in [&public_key, &public_jwk] {
         if !path.is_file() {
             return Err(grafhome_ca::Error::Validation {
-                field: "enroll user --restart".to_owned(),
-                message: format!(
-                    "cannot restart because {} is missing; run enroll user without --restart",
-                    path.display()
-                ),
+                field: "enrollment export user".to_owned(),
+                message: format!("public enrollment material is missing: {}", path.display()),
             });
         }
     }
@@ -2607,14 +3010,29 @@ fn user_request_from_material(
         path: public_jwk,
         source,
     })?;
-    let request = UserRequest::new(
-        &user.user,
-        &client.host,
-        ssh_public_key.trim(),
-        renewal_public_jwk,
-    );
+    let request = UserRequest::new(user_name, host, ssh_public_key.trim(), renewal_public_jwk);
     request.validate()?;
     Ok(request)
+}
+
+fn require_user_restart_material(user_name: &str, host: &str) -> grafhome_ca::Result<()> {
+    let private_key = user_private_key_path()?;
+    let public_key = user_public_key_path()?;
+    let material_dir = user_client_material_dir(user_name, host)?;
+    let private_jwk = material_dir.join("provisioner.priv.json");
+    let public_jwk = material_dir.join("provisioner.pub.json");
+    for path in [&private_key, &public_key, &private_jwk, &public_jwk] {
+        if !path.is_file() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "enroll user --restart".to_owned(),
+                message: format!(
+                    "cannot restart because {} is missing; run enroll user without --restart",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_renewal_password(
@@ -2662,7 +3080,7 @@ fn confirm_effectively_infinite_user_approval(request: &UserRequest) -> grafhome
 
 fn effectively_infinite_warning(request: &UserRequest, fingerprint: &str) -> String {
     format!(
-        "WARNING: effectively-infinite SSH user certificate\nUser: {}\nClient host: {}\nSSH key: {fingerprint}\nCA-side revocation will not invalidate this certificate; immediate revocation requires OpenSSH RevokedKeys distribution.",
+        "WARNING: effectively-infinite SSH user certificate\nUser: {}\nClient host: {}\nSSH key: {fingerprint}\nImmediate invalidation requires tracking this key in policy and distributing the resulting OpenSSH RevokedKeys KRL to every SSH server.",
         request.user, request.host
     )
 }
@@ -2746,7 +3164,10 @@ fn enroll_user_flow(
     let host = resolve_host(host)?;
     let pending_path = enrollment_request_path(&user, &host)?;
     if restart {
-        let request = user_request_from_material(model, &user, &host)?;
+        let active = active_user(model, &user)?;
+        required_user_client(model, &active.user, &host)?;
+        require_user_restart_material(&user, &host)?;
+        let request = user_request_from_material(&user, &host)?;
         publish_user_request(&pending_path, &request, true)?;
         if request_only {
             return Ok(());
@@ -2854,13 +3275,37 @@ fn approve_user_enrollment(
     }
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
-    let token = authorize_user(model, &request.user, &request.host, &public_jwk, || {
-        create_user_token(
+    let candidate = EnrollmentRecord::pending_user(request, &now_utc()?)?;
+    let provisioner = user_provisioner_name(&request.user, &request.host);
+    let token = with_ca_lock(model, || {
+        let registry_path = enrollment_registry_path(model);
+        let mut registry = EnrollmentRegistry::load(&registry_path)?;
+        reserve_approval_record(
+            model,
+            &mut registry,
+            &registry_path,
+            &candidate,
+            &provisioner,
+        )?;
+        authorize_user_locked(
             model,
             &request.user,
             &request.host,
-            token_ttl,
-            Some(cert_ttl),
+            &public_jwk,
+            &request.ssh_public_key,
+            || {
+                let token = create_user_token(
+                    model,
+                    &request.user,
+                    &request.host,
+                    &request.ssh_public_key,
+                    token_ttl,
+                    Some(cert_ttl),
+                )?;
+                registry.activate(candidate.clone())?;
+                registry.save(&registry_path)?;
+                Ok(token)
+            },
         )
     })?;
     let fingerprint = ca_fingerprint(model)?;
@@ -2974,20 +3419,15 @@ fn host_request_from_material(
     model: &SiteModel,
     host_name: &str,
 ) -> grafhome_ca::Result<HostRequest> {
-    required_host(model, host_name)?;
+    validate_explicit_host_identity("enrollment export host", host_name)?;
     let material_dir = host_material_dir(model, host_name);
-    let private_jwk = material_dir.join("provisioner.priv.json");
     let public_jwk = material_dir.join("provisioner.pub.json");
-    let password_file = material_dir.join("renewal-password");
     let public_key = host_public_key_path(model);
-    for path in [&public_key, &private_jwk, &public_jwk, &password_file] {
+    for path in [&public_key, &public_jwk] {
         if !path.is_file() {
             return Err(grafhome_ca::Error::Validation {
-                field: "enroll host --restart".to_owned(),
-                message: format!(
-                    "cannot restart because {} is missing; run enroll host without --restart",
-                    path.display()
-                ),
+                field: "enrollment export host".to_owned(),
+                message: format!("public enrollment material is missing: {}", path.display()),
             });
         }
     }
@@ -3004,6 +3444,26 @@ fn host_request_from_material(
     let request = HostRequest::new(host_name, ssh_public_key.trim(), renewal_public_jwk);
     request.validate()?;
     Ok(request)
+}
+
+fn require_host_restart_material(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
+    let material_dir = host_material_dir(model, host_name);
+    let private_jwk = material_dir.join("provisioner.priv.json");
+    let public_jwk = material_dir.join("provisioner.pub.json");
+    let password_file = material_dir.join("renewal-password");
+    let public_key = host_public_key_path(model);
+    for path in [&public_key, &private_jwk, &public_jwk, &password_file] {
+        if !path.is_file() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "enroll host --restart".to_owned(),
+                message: format!(
+                    "cannot restart because {} is missing; run enroll host without --restart",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn random_secret() -> grafhome_ca::Result<String> {
@@ -3024,6 +3484,8 @@ fn enroll_host_flow(
     let host = resolve_host(host)?;
     let pending_path = host_enrollment_request_path(model, &host);
     if restart {
+        required_host(model, &host)?;
+        require_host_restart_material(model, &host)?;
         let request = host_request_from_material(model, &host)?;
         publish_host_request(&pending_path, &request, true)?;
         if request_only {
@@ -3098,8 +3560,36 @@ fn approve_host_enrollment(
     required_host(model, &request.host)?;
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
-    let token = authorize_host(model, &request.host, &public_jwk, || {
-        create_host_token(model, &request.host, token_ttl, cert_ttl)
+    let candidate = EnrollmentRecord::pending_host(request, &now_utc()?)?;
+    let provisioner = host_provisioner_name(&request.host);
+    let token = with_ca_lock(model, || {
+        let registry_path = enrollment_registry_path(model);
+        let mut registry = EnrollmentRegistry::load(&registry_path)?;
+        reserve_approval_record(
+            model,
+            &mut registry,
+            &registry_path,
+            &candidate,
+            &provisioner,
+        )?;
+        authorize_host_locked(
+            model,
+            &request.host,
+            &public_jwk,
+            &request.ssh_public_key,
+            || {
+                let token = create_host_token(
+                    model,
+                    &request.host,
+                    &request.ssh_public_key,
+                    token_ttl,
+                    cert_ttl,
+                )?;
+                registry.activate(candidate.clone())?;
+                registry.save(&registry_path)?;
+                Ok(token)
+            },
+        )
     })?;
     let grant = HostGrant::new(
         request,
@@ -3127,8 +3617,9 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
         &grant.root_fingerprint,
     )?;
     enroll_host(model, &grant.host, &grant.token)?;
-    let desired = desired_host_ssh_files(model, &grant.host, &grant.ca_url)?;
-    with_host_policy_lock(model, || {
+    let mut desired = desired_host_ssh_files(model, &grant.host, &grant.ca_url)?;
+    with_host_policy_lock(model, &grant.host, || {
+        compile_host_krls(model, &mut desired)?;
         apply_host_policy_locked(model, &grant.host, &desired, true, true)
     })?;
     outln!("Host enrollment complete: {}", grant.host);
@@ -3246,17 +3737,6 @@ fn desired_host_ssh_files(
 }
 
 fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> {
-    let local_host = resolve_host(None)?;
-    let ca_origin = required_endpoint(model, ENDPOINT_ROLE_CA_ORIGIN)?;
-    if local_host != ca_origin.target {
-        return Err(grafhome_ca::Error::Validation {
-            field: "apply ca".to_owned(),
-            message: format!(
-                "must be run on CA origin {}; local host is {local_host}",
-                ca_origin.target
-            ),
-        });
-    }
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
     if dry_run {
         let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
@@ -3316,14 +3796,16 @@ fn apply_host_policy(
     quiet: bool,
 ) -> grafhome_ca::Result<()> {
     let ca_url = required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url();
-    let desired = desired_host_ssh_files(model, host_name, &ca_url)?;
+    let mut desired = desired_host_ssh_files(model, host_name, &ca_url)?;
     if dry_run {
+        compile_host_krls(model, &mut desired)?;
         let changes = host_policy_changes(model, &desired)?;
         print_host_policy_changes(host_name, &changes, true, false)?;
         return Ok(());
     }
 
-    with_host_policy_lock(model, || {
+    with_host_policy_lock(model, host_name, || {
+        compile_host_krls(model, &mut desired)?;
         apply_host_policy_locked(model, host_name, &desired, quiet, false)
     })
 }
@@ -3335,10 +3817,16 @@ fn apply_host_policy_locked(
     quiet: bool,
     validate_when_current: bool,
 ) -> grafhome_ca::Result<()> {
+    let server_config = install_target(&format!(
+        "{}/sshd_config.d/grafhome-ca.conf",
+        system_ssh_dir(model).display()
+    ));
+    let reload_server = required_host(model, host_name)?.has_ssh_role(SshRole::Server)
+        || read_host_policy_file(&server_config)?.is_some();
     let changes = host_policy_changes(model, desired)?;
     if changes.is_empty() {
         if validate_when_current {
-            validate_and_reload_ssh(model)?;
+            validate_and_reload_ssh(model, host_name, true, reload_server)?;
         }
         if !quiet {
             outln!("Host policy already current: {host_name}");
@@ -3361,12 +3849,12 @@ fn apply_host_policy_locked(
                 HostPolicyChange::Remove => remove_host_policy_file(path)?,
             }
         }
-        validate_and_reload_ssh(model)
+        validate_and_reload_ssh(model, host_name, true, reload_server)
     })();
 
     if let Err(error) = apply {
-        let rollback =
-            restore_host_policy_files(&previous).and_then(|()| validate_and_reload_ssh(model));
+        let rollback = restore_host_policy_files(&previous)
+            .and_then(|()| validate_and_reload_ssh(model, host_name, false, reload_server));
         return Err(grafhome_ca::Error::Validation {
             field: "apply host".to_owned(),
             message: match rollback {
@@ -3379,6 +3867,149 @@ fn apply_host_policy_locked(
     }
 
     print_host_policy_changes(host_name, &changes, false, quiet)
+}
+
+fn compile_host_krls(
+    model: &SiteModel,
+    desired: &mut BTreeMap<PathBuf, HostPolicyFile>,
+) -> grafhome_ca::Result<()> {
+    let targets = desired
+        .keys()
+        .filter(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("revoked_user_certs" | "revoked_host_keys")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for target in targets {
+        let source = desired
+            .get(&target)
+            .expect("KRL source target exists")
+            .content
+            .clone();
+        let source = std::str::from_utf8(&source).map_err(|_| grafhome_ca::Error::Validation {
+            field: target.display().to_string(),
+            message: "rendered KRL source is not UTF-8".to_owned(),
+        })?;
+        let keys = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let krl = compile_krl(model, &target, source.as_bytes(), &keys)?;
+        desired
+            .get_mut(&target)
+            .expect("KRL target still exists")
+            .content = krl;
+    }
+    Ok(())
+}
+
+fn compile_krl(
+    model: &SiteModel,
+    installed: &Path,
+    source: &[u8],
+    keys: &[&str],
+) -> grafhome_ca::Result<Vec<u8>> {
+    let existing_valid = installed.is_file() && krl_is_valid(model, installed)?;
+    if existing_valid {
+        let mut complete = true;
+        for key in keys {
+            if !krl_revokes_key(model, installed, key)? {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            return std::fs::read(installed)
+                .map_err(|source| grafhome_ca::Error::io(installed, source));
+        }
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("grafhome-ca-krl-")
+        .tempdir()
+        .map_err(|source| grafhome_ca::Error::io("temporary KRL directory", source))?;
+    let source_path = temp.path().join("revoked_keys");
+    write_secret_file(&source_path, source)?;
+    let candidate = temp.path().join("revoked_keys.krl");
+    if existing_valid {
+        std::fs::copy(installed, &candidate)
+            .map_err(|source| grafhome_ca::Error::io(&candidate, source))?;
+    }
+    let mut command = process(host_program(model, HOST_SSH_KEYGEN_BIN, "ssh-keygen"));
+    command.arg("-k");
+    if existing_valid {
+        command.arg("-u");
+    }
+    run_status_quiet(
+        command.arg("-f").arg(&candidate).arg(&source_path),
+        &[],
+        true,
+    )?;
+    validate_krl_file(model, &candidate)?;
+    for key in keys {
+        if !krl_revokes_key(model, &candidate, key)? {
+            return Err(grafhome_ca::Error::Validation {
+                field: candidate.display().to_string(),
+                message: "generated KRL does not revoke every requested public key".to_owned(),
+            });
+        }
+    }
+    std::fs::read(&candidate).map_err(|source| grafhome_ca::Error::io(&candidate, source))
+}
+
+fn krl_is_valid(model: &SiteModel, path: &Path) -> grafhome_ca::Result<bool> {
+    let output = process(host_program(model, HOST_SSH_KEYGEN_BIN, "ssh-keygen"))
+        .arg("-Q")
+        .arg("-l")
+        .arg("-f")
+        .arg(path)
+        .output()
+        .map_err(|source| grafhome_ca::Error::io("ssh-keygen", source))?;
+    Ok(output.status.success())
+}
+
+fn validate_krl_file(model: &SiteModel, path: &Path) -> grafhome_ca::Result<()> {
+    run_status_quiet(
+        process(host_program(model, HOST_SSH_KEYGEN_BIN, "ssh-keygen"))
+            .arg("-Q")
+            .arg("-l")
+            .arg("-f")
+            .arg(path),
+        &[],
+        true,
+    )
+}
+
+fn krl_revokes_key(model: &SiteModel, krl: &Path, key: &str) -> grafhome_ca::Result<bool> {
+    let temp = tempfile::Builder::new()
+        .prefix("grafhome-ca-krl-query-")
+        .tempfile()
+        .map_err(|source| grafhome_ca::Error::io("temporary KRL query", source))?;
+    std::fs::write(temp.path(), format!("{key}\n"))
+        .map_err(|source| grafhome_ca::Error::io(temp.path(), source))?;
+    let output = process(host_program(model, HOST_SSH_KEYGEN_BIN, "ssh-keygen"))
+        .arg("-Q")
+        .arg("-f")
+        .arg(krl)
+        .arg(temp.path())
+        .output()
+        .map_err(|source| grafhome_ca::Error::io("ssh-keygen", source))?;
+    match output.status.code() {
+        Some(1) => Ok(true),
+        Some(0) => Ok(false),
+        _ => Err(grafhome_ca::Error::Validation {
+            field: krl.display().to_string(),
+            message: format!(
+                "could not query KRL for {}: {}",
+                key.split_whitespace().next().unwrap_or("SSH key"),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+    }
 }
 
 fn host_policy_changes(
@@ -3421,6 +4052,7 @@ fn host_policy_managed_paths(
         format!("{}/ssh_config.d/grafhome-ca.conf", ssh_system_dir.display()),
         format!("{trust_dir}/user_ca_keys.pem"),
         format!("{trust_dir}/revoked_user_certs"),
+        format!("{trust_dir}/revoked_host_keys"),
         format!("{trust_dir}/ssh_known_hosts"),
     ] {
         paths.insert(install_target(&path));
@@ -3486,13 +4118,56 @@ fn restore_host_policy_files(
     Ok(())
 }
 
-fn validate_and_reload_ssh(model: &SiteModel) -> grafhome_ca::Result<()> {
-    run_status_quiet(
-        process(host_program(model, HOST_SSHD_BIN, "sshd")).arg("-t"),
-        &[],
-        true,
-    )?;
-    reload_ssh(model)
+fn validate_and_reload_ssh(
+    model: &SiteModel,
+    host_name: &str,
+    validate_managed_krls: bool,
+    reload_server: bool,
+) -> grafhome_ca::Result<()> {
+    let host = required_host(model, host_name)?;
+    let trust_dir = &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"];
+    let server_config = install_target(&format!(
+        "{}/sshd_config.d/grafhome-ca.conf",
+        system_ssh_dir(model).display()
+    ));
+    let client_config = install_target(&format!(
+        "{}/ssh_config.d/grafhome-ca.conf",
+        system_ssh_dir(model).display()
+    ));
+    if reload_server {
+        if validate_managed_krls && server_config.is_file() {
+            validate_krl_file(
+                model,
+                &install_target(&format!("{trust_dir}/revoked_user_certs")),
+            )?;
+        }
+        run_status_quiet(
+            process(host_program(model, HOST_SSHD_BIN, "sshd")).arg("-t"),
+            &[],
+            true,
+        )?;
+    }
+    if host.has_ssh_role(SshRole::Client) && client_config.is_file() {
+        if validate_managed_krls {
+            validate_krl_file(
+                model,
+                &install_target(&format!("{trust_dir}/revoked_host_keys")),
+            )?;
+        }
+        run_status_quiet(
+            process(host_program(model, HOST_SSH_BIN, "ssh"))
+                .arg("-G")
+                .arg("-F")
+                .arg(client_config)
+                .arg("grafhome-ca.invalid"),
+            &[],
+            true,
+        )?;
+    }
+    if reload_server {
+        reload_ssh(model)?;
+    }
+    Ok(())
 }
 
 fn print_host_policy_changes(
@@ -3532,10 +4207,12 @@ fn print_host_policy_changes(
 
 fn with_host_policy_lock<T>(
     model: &SiteModel,
+    host_name: &str,
     action: impl FnOnce() -> grafhome_ca::Result<T>,
 ) -> grafhome_ca::Result<T> {
-    if let Some(runtime) = TermuxHostRuntime::detect()? {
-        runtime.prepare_policy_directories()?;
+    match TermuxHostRuntime::detect()? {
+        Some(runtime) => runtime.prepare_policy_directories()?,
+        None => prepare_system_host_policy_directories(model, host_name)?,
     }
     let trust_dir = install_target(&model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"]);
     std::fs::create_dir_all(&trust_dir)
@@ -3549,6 +4226,206 @@ fn with_host_policy_lock<T>(
     file.lock_exclusive()
         .map_err(|source| grafhome_ca::Error::io(&path, source))?;
     action()
+}
+
+#[cfg(unix)]
+fn prepare_system_host_policy_directories(
+    model: &SiteModel,
+    host_name: &str,
+) -> grafhome_ca::Result<()> {
+    let client_readable = required_host(model, host_name)?.has_ssh_role(SshRole::Client);
+    let system_ssh = install_target(&system_ssh_dir(model).display().to_string());
+    let trust = install_target(&model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"]);
+    let principals = install_target(&model.deployment.values["GRAFHOME_CA_AUTH_PRINCIPALS_DIR"]);
+    prepare_managed_ssh_directory(&system_ssh, client_readable)?;
+    prepare_managed_ssh_directory(&system_ssh.join("ssh_config.d"), client_readable)?;
+    prepare_managed_ssh_directory(&trust, client_readable)?;
+    prepare_managed_ssh_directory(&system_ssh.join("sshd_config.d"), false)?;
+    prepare_managed_ssh_directory(&principals, false)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_system_host_policy_directories(
+    model: &SiteModel,
+    _host_name: &str,
+) -> grafhome_ca::Result<()> {
+    let trust = install_target(&model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"]);
+    std::fs::create_dir_all(&trust).map_err(|source| grafhome_ca::Error::io(&trust, source))
+}
+
+#[cfg(unix)]
+fn prepare_managed_ssh_directory(path: &Path, client_readable: bool) -> grafhome_ca::Result<()> {
+    let boundary = std::env::var_os("GRAFHOME_CA_INSTALL_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    prepare_managed_directory_boundary(&boundary)?;
+    let relative = path
+        .strip_prefix(&boundary)
+        .map_err(|_| grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message: format!(
+                "managed SSH directory must remain beneath {}",
+                boundary.display()
+            ),
+        })?;
+    let allow_trusted_system_symlinks = std::env::var_os("GRAFHOME_CA_INSTALL_ROOT").is_none();
+    let mut current = boundary;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(grafhome_ca::Error::Validation {
+                field: path.display().to_string(),
+                message: "managed SSH directory must contain only normal path components"
+                    .to_owned(),
+            });
+        };
+        current.push(name);
+        let created = match std::fs::create_dir(&current) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(source) => return Err(grafhome_ca::Error::io(&current, source)),
+        };
+        let metadata =
+            managed_directory_metadata(&current, current == path, allow_trusted_system_symlinks)?;
+        if created {
+            let mode = if client_readable { 0o755 } else { 0o700 };
+            std::fs::set_permissions(&current, std::fs::Permissions::from_mode(mode))
+                .map_err(|source| grafhome_ca::Error::io(&current, source))?;
+        } else if (metadata.uid() != rustix::process::geteuid().as_raw() && metadata.uid() != 0)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(grafhome_ca::Error::Validation {
+                field: current.display().to_string(),
+                message:
+                    "managed SSH parent must be operator-owned and protected from non-owner writes"
+                        .to_owned(),
+            });
+        } else if current != path && client_readable && metadata.mode() & 0o001 == 0 {
+            return Err(grafhome_ca::Error::Validation {
+                field: current.display().to_string(),
+                message: format!(
+                    "existing parent must be world-traversable for client SSH trust at {}",
+                    path.display()
+                ),
+            });
+        }
+    }
+    let metadata = managed_directory_metadata(path, true, false)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message: "managed SSH directory must be owned by the invoking host-policy operator"
+                .to_owned(),
+        });
+    }
+    let current_mode = metadata.mode() & 0o7777;
+    let desired_mode = if client_readable {
+        0o755
+    } else {
+        (current_mode & 0o777) & !0o022
+    };
+    if desired_mode != current_mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(desired_mode))
+            .map_err(|source| grafhome_ca::Error::io(path, source))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn managed_directory_metadata(
+    path: &Path,
+    final_component: bool,
+    allow_trusted_system_symlink: bool,
+) -> grafhome_ca::Result<std::fs::Metadata> {
+    managed_directory_metadata_for_uid(
+        path,
+        final_component,
+        allow_trusted_system_symlink,
+        rustix::process::geteuid().as_raw(),
+    )
+}
+
+#[cfg(unix)]
+fn managed_directory_metadata_for_uid(
+    path: &Path,
+    final_component: bool,
+    allow_trusted_system_symlink: bool,
+    expected_uid: u32,
+) -> grafhome_ca::Result<std::fs::Metadata> {
+    let link_metadata =
+        std::fs::symlink_metadata(path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    if !link_metadata.file_type().is_symlink() {
+        if link_metadata.file_type().is_dir() {
+            return Ok(link_metadata);
+        }
+        return Err(grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message: "managed SSH path must be a directory".to_owned(),
+        });
+    }
+    if final_component || !allow_trusted_system_symlink {
+        return Err(grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message: "managed SSH path must be a real directory, not a symlink".to_owned(),
+        });
+    }
+
+    let target_metadata =
+        std::fs::metadata(path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    let resolved_target =
+        std::fs::canonicalize(path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    let resolved_parent =
+        std::fs::canonicalize(parent).map_err(|source| grafhome_ca::Error::io(parent, source))?;
+    if link_metadata.uid() != expected_uid
+        || !target_metadata.file_type().is_dir()
+        || target_metadata.uid() != expected_uid
+        || target_metadata.mode() & 0o022 != 0
+        || !protected_directory_chain(&resolved_parent, expected_uid)?
+        || !protected_directory_chain(&resolved_target, expected_uid)?
+    {
+        return Err(grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message:
+                "system SSH symlink must be operator-owned and protected from non-owner writes"
+                    .to_owned(),
+        });
+    }
+    Ok(target_metadata)
+}
+
+#[cfg(unix)]
+fn protected_directory_chain(path: &Path, expected_uid: u32) -> grafhome_ca::Result<bool> {
+    for component in path.ancestors() {
+        let metadata = std::fs::metadata(component)
+            .map_err(|source| grafhome_ca::Error::io(component, source))?;
+        if !metadata.file_type().is_dir()
+            || (metadata.uid() != expected_uid && metadata.uid() != 0)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn prepare_managed_directory_boundary(path: &Path) -> grafhome_ca::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(grafhome_ca::Error::io(path, source)),
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| grafhome_ca::Error::io(path, source))?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(grafhome_ca::Error::Validation {
+            field: path.display().to_string(),
+            message: "managed SSH installation root must be a real directory".to_owned(),
+        })
+    }
 }
 
 fn rendered_host_target(path: &Path, expected_host: &str) -> Option<String> {
@@ -3655,6 +4532,7 @@ fn ca_fingerprint(model: &SiteModel) -> grafhome_ca::Result<String> {
 fn create_host_token(
     model: &SiteModel,
     host: &str,
+    ssh_public_key: &str,
     token_ttl: Option<&str>,
     cert_ttl: Option<&str>,
 ) -> grafhome_ca::Result<Vec<u8>> {
@@ -3672,6 +4550,7 @@ fn create_host_token(
     let step_bin = root_step_bin(model)?;
     let (provisioner_key, provisioner_password) =
         enrollment_provisioner_credential(model, &provisioner.name)?;
+    let key_blob = grafhome_ca::runtime_provisioners::ssh_public_key_blob(ssh_public_key)?;
     let mut command = process(&step_bin);
     command
         .env("STEPPATH", model.deployment.ca_steppath())
@@ -3688,6 +4567,8 @@ fn create_host_token(
         .arg(token_ttl)
         .arg("--cert-not-after")
         .arg(cert_ttl)
+        .arg("--set")
+        .arg(format!("grafhomeSSHPublicKey={key_blob}"))
         .arg("--issuer")
         .arg(&provisioner.name)
         .arg("--key")
@@ -3829,6 +4710,7 @@ fn create_user_token(
     model: &SiteModel,
     user: &str,
     host: &str,
+    ssh_public_key: &str,
     token_ttl: Option<&str>,
     cert_ttl: Option<&str>,
 ) -> grafhome_ca::Result<Vec<u8>> {
@@ -3846,6 +4728,7 @@ fn create_user_token(
     let step_bin = root_step_bin(model)?;
     let (provisioner_key, provisioner_password) =
         enrollment_provisioner_credential(model, &user.provisioner)?;
+    let key_blob = grafhome_ca::runtime_provisioners::ssh_public_key_blob(ssh_public_key)?;
     run_capture(
         process(&step_bin)
             .env("STEPPATH", model.deployment.ca_steppath())
@@ -3859,6 +4742,8 @@ fn create_user_token(
             .arg(token_ttl)
             .arg("--cert-not-after")
             .arg(cert_ttl)
+            .arg("--set")
+            .arg(format!("grafhomeSSHPublicKey={key_blob}"))
             .arg("--issuer")
             .arg(&user.provisioner)
             .arg("--key")
@@ -3906,23 +4791,12 @@ fn issue_user_certificate(
     Ok(())
 }
 
-fn authorize_user<T>(
-    model: &SiteModel,
-    user_name: &str,
-    host: &str,
-    public_key: &str,
-    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
-) -> grafhome_ca::Result<T> {
-    with_ca_lock(model, move || {
-        authorize_user_locked(model, user_name, host, public_key, after_activate)
-    })
-}
-
 fn authorize_user_locked<T>(
     model: &SiteModel,
     user_name: &str,
     host: &str,
-    public_key: &str,
+    renewal_public_jwk: &str,
+    ssh_public_key: &str,
     after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
 ) -> grafhome_ca::Result<T> {
     let user = active_user(model, user_name)?;
@@ -3933,25 +4807,32 @@ fn authorize_user_locked<T>(
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
     std::fs::create_dir_all(&template_dir)
         .map_err(|source| grafhome_ca::Error::io(&template_dir, source))?;
-    std::fs::write(&template_file, user_ssh_template(&user.principal))
-        .map_err(|source| grafhome_ca::Error::io(&template_file, source))?;
+    std::fs::write(
+        &template_file,
+        user_ssh_template(&user.principal, ssh_public_key)?,
+    )
+    .map_err(|source| grafhome_ca::Error::io(&template_file, source))?;
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
-    let result = with_temp_file(&template_dir, public_key.as_bytes(), |public_key_file| {
-        let text = grafhome_ca::runtime_provisioners::reconcile_user_client(
-            model,
-            &ca_json,
-            public_key_file,
-            &provisioner,
-            &template_file.display().to_string(),
-        )?;
-        install_ca_json_with_rollback(
-            model,
-            &ca_json,
-            text.as_bytes(),
-            ca_api.url(),
-            after_activate,
-        )
-    });
+    let result = with_temp_file(
+        &template_dir,
+        renewal_public_jwk.as_bytes(),
+        |public_key_file| {
+            let text = grafhome_ca::runtime_provisioners::reconcile_user_client(
+                model,
+                &ca_json,
+                public_key_file,
+                &provisioner,
+                &template_file.display().to_string(),
+            )?;
+            install_ca_json_with_rollback(
+                model,
+                &ca_json,
+                text.as_bytes(),
+                ca_api.url(),
+                after_activate,
+            )
+        },
+    );
     match result {
         Ok(value) => {
             outln!("authorized provisioner: {provisioner}");
@@ -3964,21 +4845,11 @@ fn authorize_user_locked<T>(
     }
 }
 
-fn authorize_host<T>(
-    model: &SiteModel,
-    host_name: &str,
-    public_key: &str,
-    after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
-) -> grafhome_ca::Result<T> {
-    with_ca_lock(model, move || {
-        authorize_host_locked(model, host_name, public_key, after_activate)
-    })
-}
-
 fn authorize_host_locked<T>(
     model: &SiteModel,
     host_name: &str,
-    public_key: &str,
+    renewal_public_jwk: &str,
+    ssh_public_key: &str,
     after_activate: impl FnOnce() -> grafhome_ca::Result<T>,
 ) -> grafhome_ca::Result<T> {
     let host = required_host(model, host_name)?;
@@ -3988,25 +4859,29 @@ fn authorize_host_locked<T>(
     let template_file = template_dir.join(format!("{provisioner}.tpl"));
     std::fs::create_dir_all(&template_dir)
         .map_err(|source| grafhome_ca::Error::io(&template_dir, source))?;
-    std::fs::write(&template_file, host_ssh_template(host))
+    std::fs::write(&template_file, host_ssh_template(host, ssh_public_key)?)
         .map_err(|source| grafhome_ca::Error::io(&template_file, source))?;
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
-    let result = with_temp_file(&template_dir, public_key.as_bytes(), |public_key_file| {
-        let text = grafhome_ca::runtime_provisioners::reconcile_host(
-            model,
-            &ca_json,
-            public_key_file,
-            &provisioner,
-            &template_file.display().to_string(),
-        )?;
-        install_ca_json_with_rollback(
-            model,
-            &ca_json,
-            text.as_bytes(),
-            ca_api.url(),
-            after_activate,
-        )
-    });
+    let result = with_temp_file(
+        &template_dir,
+        renewal_public_jwk.as_bytes(),
+        |public_key_file| {
+            let text = grafhome_ca::runtime_provisioners::reconcile_host(
+                model,
+                &ca_json,
+                public_key_file,
+                &provisioner,
+                &template_file.display().to_string(),
+            )?;
+            install_ca_json_with_rollback(
+                model,
+                &ca_json,
+                text.as_bytes(),
+                ca_api.url(),
+                after_activate,
+            )
+        },
+    );
     match result {
         Ok(value) => {
             outln!("authorized provisioner: {provisioner}");
@@ -4019,15 +4894,33 @@ fn authorize_host_locked<T>(
     }
 }
 
-fn revoke_user(model: &SiteModel, user_name: &str, host: Option<&str>) -> grafhome_ca::Result<()> {
+fn revoke_user(
+    model: &SiteModel,
+    user_name: &str,
+    host: Option<&str>,
+    reason: Option<&str>,
+) -> grafhome_ca::Result<()> {
     if user_name.trim().is_empty() {
         return Err(grafhome_ca::Error::Validation {
             field: "revoke user.user".to_owned(),
             message: "user must not be empty".to_owned(),
         });
     }
+    validate_revocation_reason(reason)?;
     with_ca_lock(model, || {
         let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+        let registry_path = enrollment_registry_path(model);
+        let mut registry = EnrollmentRegistry::load(&registry_path)?;
+        let selected = registry.records_for_user(user_name, host);
+        let live_enrollments = live_user_enrollments(&ca_json, user_name, host)?;
+        require_registry_coverage(&selected, &live_enrollments)?;
+        let newly_revoked = selected
+            .iter()
+            .filter(|record| record.status() != RecordStatus::Revoked)
+            .count();
+        let timestamp = now_utc()?;
+        let policy_update = prepare_revocation_policy_update(model, &selected, &timestamp, reason)?;
+        let ledger_added = policy_update.added;
         let (text, removed) = match host {
             Some(host) => grafhome_ca::runtime_provisioners::remove_exact(
                 &ca_json,
@@ -4038,13 +4931,16 @@ fn revoke_user(model: &SiteModel, user_name: &str, host: Option<&str>) -> grafho
                 &user_provisioner_prefix(user_name),
             )?,
         };
-        finish_revocation(
+        policy_update.write()?;
+        activate_revocation_ca_update(
             model,
             &ca_json,
-            text,
-            !removed.is_empty(),
-            &format!("user {user_name}"),
+            &text,
+            !removed.is_empty() || newly_revoked != 0,
         )?;
+        if registry.mark_revoked(&selected, &timestamp) != 0 {
+            registry.save(&registry_path)?;
+        }
         let mut templates = removed;
         match host {
             Some(host) => templates.push(user_provisioner_name(user_name, host)),
@@ -4052,39 +4948,332 @@ fn revoke_user(model: &SiteModel, user_name: &str, host: Option<&str>) -> grafho
                 parse_user_provisioner_name(name).is_some_and(|(user, _)| user == user_name)
             })?),
         }
-        remove_provisioner_templates(model, &templates)
+        remove_provisioner_templates(model, &templates)?;
+        print_active_revocation_result(
+            &format!("user {user_name}"),
+            newly_revoked,
+            ledger_added,
+            &model
+                .policy
+                .root
+                .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+        )
     })
 }
 
-fn revoke_host(model: &SiteModel, host_name: &str) -> grafhome_ca::Result<()> {
+fn revoke_host(
+    model: &SiteModel,
+    host_name: &str,
+    reason: Option<&str>,
+) -> grafhome_ca::Result<()> {
     if host_name.trim().is_empty() {
         return Err(grafhome_ca::Error::Validation {
             field: "revoke host.host".to_owned(),
             message: "host must not be empty".to_owned(),
         });
     }
+    validate_revocation_reason(reason)?;
     let provisioner = host_provisioner_name(host_name);
     with_ca_lock(model, || {
         let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+        let registry_path = enrollment_registry_path(model);
+        let mut registry = EnrollmentRegistry::load(&registry_path)?;
+        let selected = registry.records_for_host(host_name);
+        let live_enrollments = live_host_enrollments(&ca_json, host_name)?;
+        require_registry_coverage(&selected, &live_enrollments)?;
+        let newly_revoked = selected
+            .iter()
+            .filter(|record| record.status() != RecordStatus::Revoked)
+            .count();
+        let timestamp = now_utc()?;
+        let policy_update = prepare_revocation_policy_update(model, &selected, &timestamp, reason)?;
+        let ledger_added = policy_update.added;
         let (text, removed) = grafhome_ca::runtime_provisioners::remove_host(
             &ca_json,
             &provisioner,
             &user_provisioner_host_suffix(host_name),
         )?;
-        finish_revocation(
+        policy_update.write()?;
+        activate_revocation_ca_update(
             model,
             &ca_json,
-            text,
-            !removed.is_empty(),
-            &format!("host {host_name}"),
+            &text,
+            !removed.is_empty() || newly_revoked != 0,
         )?;
+        if registry.mark_revoked(&selected, &timestamp) != 0 {
+            registry.save(&registry_path)?;
+        }
         let mut templates = removed;
         templates.push(provisioner.clone());
         templates.extend(matching_provisioner_templates(model, |name| {
             parse_user_provisioner_name(name).is_some_and(|(_, host)| host == host_name)
         })?);
-        remove_provisioner_templates(model, &templates)
+        remove_provisioner_templates(model, &templates)?;
+        print_active_revocation_result(
+            &format!("host {host_name}"),
+            newly_revoked,
+            ledger_added,
+            &model
+                .policy
+                .root
+                .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+        )
     })
+}
+
+fn validate_revocation_reason(reason: Option<&str>) -> grafhome_ca::Result<()> {
+    if reason.is_some_and(|reason| reason.trim().is_empty()) {
+        return Err(grafhome_ca::Error::Validation {
+            field: "revoke.reason".to_owned(),
+            message: "reason must not be empty".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+struct LiveEnrollment {
+    identity: String,
+    renewal_public_jwk: serde_json::Value,
+}
+
+fn live_host_enrollments(ca_json: &Path, host: &str) -> grafhome_ca::Result<Vec<LiveEnrollment>> {
+    let host_provisioner = host_provisioner_name(host);
+    live_enrollment_inventory(ca_json, |name| {
+        if name == host_provisioner {
+            return Some(format!("host {host}"));
+        }
+        if let Some((user, client_host)) = parse_user_provisioner_name(name)
+            && client_host == host
+        {
+            return Some(format!("user {user}@{client_host}"));
+        }
+        None
+    })
+}
+
+fn live_user_enrollments(
+    ca_json: &Path,
+    user: &str,
+    host: Option<&str>,
+) -> grafhome_ca::Result<Vec<LiveEnrollment>> {
+    live_enrollment_inventory(ca_json, |name| {
+        let (item_user, client_host) = parse_user_provisioner_name(name)?;
+        if item_user == user && host.is_none_or(|host| client_host == host) {
+            return Some(format!("user {item_user}@{client_host}"));
+        }
+        None
+    })
+}
+
+fn live_enrollment_inventory(
+    ca_json: &Path,
+    mut identity_for: impl FnMut(&str) -> Option<String>,
+) -> grafhome_ca::Result<Vec<LiveEnrollment>> {
+    let live = read_json_file(ca_json)?;
+    let provisioners = live_provisioners(&live, ca_json)?;
+    let mut enrollments = BTreeMap::new();
+    for provisioner in provisioners {
+        let Some(name) = provisioner.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(identity) = identity_for(name) else {
+            continue;
+        };
+        let key = provisioner
+            .get("key")
+            .ok_or_else(|| grafhome_ca::Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("live enrollment provisioner {name} has no public key"),
+            })?;
+        let (key, _) = canonical_jwk(key)?;
+        if enrollments.insert(identity.clone(), key).is_some() {
+            return Err(grafhome_ca::Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("live enrollment identity {identity} is duplicated"),
+            });
+        }
+    }
+    Ok(enrollments
+        .into_iter()
+        .map(|(identity, renewal_public_jwk)| LiveEnrollment {
+            identity,
+            renewal_public_jwk,
+        })
+        .collect())
+}
+
+fn require_registry_coverage(
+    records: &[EnrollmentRecord],
+    live_enrollments: &[LiveEnrollment],
+) -> grafhome_ca::Result<()> {
+    let missing = live_enrollments
+        .iter()
+        .filter(|live| {
+            !records.iter().any(|record| {
+                record.status() != RecordStatus::Revoked
+                    && record.identity() == live.identity
+                    && record.renewal_public_jwk() == &live.renewal_public_jwk
+            })
+        })
+        .map(|live| live.identity.clone())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(grafhome_ca::Error::Validation {
+        field: "revoke enrollment".to_owned(),
+        message: format!(
+            "live enrollment keys are absent from the CA registry: {}; export them on each target and run `grafhome-ca enrollment import` before revoking",
+            missing.join(", ")
+        ),
+    })
+}
+
+struct RevocationPolicyUpdate {
+    target: PathBuf,
+    mode: u32,
+    content: Option<Vec<u8>>,
+    added: usize,
+}
+
+impl RevocationPolicyUpdate {
+    fn write(self) -> grafhome_ca::Result<()> {
+        let Some(content) = self.content else {
+            return Ok(());
+        };
+        write_public_file_atomic(&self.target, &content, self.mode)?;
+        #[cfg(unix)]
+        File::open(
+            self.target
+                .parent()
+                .expect("revocation policy target has a parent"),
+        )
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| grafhome_ca::Error::io(&self.target, source))?;
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RevocationsFile<'a> {
+    format_version: u32,
+    ssh_keys: &'a [grafhome_ca::policy::RevokedSshKey],
+}
+
+fn prepare_revocation_policy_update(
+    model: &SiteModel,
+    records: &[EnrollmentRecord],
+    revoked_at: &str,
+    reason: Option<&str>,
+) -> grafhome_ca::Result<RevocationPolicyUpdate> {
+    let deployed = model
+        .policy
+        .root
+        .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH);
+    let target =
+        std::fs::canonicalize(&deployed).map_err(|source| grafhome_ca::Error::Validation {
+            field: deployed.display().to_string(),
+            message: format!(
+                "tracked revocation policy must already exist before revoking: {source}"
+            ),
+        })?;
+    let metadata = std::fs::symlink_metadata(&target)
+        .map_err(|source| grafhome_ca::Error::io(&target, source))?;
+    if !metadata.file_type().is_file() {
+        return Err(grafhome_ca::Error::Validation {
+            field: target.display().to_string(),
+            message: "tracked revocation policy target must be a regular file".to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    let mode = metadata.permissions().mode() & 0o7777;
+    #[cfg(not(unix))]
+    let mode = 0o644;
+
+    // The command model is loaded before acquiring the CA lock. Reload the tracked ledger here so
+    // serialized revocations cannot overwrite a change committed by an earlier lock holder.
+    let mut policy = grafhome_ca::policy::Policy::load(&model.policy.root)?;
+    let mut seen = policy
+        .revoked_ssh_keys
+        .iter()
+        .map(|entry| (entry.is_user(), entry.fingerprint().to_owned()))
+        .collect::<BTreeSet<_>>();
+    let original_len = policy.revoked_ssh_keys.len();
+    for record in records {
+        let entry = record.to_revocation(revoked_at, reason);
+        if seen.insert((entry.is_user(), entry.fingerprint().to_owned())) {
+            policy.revoked_ssh_keys.push(entry);
+        }
+    }
+    policy.validate()?;
+    let added = policy.revoked_ssh_keys.len() - original_len;
+    let content = if added == 0 {
+        None
+    } else {
+        let text = toml::to_string_pretty(&RevocationsFile {
+            format_version: 1,
+            ssh_keys: &policy.revoked_ssh_keys,
+        })
+        .map_err(|source| grafhome_ca::Error::Validation {
+            field: target.display().to_string(),
+            message: format!("could not serialize revocation policy: {source}"),
+        })?;
+        Some(text.into_bytes())
+    };
+    Ok(RevocationPolicyUpdate {
+        target,
+        mode,
+        content,
+        added,
+    })
+}
+
+fn activate_revocation_ca_update(
+    model: &SiteModel,
+    ca_json: &Path,
+    text: &str,
+    changed: bool,
+) -> grafhome_ca::Result<()> {
+    if !changed {
+        return Ok(());
+    }
+    install_ca_json_with_rollback(
+        model,
+        ca_json,
+        text.as_bytes(),
+        required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
+        || Ok(()),
+    )
+}
+
+fn print_active_revocation_result(
+    identity: &str,
+    newly_revoked: usize,
+    ledger_added: usize,
+    policy_path: &Path,
+) -> grafhome_ca::Result<()> {
+    if newly_revoked == 0 && ledger_added == 0 {
+        outln!("{identity} is already revoked or was never enrolled.");
+        return Ok(());
+    }
+    if newly_revoked == 0 {
+        outln!(
+            "Restored active revocation tracking for {identity}: recorded {ledger_added} SSH keys."
+        );
+    } else if ledger_added == 0 {
+        outln!(
+            "Revoked {identity}: future issuance and renewal are disabled; active revocation keys were already recorded."
+        );
+    } else {
+        outln!(
+            "Revoked {identity}: future issuance and renewal are disabled; recorded {ledger_added} SSH keys for active revocation."
+        );
+    }
+    outln!(
+        "Commit and distribute {}, then run `grafhome-ca apply host` on managed SSH hosts.",
+        policy_path.display()
+    );
+    Ok(())
 }
 
 fn status(
@@ -4418,29 +5607,6 @@ fn matching_provisioner_templates(
         }
     }
     Ok(names)
-}
-
-fn finish_revocation(
-    model: &SiteModel,
-    ca_json: &Path,
-    text: String,
-    removed: bool,
-    identity: &str,
-) -> grafhome_ca::Result<()> {
-    if removed {
-        install_ca_json_with_rollback(
-            model,
-            ca_json,
-            text.as_bytes(),
-            required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
-            || Ok(()),
-        )?;
-        outln!("Revoked {identity}: future issuance and renewal are disabled.");
-    } else {
-        outln!("{identity} is already revoked or was never enrolled.");
-    }
-    outln!("Existing SSH certificates remain valid until their current expiry.");
-    Ok(())
 }
 
 fn install_ca_json_with_rollback<T>(
@@ -5304,14 +6470,17 @@ fn reload_ssh(model: &SiteModel) -> grafhome_ca::Result<()> {
     })
 }
 
-fn user_ssh_template(principal: &str) -> String {
+fn user_ssh_template(principal: &str, ssh_public_key: &str) -> grafhome_ca::Result<String> {
     let principal_json = serde_json::to_string(principal).expect("principal string serializes");
-    format!(
-        "{{\n  \"type\": \"user\",\n  \"keyId\": {{{{ toJson .KeyID }}}},\n  \"principals\": [{principal_json}],\n  \"criticalOptions\": {{{{ toJson .CriticalOptions }}}},\n  \"extensions\": {{{{ toJson .Extensions }}}}\n}}\n"
+    grafhome_ca::runtime_provisioners::bind_ssh_template(
+        &format!(
+            "{{\n  \"type\": \"user\",\n  \"keyId\": {{{{ toJson .KeyID }}}},\n  \"principals\": [{principal_json}],\n  \"criticalOptions\": {{{{ toJson .CriticalOptions }}}},\n  \"extensions\": {{{{ toJson .Extensions }}}}\n}}\n"
+        ),
+        ssh_public_key,
     )
 }
 
-fn host_ssh_template(host: &Host) -> String {
+fn host_ssh_template(host: &Host, ssh_public_key: &str) -> grafhome_ca::Result<String> {
     let principals = host
         .principals
         .iter()
@@ -5319,8 +6488,11 @@ fn host_ssh_template(host: &Host) -> String {
         .map(|principal| serde_json::to_string(principal).expect("principal serializes"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "{{\n  \"type\": \"host\",\n  \"keyId\": {{{{ toJson .KeyID }}}},\n  \"principals\": [{principals}],\n  \"criticalOptions\": {{{{ toJson .CriticalOptions }}}},\n  \"extensions\": {{{{ toJson .Extensions }}}}\n}}\n"
+    grafhome_ca::runtime_provisioners::bind_ssh_template(
+        &format!(
+            "{{\n  \"type\": \"host\",\n  \"keyId\": {{{{ toJson .KeyID }}}},\n  \"principals\": [{principals}],\n  \"criticalOptions\": {{{{ toJson .CriticalOptions }}}},\n  \"extensions\": {{{{ toJson .Extensions }}}}\n}}\n"
+        ),
+        ssh_public_key,
     )
 }
 
@@ -5395,14 +6567,138 @@ mod tests {
 
     use tempfile::tempdir;
 
+    #[cfg(target_os = "macos")]
+    use super::managed_directory_metadata_for_uid;
     use super::{
         CA_REACHABILITY_TIMEOUT, Endpoint, ExistingIdentityChoice, NoncanonicalTerminalMode,
         TermuxHostRuntime, effectively_infinite_warning, endpoint_reachable_with,
-        normalize_regular_file_mode, parse_enrollment_document, prepare_existing_user_identity,
-        read_app_private_credential, read_interactive_document, read_terminal_document,
-        renewal_already_running, require_effectively_infinite_confirmation, ssh_public_keys_match,
-        store_app_private_credential, try_renewal_lock, validate_grant_ca_url,
+        hostnames_match_origin, managed_directory_metadata, normalize_regular_file_mode,
+        parse_enrollment_document, prepare_existing_user_identity,
+        prepare_revocation_policy_update, read_app_private_credential, read_interactive_document,
+        read_terminal_document, renewal_already_running, require_effectively_infinite_confirmation,
+        ssh_public_keys_match, store_app_private_credential, try_renewal_lock,
+        validate_grant_ca_url,
     };
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let source = entry.path();
+            let target = to.join(entry.file_name());
+            if source.is_dir() {
+                copy_tree(&source, &target);
+            } else {
+                fs::copy(source, target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ca_origin_hostname_matching_preserves_explicit_fqdns() {
+        assert!(hostnames_match_origin(
+            "ca-host.example.test",
+            "ca-host.example.test"
+        ));
+        assert!(!hostnames_match_origin(
+            "ca-host.other.test",
+            "ca-host.example.test"
+        ));
+        assert!(hostnames_match_origin("ca-host.example.test", "ca-host"));
+        assert!(hostnames_match_origin("ca-host", "ca-host"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_system_path_accepts_only_trusted_intermediate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::Builder::new()
+            .prefix("grafhome-ca-system-symlink-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let target = directory.path().join("private-etc");
+        let link = directory.path().join("etc");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(managed_directory_metadata(&link, false, true).is_ok());
+        assert!(managed_directory_metadata(&link, false, false).is_err());
+        assert!(managed_directory_metadata(&link, true, true).is_err());
+
+        let writable_parent = directory.path().join("writable-parent");
+        let replaceable_target = writable_parent.join("private-etc");
+        let replaceable_link = directory.path().join("replaceable-etc");
+        fs::create_dir(&writable_parent).unwrap();
+        fs::create_dir(&replaceable_target).unwrap();
+        fs::set_permissions(&writable_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&replaceable_target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&replaceable_target, &replaceable_link).unwrap();
+        assert!(managed_directory_metadata(&replaceable_link, false, true).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_system_path_accepts_macos_etc_symlink() {
+        assert!(
+            managed_directory_metadata_for_uid(std::path::Path::new("/etc"), false, true, 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn revocation_policy_merge_reloads_the_ledger_under_the_ca_lock() {
+        const KEY_ONE: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3";
+        const KEY_TWO: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw";
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("grafhome-ca");
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config"),
+            &root,
+        );
+        let ledger = root.join("policy/revocations.toml");
+        fs::write(&ledger, "format_version = 1\n").unwrap();
+        let model = grafhome_ca::model::SiteModel::load(&root).unwrap();
+        fs::write(
+            &ledger,
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "edge-host"
+public_key = "{KEY_ONE}"
+fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+            ),
+        )
+        .unwrap();
+        let request = grafhome_ca::enrollment::HostRequest::new(
+            "proxy-host",
+            KEY_TWO,
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256", "x": "second-x", "y": "second-y"
+            }),
+        );
+        let record = grafhome_ca::enrollment_registry::EnrollmentRecord::pending_host(
+            &request,
+            "2026-07-24T20:15:15Z",
+        )
+        .unwrap();
+
+        let update =
+            prepare_revocation_policy_update(&model, &[record], "2026-07-24T20:16:15Z", None)
+                .unwrap();
+        let content = String::from_utf8(update.content.unwrap()).unwrap();
+
+        assert!(content.contains(KEY_ONE));
+        assert!(content.contains(KEY_TWO));
+    }
 
     #[cfg(unix)]
     #[test]

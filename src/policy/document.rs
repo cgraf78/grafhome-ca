@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CA_POLICY_PATH, Endpoint, HOST_POLICY_DIR, Host, LEGACY_POLICY_PATHS,
-    PROVISIONER_ROLE_USER_ENROLLMENT, Policy, Provisioner, SshRole, Status, USERS_POLICY_PATH,
-    User, UserClient, UserRemote, expected_provisioner_type, provisioner_role_rank,
-    read_typed_document,
+    PROVISIONER_ROLE_USER_ENROLLMENT, Policy, Provisioner, REVOCATIONS_POLICY_PATH, RevokedSshKey,
+    SshRole, Status, USERS_POLICY_PATH, User, UserClient, UserRemote, expected_provisioner_type,
+    provisioner_role_rank, read_typed_document,
 };
 use crate::error::{Error, Result};
 
@@ -127,6 +127,14 @@ struct LoginPolicy {
     status: Status,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RevocationsDocument {
+    format_version: u32,
+    #[serde(default)]
+    ssh_keys: Vec<RevokedSshKey>,
+}
+
 /// Detect the policy layout while rejecting ambiguous mixed-format trees.
 pub fn detect(root: &Path) -> Result<Format> {
     let canonical = root.join(CA_POLICY_PATH).exists();
@@ -157,6 +165,9 @@ pub fn input_paths(root: &Path) -> Result<Vec<PathBuf>> {
                 PathBuf::from(CA_POLICY_PATH),
                 PathBuf::from(USERS_POLICY_PATH),
             ];
+            if root.join(REVOCATIONS_POLICY_PATH).exists() {
+                paths.push(PathBuf::from(REVOCATIONS_POLICY_PATH));
+            }
             paths.extend(host_paths(root)?);
             Ok(paths)
         }
@@ -167,6 +178,18 @@ pub fn input_paths(root: &Path) -> Result<Vec<PathBuf>> {
 pub fn load(root: &Path) -> Result<Policy> {
     let ca: CaDocument = read_document(root.join(CA_POLICY_PATH))?;
     let users: UsersDocument = read_document(root.join(USERS_POLICY_PATH))?;
+    let revoked_ssh_keys = if root.join(REVOCATIONS_POLICY_PATH).exists() {
+        let document: RevocationsDocument = read_document(root.join(REVOCATIONS_POLICY_PATH))?;
+        if document.format_version != 1 {
+            return Err(Error::Validation {
+                field: format!("{REVOCATIONS_POLICY_PATH}:format_version"),
+                message: "must be 1".to_owned(),
+            });
+        }
+        document.ssh_keys
+    } else {
+        Vec::new()
+    };
 
     let endpoints = ca
         .endpoints
@@ -291,6 +314,7 @@ pub fn load(root: &Path) -> Result<Policy> {
         provisioners,
         user_clients,
         user_remotes,
+        revoked_ssh_keys,
     })
 }
 
@@ -363,6 +387,15 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
         canonical_file(policy_output_path(CA_POLICY_PATH), &ca)?,
         canonical_file(policy_output_path(USERS_POLICY_PATH), &users)?,
     ];
+    if !policy.revoked_ssh_keys.is_empty() {
+        files.push(canonical_file(
+            policy_output_path(REVOCATIONS_POLICY_PATH),
+            &RevocationsDocument {
+                format_version: 1,
+                ssh_keys: policy.revoked_ssh_keys.clone(),
+            },
+        )?);
+    }
     for host in &policy.hosts {
         if !valid_name(&host.host) {
             return Err(Error::Validation {

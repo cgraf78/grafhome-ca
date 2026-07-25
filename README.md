@@ -115,6 +115,17 @@ unless both enrollment provisioners have complete encrypted key/password files
 whose public material matches the live CA, so a skipped or partial migration
 cannot silently disable later approvals.
 
+The first rollout of SSH key-bound enrollment templates intentionally
+invalidates any still-unconsumed grant minted by an older binary: that token
+does not contain the bound public-key claim. Finish or discard outstanding
+short-lived grants before `apply ca`. After rollout, rebuild the request with
+`enroll host --restart --request-only` or
+`enroll user --restart --request-only` and approve it again with the upgraded
+CA origin. If the earlier approval already created a live renewal provisioner
+that is absent from the registry, export and import its public enrollment
+material first, then re-approve the rebuilt request. Do not weaken the
+public-key guard to accept a legacy token.
+
 Treat materialization and installation as one CA maintenance window. The
 command takes the same CA lock as approval, revocation, and policy application
 while it snapshots live state, but a staged output cannot remain current after
@@ -208,9 +219,13 @@ grafhome-ca apply host --host policy-host
 
 `apply host` uses the same validated site model and pinned CA trust as
 enrollment. It reconciles only Grafhome-managed OpenSSH files for the local
-host, including the dedicated authorized-principals directory, then validates
-`sshd` and reloads SSH. A no-op does not reload SSH. If validation or reload
-fails, the command restores the previous files and reloads that configuration.
+host, including the dedicated authorized-principals directory and role-scoped
+key revocation lists (KRLs). Servers receive revoked user keys through
+`RevokedKeys`; clients receive revoked host keys through `RevokedHostKeys`.
+The command compiles and verifies binary KRLs, validates `sshd -t` and
+`ssh -G` as applicable, then reloads SSH. A no-op does not reload SSH. If
+validation or reload fails, the command restores the previous files and
+reloads that configuration.
 `--host` selects the policy identity applied to this machine and overrides
 `GRAFHOME_CA_LOCAL_HOST`; it is not a remote destination.
 Removing an authorization row therefore removes its stale principals file on
@@ -347,14 +362,13 @@ with a routine renewal. The upgraded client preserves the initial certificate
 and proves renewal works by writing a temporary certificate. Routine grants
 remain version 1 and retain their existing wire format.
 
-An effectively-infinite certificate is a long-lived bearer credential. CA-side
-`revoke user` stops future issuance but cannot invalidate a certificate already
-accepted by OpenSSH. Use a hardware-backed or otherwise non-exportable SSH key
-where the device supports one, and maintain an OpenSSH `RevokedKeys`
-distribution path capable of revoking the certificate or its public key
-immediately.
+An effectively-infinite certificate is a long-lived bearer credential. Use a
+hardware-backed or otherwise non-exportable SSH key where the device supports
+one. `revoke user` records the underlying public key for `RevokedKeys`, but
+invalidation begins on each server only after the updated private policy has
+been distributed and `grafhome-ca apply host` has completed there.
 
-CA-side revocation does not require a certificate serial:
+Active revocation does not require a certificate serial:
 
 ```sh
 # Disable the host identity and every user enrollment on that host.
@@ -363,7 +377,75 @@ grafhome-ca revoke host --host ca-host
 # Disable every enrolled client host for a user, or only one client host.
 grafhome-ca revoke user --user alice
 grafhome-ca revoke user --user alice --host laptop-a
+# Store an optional audit reason with newly recorded keys.
+grafhome-ca revoke host --host ca-host --reason "device retired"
 ```
+
+The canonical policy must contain a dedicated tracked file before the first
+revocation. Keep the file in private site configuration because its host and
+user metadata may describe private inventory:
+
+```toml
+# policy/revocations.toml
+format_version = 1
+```
+
+Successful approvals automatically record the SSH public key and the public
+device-renewal JWK in
+`${GRAFHOME_CA_STATE_DIR}/enrollments/registry.json` on the CA origin. This
+owner-only file is mutable CA state, not tracked policy; include it in origin
+backups. Routine host and user renewal neither reads nor updates the registry,
+so registry maintenance cannot interrupt already-enrolled clients.
+
+Backfill enrollments that predate the registry by exporting existing public
+material on each target and importing it on the CA origin. Export does not
+rotate keys or write enrollment state. Import verifies the exported renewal
+JWK against the live provisioner, binds that provisioner's SSH template to the
+exported SSH key, and restarts and health-checks step-ca before activating the
+registry record. Explicit identities remain exportable and importable after
+their policy rows have been disabled or removed:
+
+```sh
+# System host as root, or a Termux host as its app owner.
+grafhome-ca enrollment export host --host policy-host > host-enrollment.txt
+
+# User account on its enrolled client host.
+grafhome-ca enrollment export user \
+  --user policy-user --host policy-host > user-enrollment.txt
+
+# CA origin as root.
+grafhome-ca enrollment import --request-file host-enrollment.txt
+grafhome-ca enrollment import --request-file user-enrollment.txt
+```
+
+Import is a trusted migration assertion for legacy provisioners. Verify the
+exported SSH fingerprint against the target's current certificate or another
+trusted inventory before importing it. The binding prevents future issuance
+for a different key, but CA state cannot discover a different key that a legacy
+unbound provisioner may have signed historically.
+
+Revocation fails closed if any matching live provisioner is absent from the
+registry or has a different renewal key. `revoke host` selects the host key and
+all user keys enrolled on that client host; `revoke user` selects the requested
+user scope. The tracked file stores canonical plain public keys, SSH
+fingerprints, renewal JWK fingerprints, UTC timestamps, and optional reasons.
+Tracking both fingerprints preserves the no-key-reuse rule even if the
+untracked registry must be restored from backup. Logical host and user names
+may be reused after revocation only with both a new SSH key and a new renewal
+key. Previously revoked keys remain permanent tombstones.
+
+The command writes the tracked key entries before changing live CA state. If CA
+activation fails, the conservative policy entries remain staged and rerunning
+the same command is safe. After success, commit and distribute the policy, then
+run `grafhome-ca apply host` on managed SSH hosts. A KRL entry for a plain key
+rejects the current certificate and later renewed certificates for that same
+key. Host apply updates files atomically and restores the previous validated SSH
+configuration if validation or reload fails.
+
+Initial enrollment tokens and every device renewal provisioner are constrained
+to the approved SSH public key. Possession of a renewal JWK therefore cannot be
+used to obtain a certificate for a replacement key that is absent from the
+registry and KRL ledger.
 
 Inspect live enrollment state from the CA or an enrolled client. The command
 queries the CA's public provisioner API through the locally pinned trust root;
@@ -380,9 +462,10 @@ succeeds only when the requested host or user-client enrollment is active. Add
 `--renewable` to also require the local trust and credential material needed by
 a scheduled renewal.
 
-These root-run commands remove the renewal JWK provisioner and immediately stop
-future issuance and renewal. OpenSSH does not query step-ca on each login, so a
-certificate already issued remains usable until its current expiry. The default
+The root-run revoke commands remove the renewal JWK provisioner and immediately
+stop future issuance and renewal. OpenSSH does not query step-ca on each login,
+so an already-issued certificate remains usable only until its key reaches the
+relevant server or client KRL (or until the certificate expires). The default
 policy lifetimes remain 24 hours for users and 168 hours for hosts.
 
 Enrollment grants are read from stdin so their Smallstep tokens do not appear
@@ -401,17 +484,22 @@ local account from substituting policy for a privileged invocation. On the
 documented root-run workflows, the invoking account is root, so the complete
 input chain must be root-owned.
 
-System host lifecycle commands (`enroll host`, `renew host`, and `apply host`)
-and CA state commands (`materialize`, `migrate enrollment-provisioner-keys`,
-`apply ca`, `approve host`, `approve user`, `revoke host`, and `revoke user`)
-enforce an effective UID of root. Termux host lifecycle commands instead accept
-the unprivileged app owner after verifying that `HOME` and `PREFIX` are absolute,
-owner-controlled directories without group or other write access; all host
-state and OpenSSH targets are then derived beneath those roots. Other non-root
-invocations fail before reading enrollment input or changing state. The test
-suite may also exercise system paths without root only when configuration, CA
-state, keys, helper tools, and redirected installation targets are confined
-beneath one protected temporary sandbox.
+System host lifecycle commands (`enroll host`, `renew host`, `apply host`, and
+host enrollment export) and CA state commands (`materialize`,
+`migrate enrollment-provisioner-keys`, `apply ca`, `approve host`,
+`approve user`, `revoke host`, `revoke user`, and `enrollment import`) enforce
+an effective UID of root. CA state commands additionally compare the kernel
+hostname with the configured `ca_origin` target. A configured FQDN requires an
+exact match; a configured short name also matches that kernel name's short
+component. Policy identity environment overrides cannot spoof this check.
+Termux host lifecycle commands
+instead accept the unprivileged app owner after verifying that `HOME` and
+`PREFIX` are absolute, owner-controlled directories without group or other
+write access; all host state and OpenSSH targets are then derived beneath those
+roots. Other non-root or off-origin invocations fail before reading enrollment
+input or changing state. The test suite may also exercise system paths without
+root only when configuration, CA state, keys, helper tools, and redirected
+installation targets are confined beneath one protected temporary sandbox.
 
 This release replaces the old direct `user-login` and shared SSHPOP renewal
 flows. Site policy should use

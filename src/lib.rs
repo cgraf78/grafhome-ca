@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod enrollment;
+pub mod enrollment_registry;
 pub mod error;
 pub mod executable;
 pub mod model;

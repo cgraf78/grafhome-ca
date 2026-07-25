@@ -11,6 +11,12 @@ use tempfile::tempdir;
 const USER_ENROLLMENT_CA_JSON: &str = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-enrollment","key":{"kid":"enrollment-kid","kty":"EC"},"encryptedKey":"encrypted-enrollment","claims":{"defaultUserSSHCertDuration":"24h","maxUserSSHCertDuration":"2562047h","enableSSHCA":true}}]}}"#;
 #[cfg(unix)]
 const HOST_BOOTSTRAP_CA_JSON: &str = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-host-bootstrap","key":{"kid":"bootstrap-kid","kty":"EC"},"encryptedKey":"encrypted-bootstrap","claims":{"defaultHostSSHCertDuration":"168h","maxHostSSHCertDuration":"720h","enableSSHCA":true}}]}}"#;
+#[cfg(unix)]
+const VALID_SSH_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3 fixture";
+#[cfg(unix)]
+const VALID_SSH_KEY_TWO: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw test@fixture";
 
 fn example_config_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config")
@@ -80,6 +86,36 @@ fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
     let log = dir.path().join("calls.log");
 
     copy_dir(&example_config_root(), &config_root);
+    fs::write(
+        config_root.join("policy/revocations.toml"),
+        "format_version = 1\n",
+    )
+    .unwrap();
+    let origin_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
+    if origin_host != "ca-host" {
+        let ca_policy = config_root.join("policy/ca.toml");
+        let policy = fs::read_to_string(&ca_policy).unwrap().replacen(
+            "target = \"ca-host\"",
+            &format!("target = \"{origin_host}\""),
+            1,
+        );
+        fs::write(ca_policy, policy).unwrap();
+        if origin_host != "proxy-host" {
+            fs::write(
+                config_root
+                    .join("policy/hosts")
+                    .join(format!("{origin_host}.toml")),
+                format!("ssh_roles = []\nprincipals = [\"test-origin-{origin_host}\"]\n"),
+            )
+            .unwrap();
+        }
+    }
     fs::create_dir_all(&fake_bin).unwrap();
     fs::create_dir_all(state.join("step/certs")).unwrap();
     fs::create_dir_all(password.parent().unwrap()).unwrap();
@@ -125,7 +161,7 @@ fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
     fs::write(&host_key, "host-private\n").unwrap();
     fs::write(
         format!("{}.pub", host_key.display()),
-        "ssh-ed25519 AAAAhostpublic fixture\n",
+        format!("{VALID_SSH_KEY}\n"),
     )
     .unwrap();
 
@@ -301,10 +337,54 @@ if [ "$1" = "-t" ]; then
     prev="$arg"
   done
   printf 'private\n' > "$out"
-  printf 'ssh-ed25519 AAAApublic test@fixture\n' > "$out.pub"
+  printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw test@fixture\n' > "$out.pub"
 elif [ "$1" = "-L" ]; then
   test -s "$3"
   printf 'inspect %s\n' "$3"
+elif [ "$1" = "-k" ]; then
+  out=""
+  source=""
+  previous=""
+  for argument in "$@"; do
+    if [ "$previous" = "-f" ]; then out="$argument"; fi
+    source="$argument"
+    previous="$argument"
+  done
+  if [ "${FAKE_KRL_GENERATION_FAIL:-}" = "1" ]; then
+    printf 'simulated KRL generation failure\n' >&2
+    exit 49
+  fi
+  if [ ! -e "$out" ]; then printf 'FAKE-KRL\n' > "$out"; fi
+  cat "$source" >> "$out"
+elif [ "$1" = "-Q" ]; then
+  krl=""
+  source=""
+  previous=""
+  list=0
+  for argument in "$@"; do
+    if [ "$argument" = "-l" ]; then list=1; fi
+    if [ "$previous" = "-f" ]; then krl="$argument"; fi
+    source="$argument"
+    previous="$argument"
+  done
+  if ! grep -q '^FAKE-KRL$' "$krl" 2>/dev/null; then exit 44; fi
+  if [ "$list" = "1" ]; then exit 0; fi
+  while IFS= read -r key || [ -n "$key" ]; do
+    [ -z "$key" ] && continue
+    if ! grep -Fqx "$key" "$krl"; then exit 0; fi
+  done < "$source"
+  exit 1
+fi
+"#,
+    );
+    write_executable(
+        &fake_bin.join("ssh"),
+        r#"#!/bin/sh
+set -eu
+printf 'ssh args=%s\n' "$*" >> "$FAKE_LOG"
+if [ "${FAKE_SSH_CONFIG_FAIL:-}" = "1" ]; then
+  printf 'simulated ssh client validation failure\n' >&2
+  exit 50
 fi
 "#,
     );
@@ -484,7 +564,7 @@ fn prepare_macos_user_renewal(home: &Path, fixture: &ExecFixture, with_credentia
 
     let public_key = home.join(".ssh/id_ed25519.pub");
     fs::create_dir_all(public_key.parent().unwrap()).unwrap();
-    fs::write(public_key, "ssh-ed25519 AAAApublic test@fixture\n").unwrap();
+    fs::write(public_key, format!("{VALID_SSH_KEY_TWO}\n")).unwrap();
 
     if with_credential {
         fs::write(
@@ -609,7 +689,7 @@ fn prepare_termux_host_runtime(
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&ssh).unwrap();
-    for executable in ["ssh-keygen", "sshd", "sv"] {
+    for executable in ["ssh", "ssh-keygen", "sshd", "sv"] {
         fs::copy(fixture.fake_bin.join(executable), bin.join(executable)).unwrap();
         fs::set_permissions(bin.join(executable), fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -618,7 +698,7 @@ fn prepare_termux_host_runtime(
     fs::write(ssh.join("ssh_host_ed25519_key"), "host-private\n").unwrap();
     fs::write(
         ssh.join("ssh_host_ed25519_key.pub"),
-        "ssh-ed25519 AAAAhostpublic fixture\n",
+        format!("{VALID_SSH_KEY}\n"),
     )
     .unwrap();
     (home, prefix, bin)
@@ -871,6 +951,7 @@ fn system_host_and_ca_commands_reject_non_root_callers() {
         &["migrate", "enrollment-provisioner-keys"],
         &["approve", "host", "--yes"],
         &["approve", "user", "--yes"],
+        &["enrollment", "import"],
         &["enroll", "host", "--request-only"],
         &["renew", "host"],
         &["revoke", "host", "--host", "proxy-host"],
@@ -902,7 +983,7 @@ fn apply_host_dry_run_does_not_write_or_reload() {
         .success()
         .stdout(predicate::str::contains("create\t"))
         .stdout(predicate::str::contains(
-            "Would apply 6 host policy change(s) for proxy-host",
+            "Would apply 7 host policy change(s) for proxy-host",
         ));
 
     assert!(!install_root.exists());
@@ -924,7 +1005,7 @@ fn apply_host_explicit_host_overrides_the_policy_identity_environment() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Would apply 6 host policy change(s) for proxy-host",
+            "Would apply 7 host policy change(s) for proxy-host",
         ));
 }
 
@@ -942,7 +1023,7 @@ fn apply_host_installs_fresh_local_policy() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Applied 6 host policy change(s) for proxy-host",
+            "Applied 7 host policy change(s) for proxy-host",
         ));
 
     assert_eq!(
@@ -964,6 +1045,208 @@ fn apply_host_installs_fresh_local_policy() {
     assert!(log.contains("systemctl args=reload sshd.service"));
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_compiles_role_scoped_krls_and_reuses_them_when_unchanged() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "retired-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3"
+fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15Z"
+
+[[ssh_keys]]
+kind = "user"
+user = "alice"
+client_host = "retired-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw"
+fingerprint = "SHA256:+3AjrkPFtS9Wir1XpfmKixs1yTrmIGU28cbbOnEMW+o"
+renewal_fingerprint = "SHA256:grNhYzQm8G7RLKOUx2vpN4lqVj0aFJsYYfM1GxKXDnE"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+    )
+    .unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+
+    let trust = install_root.join("etc/ssh/grafhome");
+    assert!(
+        fs::read(trust.join("revoked_user_certs"))
+            .unwrap()
+            .starts_with(b"FAKE-KRL\n")
+    );
+    assert!(
+        fs::read(trust.join("revoked_host_keys"))
+            .unwrap()
+            .starts_with(b"FAKE-KRL\n")
+    );
+    let client =
+        fs::read_to_string(install_root.join("etc/ssh/ssh_config.d/grafhome-ca.conf")).unwrap();
+    assert!(client.contains("RevokedHostKeys /etc/ssh/grafhome/revoked_host_keys"));
+    let first_log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(first_log.matches("ssh-keygen args=-k").count(), 2);
+    assert!(first_log.contains("ssh args=-G -F"));
+
+    fs::write(&fixture.log, "").unwrap();
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Host policy already current"));
+    let second_log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(!second_log.contains("ssh-keygen args=-k"));
+    assert!(!second_log.contains("systemctl args=reload"));
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_krl_generation_failure_writes_no_managed_files() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_KRL_GENERATION_FAIL", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("simulated KRL generation failure"));
+
+    let trust = install_root.join("etc/ssh/grafhome");
+    assert!(trust.join(".apply.lock").is_file());
+    assert!(!trust.join("revoked_user_certs").exists());
+    assert!(!trust.join("revoked_host_keys").exists());
+    assert!(
+        !install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .exists()
+    );
+    assert!(
+        !install_root
+            .join("etc/ssh/ssh_config.d/grafhome-ca.conf")
+            .exists()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ssh-keygen args=-k"));
+    assert!(!log.contains("sshd args=-t"));
+    assert!(!log.contains("systemctl args=reload"));
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_reloads_sshd_when_removing_the_server_role() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+
+    fs::write(
+        fixture
+            .config_root
+            .join("policy/hosts/proxy-host.toml"),
+        "ssh_roles = [\"client\"]\nprincipals = [\"proxy-host\", \"ca.example.test\"]\n\n[user_access.alice]\nenrollment = true\n",
+    )
+    .unwrap();
+    fs::write(&fixture.log, "").unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+
+    assert!(
+        !install_root
+            .join("etc/ssh/sshd_config.d/grafhome-ca.conf")
+            .exists()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("sshd args=-t"));
+    assert!(log.contains("systemctl args=reload sshd.service"));
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_normalizes_public_ssh_directories_under_a_restrictive_umask() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    let binary = assert_cmd::cargo::cargo_bin("grafhome-ca");
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("umask 077; exec \"$@\"")
+        .arg("grafhome-ca-umask-test")
+        .arg(binary)
+        .args(["apply", "host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("HOSTNAME", "proxy-host.example.test")
+        .env("GRAFHOME_CA_INSTALL_ROOT", &install_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (path, expected_mode) in [
+        ("etc/ssh", 0o755),
+        ("etc/ssh/grafhome", 0o755),
+        ("etc/ssh/ssh_config.d", 0o755),
+        ("etc/ssh/sshd_config.d", 0o700),
+        ("etc/ssh/auth_principals", 0o700),
+    ] {
+        assert_eq!(
+            fs::metadata(install_root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode,
+            "{path}"
+        );
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_preserves_existing_secure_server_directory_modes() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    for path in ["etc/ssh/sshd_config.d", "etc/ssh/auth_principals"] {
+        let directory = install_root.join(path);
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+    }
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+
+    for path in ["etc/ssh/sshd_config.d", "etc/ssh/auth_principals"] {
+        assert_eq!(
+            fs::metadata(install_root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750,
+            "{path}"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn apply_host_installs_fresh_local_policy_macos() {
@@ -975,7 +1258,7 @@ fn apply_host_installs_fresh_local_policy_macos() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Applied 6 host policy change(s) for proxy-host",
+            "Applied 7 host policy change(s) for proxy-host",
         ));
 
     assert_eq!(
@@ -1083,7 +1366,7 @@ fn termux_owner_applies_host_policy_under_the_app_prefix() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Applied 6 host policy change(s) for proxy-host",
+            "Applied 7 host policy change(s) for proxy-host",
         ));
 
     let ssh_dir = prefix.join("etc/ssh");
@@ -1427,12 +1710,33 @@ fn apply_ca_restores_previous_policy_when_restart_fails() {
 fn apply_ca_rejects_a_non_origin_host() {
     let (_dir, fixture) = exec_fixture();
     prepare_apply_ca(&fixture);
+    let ca_policy = fixture.config_root.join("policy/ca.toml");
+    let local_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
+    let policy = fs::read_to_string(&ca_policy).unwrap().replacen(
+        &format!("target = \"{local_host}\""),
+        "target = \"off-origin\"",
+        1,
+    );
+    fs::write(ca_policy, policy).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/hosts/off-origin.toml"),
+        "ssh_roles = []\nprincipals = [\"test-off-origin\"]\n",
+    )
+    .unwrap();
 
     apply_ca_command(&fixture)
-        .env("HOSTNAME", "proxy-host.example.test")
+        .env("GRAFHOME_CA_LOCAL_HOST", "off-origin")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("must be run on CA origin ca-host"));
+        .stderr(predicate::str::contains(
+            "must be run on CA origin off-origin",
+        ));
 
     assert!(!fixture.log.exists());
 }
@@ -1509,9 +1813,25 @@ fn apply_host_preserves_custom_trust_and_principals_paths() {
     fs::write(deployment_path, deployment).unwrap();
     prepare_apply_host(&fixture);
 
-    apply_host_command(&fixture, &install_root)
-        .assert()
-        .success();
+    let binary = assert_cmd::cargo::cargo_bin("grafhome-ca");
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("umask 077; exec \"$@\"")
+        .arg("grafhome-ca-custom-path-umask-test")
+        .arg(binary)
+        .args(["apply", "host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("HOSTNAME", "proxy-host.example.test")
+        .env("GRAFHOME_CA_INSTALL_ROOT", &install_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     assert!(
         install_root
@@ -1527,6 +1847,45 @@ fn apply_host_preserves_custom_trust_and_principals_paths() {
         fs::read_to_string(install_root.join("var/lib/grafhome/principals/alice")).unwrap(),
         "alice\n"
     );
+    for (path, expected_mode) in [
+        ("var/lib/grafhome", 0o755),
+        ("var/lib/grafhome/trust", 0o755),
+        ("var/lib/grafhome/principals", 0o700),
+    ] {
+        assert_eq!(
+            fs::metadata(install_root.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            expected_mode,
+            "{path}"
+        );
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_rejects_a_writable_custom_trust_parent() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    let deployment_path = fixture.config_root.join("config/deployment.env");
+    let deployment = fs::read_to_string(&deployment_path).unwrap().replace(
+        "GRAFHOME_CA_SSH_TRUST_DIR=/etc/ssh/grafhome",
+        "GRAFHOME_CA_SSH_TRUST_DIR=/var/lib/grafhome/trust",
+    );
+    fs::write(deployment_path, deployment).unwrap();
+    let writable = install_root.join("var/lib/grafhome");
+    fs::create_dir_all(&writable).unwrap();
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "managed SSH parent must be operator-owned and protected from non-owner writes",
+        ));
 }
 
 #[cfg(unix)]
@@ -1789,6 +2148,1093 @@ fn approve_user_rejects_locally_writable_policy() {
         .stderr(predicate::str::contains("ca-host.toml"));
 
     assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_host_rejects_off_origin_before_reading_the_request() {
+    let (dir, fixture) = exec_fixture();
+    let missing = dir.path().join("must-not-be-read.json");
+    let ca_policy = fixture.config_root.join("policy/ca.toml");
+    let local_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
+    let policy = fs::read_to_string(&ca_policy).unwrap().replacen(
+        &format!("target = \"{local_host}\""),
+        "target = \"off-origin\"",
+        1,
+    );
+    fs::write(ca_policy, policy).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/hosts/off-origin.toml"),
+        "ssh_roles = []\nprincipals = [\"test-off-origin\"]\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "host", "--yes", "--request-file"])
+        .arg(&missing)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("GRAFHOME_CA_LOCAL_HOST", "off-origin")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "must be run on CA origin off-origin",
+        ))
+        .stderr(predicate::str::contains("must-not-be-read").not());
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_import_rejects_off_origin_before_reading_the_export() {
+    let (dir, fixture) = exec_fixture();
+    let missing = dir.path().join("must-not-be-read.json");
+    let ca_policy = fixture.config_root.join("policy/ca.toml");
+    let local_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
+    let policy = fs::read_to_string(&ca_policy).unwrap().replacen(
+        &format!("target = \"{local_host}\""),
+        "target = \"off-origin\"",
+        1,
+    );
+    fs::write(ca_policy, policy).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/hosts/off-origin.toml"),
+        "ssh_roles = []\nprincipals = [\"test-off-origin\"]\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&missing)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("GRAFHOME_CA_LOCAL_HOST", "off-origin")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "must be run on CA origin off-origin",
+        ))
+        .stderr(predicate::str::contains("must-not-be-read").not());
+
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_export_reads_existing_public_material_without_changing_state() {
+    let (dir, fixture) = exec_fixture();
+    let host_material = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/proxy-host");
+    fs::create_dir_all(&host_material).unwrap();
+    fs::write(
+        host_material.join("provisioner.pub.json"),
+        r#"{"kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enrollment",
+            "export",
+            "host",
+            "--host",
+            "proxy-host",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ENROLLMENT:{\"version\":1,\"kind\":\"grafhome-host-enrollment-request\"",
+        ))
+        .stdout(predicate::str::contains("private").not())
+        .stdout(predicate::str::contains("secret").not());
+
+    let home = dir.path().join("home");
+    let user_material = home.join(".config/grafhome-ca/users/alice/hosts/laptop-a");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(&user_material).unwrap();
+    fs::write(home.join(".ssh/id_ed25519.pub"), VALID_SSH_KEY_TWO).unwrap();
+    fs::write(
+        user_material.join("provisioner.pub.json"),
+        r#"{"kty":"EC","crv":"P-256","x":"user-x","y":"user-y"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enrollment",
+            "export",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "laptop-a",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ENROLLMENT:{\"version\":1,\"kind\":\"grafhome-user-enrollment-request\"",
+        ))
+        .stdout(predicate::str::contains("private").not());
+
+    assert!(!host_material.join("pending-enrollment.json").exists());
+    assert!(!user_material.join("pending-enrollment.json").exists());
+    assert!(!enrollment_registry_path(&fixture).exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_import_binds_a_live_host_key_before_activating_the_registry() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("host-export.json");
+    let renewal_key = serde_json::json!({
+        "kid": "ignored-metadata",
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "host-x",
+        "y": "host-y"
+    });
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec(&serde_json::json!({
+            "authority": {
+                "provisioners": [{
+                    "type": "JWK",
+                    "name": "grafhome-host-70726f78792d686f7374",
+                    "key": {
+                        "kty": "EC",
+                        "crv": "P-256",
+                        "x": "host-x",
+                        "y": "host-y"
+                    },
+                    "options": {
+                        "x509": {"template": "legacy-x509"},
+                        "ssh": {"template": "{\"type\":\"host\",\"keyId\":{{ toJson .KeyID }},\"principals\":[\"proxy-host\"]}"}
+                    }
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "proxy-host",
+            "ssh_public_key": VALID_SSH_KEY,
+            "renewal_public_jwk": renewal_key
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let original_ca = fs::read(&ca_json).unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
+        .assert()
+        .failure();
+    assert_eq!(fs::read(&ca_json).unwrap(), original_ca);
+    assert!(!enrollment_registry_path(&fixture).exists());
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported host proxy-host"));
+
+    let registry_path = fixture
+        .config_root
+        .join("../state/enrollments/registry.json");
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    assert_eq!(registry["format_version"], 1);
+    assert_eq!(registry["records"].as_array().unwrap().len(), 1);
+    assert_eq!(registry["records"][0]["status"], "active");
+    assert_eq!(registry["records"][0]["host"], "proxy-host");
+    assert_eq!(
+        registry["records"][0]["ssh_public_key"],
+        VALID_SSH_KEY
+            .split_once(" fixture")
+            .map(|(key, _)| key)
+            .unwrap()
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&registry_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+    let template = config["authority"]["provisioners"][0]["options"]["ssh"]["template"]
+        .as_str()
+        .unwrap();
+    let key_blob = VALID_SSH_KEY.split_whitespace().nth(1).unwrap();
+    assert!(template.contains(&format!("grafhome-ca-ssh-key:{key_blob}")));
+    assert!(template.contains(".Insecure.CR.Key.Marshal"));
+    assert!(template.ends_with(
+        "{\"type\":\"host\",\"keyId\":{{ toJson .KeyID }},\"principals\":[\"proxy-host\"]}"
+    ));
+    let log = fs::read_to_string(&fixture.log).unwrap_or_default();
+    assert!(log.contains("systemctl args=restart step-ca.service"));
+    assert!(log.contains("systemctl args=is-active step-ca.service"));
+    assert!(log.contains("ca health"));
+
+    fs::write(&fixture.log, "").unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+    assert!(fs::read_to_string(&fixture.log).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_import_backfills_a_live_host_after_policy_removal() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("departed-host-export.json");
+    let renewal_key = serde_json::json!({
+        "kty": "EC", "crv": "P-256", "x": "departed-x", "y": "departed-y"
+    });
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec(&serde_json::json!({
+            "authority": {"provisioners": [{
+                "type": "JWK",
+                "name": "grafhome-host-6465706172746564",
+                "key": renewal_key,
+                "options": {
+                    "x509": {"template": "legacy-x509"},
+                    "ssh": {"template": "{\"type\":\"host\",\"keyId\":{{ toJson .KeyID }},\"principals\":[\"departed\"]}"}
+                }
+            }]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "departed",
+            "ssh_public_key": VALID_SSH_KEY,
+            "renewal_public_jwk": renewal_key
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported host departed"));
+
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(registry["records"][0]["host"], "departed");
+    assert_eq!(registry["records"][0]["status"], "active");
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_export_reads_host_and_user_material_after_policy_removal() {
+    let (dir, fixture) = exec_fixture();
+    let host_material = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/departed");
+    fs::create_dir_all(&host_material).unwrap();
+    fs::write(host_material.join("provisioner.priv.json"), "private\n").unwrap();
+    fs::write(
+        host_material.join("provisioner.pub.json"),
+        r#"{"kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}"#,
+    )
+    .unwrap();
+    fs::write(host_material.join("renewal-password"), "secret\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enrollment",
+            "export",
+            "host",
+            "--host",
+            "departed",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"host\":\"departed\""));
+
+    let home = dir.path().join("home");
+    let user_material = home.join(".config/grafhome-ca/users/departed/hosts/retired-client");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(&user_material).unwrap();
+    fs::write(home.join(".ssh/id_ed25519"), "private\n").unwrap();
+    fs::write(home.join(".ssh/id_ed25519.pub"), VALID_SSH_KEY_TWO).unwrap();
+    fs::write(user_material.join("provisioner.priv.json"), "private\n").unwrap();
+    fs::write(
+        user_material.join("provisioner.pub.json"),
+        r#"{"kty":"EC","crv":"P-256","x":"user-x","y":"user-y"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enrollment",
+            "export",
+            "user",
+            "--user",
+            "departed",
+            "--host",
+            "retired-client",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"user\":\"departed\""))
+        .stdout(predicate::str::contains("\"host\":\"retired-client\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_import_backfills_a_live_user_after_policy_removal() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("departed-user-export.json");
+    let renewal_key = serde_json::json!({
+        "kty": "EC", "crv": "P-256", "x": "departed-user-x", "y": "departed-user-y"
+    });
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec(&serde_json::json!({
+            "authority": {"provisioners": [{
+                "type": "JWK",
+                "name": "grafhome-user-6465706172746564-726574697265642d636c69656e74",
+                "key": renewal_key,
+                "options": {
+                    "x509": {"template": "legacy-x509"},
+                    "ssh": {"template": "{\"type\":\"user\",\"keyId\":{{ toJson .KeyID }},\"principals\":[\"departed\"]}"}
+                }
+            }]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-user-enrollment-request",
+            "user": "departed",
+            "host": "retired-client",
+            "ssh_public_key": VALID_SSH_KEY_TWO,
+            "renewal_public_jwk": renewal_key
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Imported user departed@retired-client",
+        ));
+
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(registry["records"][0]["user"], "departed");
+    assert_eq!(registry["records"][0]["client_host"], "retired-client");
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_import_rejects_an_ssh_key_already_in_tracked_revocations() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("host-export.json");
+    let renewal_key = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "replacement-host-x",
+        "y": "replacement-host-y"
+    });
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec(&serde_json::json!({
+            "authority": {
+                "provisioners": [{
+                    "type": "JWK",
+                    "name": "grafhome-host-70726f78792d686f7374",
+                    "key": renewal_key
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "retired-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3"
+fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "proxy-host",
+            "ssh_public_key": VALID_SSH_KEY,
+            "renewal_public_jwk": renewal_key
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("previously revoked SSH key"));
+
+    assert!(!enrollment_registry_path(&fixture).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approval_rejects_an_ssh_key_already_in_tracked_revocations() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("host-request.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(&ca_json, HOST_BOOTSTRAP_CA_JSON).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "retired-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3"
+fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "proxy-host",
+            "ssh_public_key": VALID_SSH_KEY,
+            "renewal_public_jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": "replacement-host-x",
+                "y": "replacement-host-y"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "host", "--yes", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("previously revoked SSH key"));
+
+    assert!(!enrollment_registry_path(&fixture).exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approval_rejects_a_renewal_key_already_in_tracked_revocations() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("host-request.json");
+    let renewal_key = serde_json::json!({
+        "kty": "EC", "crv": "P-256", "x": "reused-renewal-x", "y": "reused-renewal-y"
+    });
+    let (_, renewal_fingerprint) =
+        grafhome_ca::enrollment_registry::canonical_jwk(&renewal_key).unwrap();
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(&ca_json, HOST_BOOTSTRAP_CA_JSON).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        format!(
+            r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "retired-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw"
+fingerprint = "SHA256:+3AjrkPFtS9Wir1XpfmKixs1yTrmIGU28cbbOnEMW+o"
+renewal_fingerprint = "{renewal_fingerprint}"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "proxy-host",
+            "ssh_public_key": VALID_SSH_KEY,
+            "renewal_public_jwk": renewal_key
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "host", "--yes", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("previously revoked renewal key"));
+
+    assert!(!enrollment_registry_path(&fixture).exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approval_requires_import_for_a_live_unregistered_enrollment() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let request_file = fixture.config_root.join("host-request.json");
+    let renewal_key = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "host-x",
+        "y": "host-y"
+    });
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        serde_json::to_vec(&serde_json::json!({
+            "authority": {
+                "provisioners": [
+                    {
+                        "type": "JWK",
+                        "name": "grafhome-host-bootstrap",
+                        "key": {"kid": "bootstrap-kid", "kty": "EC"},
+                        "encryptedKey": "encrypted-bootstrap",
+                        "claims": {
+                            "defaultHostSSHCertDuration": "168h",
+                            "maxHostSSHCertDuration": "720h",
+                            "enableSSHCA": true
+                        }
+                    },
+                    {
+                        "type": "JWK",
+                        "name": "grafhome-host-70726f78792d686f7374",
+                        "key": renewal_key
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &request_file,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "proxy-host",
+            "ssh_public_key": VALID_SSH_KEY,
+            "renewal_public_jwk": renewal_key
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "host", "--yes", "--request-file"])
+        .arg(&request_file)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("enrollment import"));
+
+    assert!(!enrollment_registry_path(&fixture).exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_host_tracks_host_and_user_keys_through_the_policy_symlink() {
+    let (dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{"name":"grafhome-host-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}},{"name":"grafhome-user-616c696365-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"user-x","y":"user-y"}},{"name":"keep-me"}]}}"#,
+    )
+    .unwrap();
+    let host_request = grafhome_ca::enrollment::HostRequest::new(
+        "proxy-host",
+        VALID_SSH_KEY,
+        serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": "host-x", "y": "host-y"
+        }),
+    );
+    let user_request = grafhome_ca::enrollment::UserRequest::new(
+        "alice",
+        "proxy-host",
+        VALID_SSH_KEY_TWO,
+        serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": "user-x", "y": "user-y"
+        }),
+    );
+    let mut registry = grafhome_ca::enrollment_registry::EnrollmentRegistry::default();
+    let now = "2026-07-24T20:14:15Z";
+    let host_record =
+        grafhome_ca::enrollment_registry::EnrollmentRecord::pending_host(&host_request, now)
+            .unwrap();
+    let user_record =
+        grafhome_ca::enrollment_registry::EnrollmentRecord::pending_user(&user_request, now)
+            .unwrap();
+    registry.activate(host_record).unwrap();
+    registry.activate(user_record).unwrap();
+    registry.save(&enrollment_registry_path(&fixture)).unwrap();
+
+    let deployed = fixture.config_root.join("policy/revocations.toml");
+    let tracked = dir.path().join("tracked-revocations.toml");
+    fs::rename(&deployed, &tracked).unwrap();
+    std::os::unix::fs::symlink(&tracked, &deployed).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "revoke",
+            "host",
+            "--host",
+            "proxy-host",
+            "--reason",
+            "device replaced",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "recorded 2 SSH keys for active revocation",
+        ));
+
+    assert!(
+        fs::symlink_metadata(&deployed)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let policy = fs::read_to_string(&tracked).unwrap();
+    assert_eq!(policy.matches("[[ssh_keys]]").count(), 2);
+    assert_eq!(policy.matches("renewal_fingerprint = ").count(), 2);
+    assert!(policy.contains("kind = \"host\""));
+    assert!(policy.contains("kind = \"user\""));
+    assert!(policy.contains("reason = \"device replaced\""));
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert!(
+        registry["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["status"] == "revoked")
+    );
+    let ca = fs::read_to_string(ca_json).unwrap();
+    assert!(!ca.contains("grafhome-host-70726f78792d686f7374"));
+    assert!(!ca.contains("grafhome-user-616c696365-70726f78792d686f7374"));
+    assert!(ca.contains("keep-me"));
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_host_does_not_treat_a_reused_name_tombstone_as_live_registry_coverage() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{"name":"grafhome-host-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"replacement-x","y":"replacement-y"}},{"name":"keep-me"}]}}"#,
+    )
+    .unwrap();
+
+    let request = grafhome_ca::enrollment::HostRequest::new(
+        "proxy-host",
+        VALID_SSH_KEY,
+        serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": "retired-x", "y": "retired-y"
+        }),
+    );
+    let mut registry = grafhome_ca::enrollment_registry::EnrollmentRegistry::default();
+    let record = grafhome_ca::enrollment_registry::EnrollmentRecord::pending_host(
+        &request,
+        "2026-07-24T20:14:15Z",
+    )
+    .unwrap();
+    registry.activate(record).unwrap();
+    let selected = registry.live_for_host("proxy-host");
+    registry.mark_revoked(&selected, "2026-07-24T20:15:15Z");
+    registry.save(&enrollment_registry_path(&fixture)).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "proxy-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3"
+fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:15:15Z"
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("enrollment import"));
+
+    let ca = fs::read_to_string(ca_json).unwrap();
+    assert!(ca.contains("grafhome-host-70726f78792d686f7374"));
+    assert!(ca.contains("replacement-x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_host_keeps_tracked_keys_staged_when_ca_activation_fails_and_retries_cleanly() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{"name":"grafhome-host-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"proxy-host-host-x","y":"host-y"}},{"name":"grafhome-user-616c696365-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"proxy-host-user-x","y":"user-y"}},{"name":"keep-me"}]}}"#,
+    )
+    .unwrap();
+    seed_host_and_user_registry(&fixture, "proxy-host", "alice");
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_SYSTEMCTL_RESTART_FAIL_ONCE", "1")
+        .assert()
+        .failure();
+
+    let policy = fs::read_to_string(fixture.config_root.join("policy/revocations.toml")).unwrap();
+    assert_eq!(policy.matches("[[ssh_keys]]").count(), 2);
+    let ca = fs::read_to_string(&ca_json).unwrap();
+    assert!(ca.contains("grafhome-host-70726f78792d686f7374"));
+    assert!(ca.contains("grafhome-user-616c696365-70726f78792d686f7374"));
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert!(
+        registry["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["status"] == "active")
+    );
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let policy = fs::read_to_string(fixture.config_root.join("policy/revocations.toml")).unwrap();
+    assert_eq!(policy.matches("[[ssh_keys]]").count(), 2);
+    let ca = fs::read_to_string(ca_json).unwrap();
+    assert!(!ca.contains("grafhome-host-70726f78792d686f7374"));
+    assert!(!ca.contains("grafhome-user-616c696365-70726f78792d686f7374"));
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_host_restarts_ca_when_disk_is_already_pruned_but_registry_is_active() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{"name":"keep-me"}]}}"#,
+    )
+    .unwrap();
+    seed_host_and_user_registry(&fixture, "proxy-host", "alice");
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("systemctl args=restart step-ca.service"));
+    assert!(log.contains("ca health"));
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert!(
+        registry["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["status"] == "revoked")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_host_reports_a_repaired_ledger_for_existing_tombstones() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{"name":"keep-me"}]}}"#,
+    )
+    .unwrap();
+    seed_host_and_user_registry(&fixture, "proxy-host", "alice");
+    let registry_path = enrollment_registry_path(&fixture);
+    let mut registry =
+        grafhome_ca::enrollment_registry::EnrollmentRegistry::load(&registry_path).unwrap();
+    let selected = registry.records_for_host("proxy-host");
+    registry.mark_revoked(&selected, "2026-07-24T20:15:15Z");
+    registry.save(&registry_path).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Restored active revocation tracking for host proxy-host: recorded 2 SSH keys.",
+        ))
+        .stdout(predicate::str::contains("Commit and distribute"))
+        .stdout(predicate::str::contains("already revoked").not());
+
+    let policy = fs::read_to_string(fixture.config_root.join("policy/revocations.toml")).unwrap();
+    assert_eq!(policy.matches("[[ssh_keys]]").count(), 2);
+}
+
+#[cfg(unix)]
+fn enrollment_registry_path(fixture: &ExecFixture) -> PathBuf {
+    fixture
+        .config_root
+        .join("../state/enrollments/registry.json")
+}
+
+#[cfg(unix)]
+fn seed_host_and_user_registry(fixture: &ExecFixture, host: &str, user: &str) {
+    let mut registry = grafhome_ca::enrollment_registry::EnrollmentRegistry::default();
+    let now = "2026-07-24T20:14:15Z";
+    let host_request = grafhome_ca::enrollment::HostRequest::new(
+        host,
+        VALID_SSH_KEY,
+        serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": format!("{host}-host-x"), "y": "host-y"
+        }),
+    );
+    let user_request = grafhome_ca::enrollment::UserRequest::new(
+        user,
+        host,
+        VALID_SSH_KEY_TWO,
+        serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": format!("{host}-user-x"), "y": "user-y"
+        }),
+    );
+    let host_record =
+        grafhome_ca::enrollment_registry::EnrollmentRecord::pending_host(&host_request, now)
+            .unwrap();
+    let user_record =
+        grafhome_ca::enrollment_registry::EnrollmentRecord::pending_user(&user_request, now)
+            .unwrap();
+    registry.activate(host_record).unwrap();
+    registry.activate(user_record).unwrap();
+    registry.save(&enrollment_registry_path(fixture)).unwrap();
+}
+
+#[cfg(unix)]
+fn seed_two_user_clients_registry(
+    fixture: &ExecFixture,
+    user: &str,
+    first_host: &str,
+    second_host: &str,
+) {
+    let mut registry = grafhome_ca::enrollment_registry::EnrollmentRegistry::default();
+    let now = "2026-07-24T20:14:15Z";
+    for (host, key, x) in [
+        (first_host, VALID_SSH_KEY, "first-user-x"),
+        (second_host, VALID_SSH_KEY_TWO, "second-user-x"),
+    ] {
+        let request = grafhome_ca::enrollment::UserRequest::new(
+            user,
+            host,
+            key,
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256", "x": x, "y": "user-y"
+            }),
+        );
+        let record =
+            grafhome_ca::enrollment_registry::EnrollmentRecord::pending_user(&request, now)
+                .unwrap();
+        registry.activate(record).unwrap();
+    }
+    registry.save(&enrollment_registry_path(fixture)).unwrap();
+}
+
+#[cfg(unix)]
+fn seed_user_registry_record(
+    fixture: &ExecFixture,
+    user: &str,
+    host: &str,
+    ssh_public_key: &str,
+    renewal_public_jwk: serde_json::Value,
+) {
+    let request =
+        grafhome_ca::enrollment::UserRequest::new(user, host, ssh_public_key, renewal_public_jwk);
+    let record = grafhome_ca::enrollment_registry::EnrollmentRecord::pending_user(
+        &request,
+        "2026-07-24T20:14:15Z",
+    )
+    .unwrap();
+    let mut registry = grafhome_ca::enrollment_registry::EnrollmentRegistry::default();
+    registry.activate(record).unwrap();
+    registry.save(&enrollment_registry_path(fixture)).unwrap();
 }
 
 #[cfg(unix)]
@@ -2166,8 +3612,15 @@ fn materialize_writes_placeholder_free_ca_json() {
         .arg(&staging)
         .assert()
         .success();
+    let origin_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
     let staged_ca_json = staging.join(format!(
-        "hosts/ca-host{}/step/config/ca.json",
+        "hosts/{origin_host}{}/step/config/ca.json",
         dir.path().join("state").display()
     ));
     let live_ca_json = dir.path().join("live-ca.json");
@@ -2420,7 +3873,7 @@ fn approve_host_prints_one_complete_grant() {
         "version": 1,
         "kind": "grafhome-host-enrollment-request",
         "host": "proxy-host",
-        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"}
     });
 
@@ -2448,6 +3901,8 @@ fn approve_host_prints_one_complete_grant() {
     assert!(log.contains("--principal ca.example.test"));
     assert!(log.contains("--not-after 15m"));
     assert!(log.contains("--cert-not-after 168h"));
+    let key_blob = VALID_SSH_KEY.split_whitespace().nth(1).unwrap();
+    assert!(log.contains(&format!("--set grafhomeSSHPublicKey={key_blob}")));
     let enrollment_keys = fixture
         .config_root
         .parent()
@@ -2479,10 +3934,30 @@ fn approve_host_prints_one_complete_grant() {
     assert_eq!(bootstrap["claims"]["maxHostSSHCertDuration"], "720h");
     assert_eq!(bootstrap["claims"]["disableRenewal"], true);
     assert!(
+        bootstrap["options"]["ssh"]["template"]
+            .as_str()
+            .unwrap()
+            .contains("grafhomeSSHPublicKey")
+    );
+    let renewal = provisioners
+        .iter()
+        .find(|item| item["name"] == "grafhome-host-70726f78792d686f7374")
+        .unwrap();
+    assert!(
+        renewal["options"]["ssh"]["template"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("grafhome-ca-ssh-key:{key_blob}"))
+    );
+    assert!(
         provisioners
             .iter()
             .any(|item| item["name"] == "grafhome-host-70726f78792d686f7374")
     );
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(registry["records"].as_array().unwrap().len(), 1);
+    assert_eq!(registry["records"][0]["status"], "active");
 }
 
 #[cfg(unix)]
@@ -2494,7 +3969,7 @@ fn approve_host_rejects_malformed_ttl_before_step_runs() {
         "version": 1,
         "kind": "grafhome-host-enrollment-request",
         "host": "proxy-host",
-        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"}
     });
 
@@ -2528,7 +4003,7 @@ fn approve_host_token_failure_leaves_ca_state_untouched() {
         "version": 1,
         "kind": "grafhome-host-enrollment-request",
         "host": "proxy-host",
-        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"}
     });
 
@@ -2551,6 +4026,10 @@ fn approve_host_token_failure_leaves_ca_state_untouched() {
             .join("../state/step/templates/ssh/grafhome-host-70726f78792d686f7374.tpl")
             .exists()
     );
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(registry["records"].as_array().unwrap().len(), 1);
+    assert_eq!(registry["records"][0]["status"], "pending");
 }
 
 #[cfg(unix)]
@@ -2581,6 +4060,10 @@ fn approve_user_token_failure_leaves_ca_state_untouched() {
             .join("../state/step/templates/ssh/grafhome-user-616c696365-63612d686f7374.tpl")
             .exists()
     );
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(registry["records"].as_array().unwrap().len(), 1);
+    assert_eq!(registry["records"][0]["status"], "pending");
 }
 
 #[cfg(unix)]
@@ -2675,6 +4158,46 @@ fn enroll_host_restart_requires_existing_enrollment_material() {
 
 #[cfg(unix)]
 #[test]
+fn enroll_host_restart_rejects_a_removed_policy_host() {
+    let (_dir, fixture) = exec_fixture();
+    let args = [
+        "enroll",
+        "host",
+        "--host",
+        "edge-host",
+        "--request-only",
+        "--config-root",
+    ];
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+    let pending = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/edge-host/pending-enrollment.json");
+    let original = fs::read(&pending).unwrap();
+    fs::remove_file(fixture.config_root.join("policy/hosts/edge-host.toml")).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .arg("--restart")
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown host"));
+
+    assert_eq!(fs::read(pending).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
 fn enroll_host_uses_trusted_path_step_when_configured_path_is_missing() {
     let (dir, fixture) = exec_fixture();
     let path = configure_step_path_fallback(&dir, &fixture);
@@ -2721,6 +4244,9 @@ fn renew_host_uses_trusted_path_step_when_configured_path_is_missing() {
     fs::create_dir_all(&material).unwrap();
     fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
     fs::write(material.join("renewal-password"), "password\n").unwrap();
+    let registry = enrollment_registry_path(&fixture);
+    fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    fs::write(&registry, "malformed registry must be ignored by renewal\n").unwrap();
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -2755,7 +4281,7 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation() {
         "version": 1,
         "kind": "grafhome-host-enrollment-grant",
         "host": "proxy-host",
-        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
         "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2825,7 +4351,7 @@ fn enroll_host_waits_for_grant_and_completes_in_one_invocation_macos() {
         "version": 1,
         "kind": "grafhome-host-enrollment-grant",
         "host": "proxy-host",
-        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
         "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3132,6 +4658,62 @@ fn enroll_user_restart_requires_existing_enrollment_material() {
 
 #[cfg(unix)]
 #[test]
+fn enroll_user_restart_rejects_a_disabled_policy_client() {
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    let password_file = dir.path().join("password");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(&password_file, "user-owned-password\n").unwrap();
+    let args = [
+        "enroll",
+        "user",
+        "--user",
+        "alice",
+        "--host",
+        "ca-host",
+        "--request-only",
+        "--config-root",
+    ];
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .arg("--password-file")
+        .arg(&password_file)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+    let pending =
+        home.join(".config/grafhome-ca/users/alice/hosts/ca-host/pending-enrollment.json");
+    let original = fs::read(&pending).unwrap();
+    let host_policy = fixture.config_root.join("policy/hosts/ca-host.toml");
+    let policy = fs::read_to_string(&host_policy).unwrap().replace(
+        "[user_access.alice.enrollment]\nallow_effectively_infinite_cert = true",
+        "[user_access.alice.enrollment]\nallow_effectively_infinite_cert = true\nstatus = \"disabled\"",
+    );
+    fs::write(host_policy, policy).unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg(&fixture.config_root)
+        .arg("--restart")
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "missing active user client for user and host",
+        ));
+
+    assert_eq!(fs::read(pending).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
 fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
@@ -3143,7 +4725,7 @@ fn enroll_user_waits_for_grant_and_completes_in_one_invocation() {
         "kind": "grafhome-user-enrollment-grant",
         "user": "alice",
         "host": "ca-host",
-        "ssh_public_key": "ssh-ed25519 AAAApublic test@fixture",
+        "ssh_public_key": VALID_SSH_KEY_TWO,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
         "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3505,7 +5087,7 @@ fn enroll_and_renew_user_with_macos_keychain_credential() {
         "kind": "grafhome-user-enrollment-grant",
         "user": "alice",
         "host": "ca-host",
-        "ssh_public_key": "ssh-ed25519 AAAApublic test@fixture",
+        "ssh_public_key": VALID_SSH_KEY_TWO,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
         "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3942,7 +5524,7 @@ fn enroll_user_rejects_grant_for_a_different_ssh_key() {
         "kind": "grafhome-user-enrollment-grant",
         "user": "alice",
         "host": "ca-host",
-        "ssh_public_key": "ssh-ed25519 AAAAdifferent attacker",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
         "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -4137,7 +5719,7 @@ fn enroll_host_redacts_token_from_failed_step_error() {
         "version": 1,
         "kind": "grafhome-host-enrollment-grant",
         "host": "proxy-host",
-        "ssh_public_key": "ssh-ed25519 AAAAhostpublic fixture",
+        "ssh_public_key": VALID_SSH_KEY,
         "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
         "ca_url": "https://ca.example.test",
         "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -4209,6 +5791,15 @@ fn approve_user_authorizes_effectively_infinite_enrollment_and_finite_renewal() 
         .unwrap(),
     )
     .unwrap();
+    seed_user_registry_record(
+        &fixture,
+        "alice",
+        "ca-host",
+        VALID_SSH_KEY_TWO,
+        serde_json::json!({
+            "kty": "EC", "crv": "P-256", "x": "client-x", "y": "client-y"
+        }),
+    );
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.args(["approve", "user"])
@@ -4260,6 +5851,19 @@ fn approve_user_authorizes_effectively_infinite_enrollment_and_finite_renewal() 
             .unwrap()
             .contains(r#""principals": ["alice"]"#)
     );
+    let key_blob = VALID_SSH_KEY_TWO.split_whitespace().nth(1).unwrap();
+    assert!(
+        provisioner["options"]["ssh"]["template"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("grafhome-ca-ssh-key:{key_blob}"))
+    );
+    assert!(
+        enrollment["options"]["ssh"]["template"]
+            .as_str()
+            .unwrap()
+            .contains("grafhomeSSHPublicKey")
+    );
     assert!(
         ca_json
             .parent()
@@ -4276,6 +5880,7 @@ fn approve_user_authorizes_effectively_infinite_enrollment_and_finite_renewal() 
     assert!(log.contains("systemctl args=is-active step-ca.service"));
     assert!(log.contains("ca health"));
     assert!(log.contains("--cert-not-after 2562047h"));
+    assert!(log.contains(&format!("--set grafhomeSSHPublicKey={key_blob}")));
     let enrollment_keys = fixture
         .config_root
         .parent()
@@ -4439,25 +6044,28 @@ fn concurrent_approvals_preserve_both_renewal_provisioners() {
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(&ca_json, USER_ENROLLMENT_CA_JSON).unwrap();
     let path = prepend_path(&fixture.fake_bin);
-    let requests = ["ca-host", "proxy-host"].map(|host| {
-        format!(
-            "REQUEST:{}\n",
-            serde_json::json!({
-                "version": 1,
-                "kind": "grafhome-user-enrollment-request",
-                "user": "alice",
-                "host": host,
-                "ssh_public_key": format!("ssh-ed25519 AAAApublic alice@{host}"),
-                "renewal_public_jwk": {
-                    "kid": format!("{host}-kid"),
-                    "kty": "EC",
-                    "crv": "P-256",
-                    "x": format!("{host}-x"),
-                    "y": format!("{host}-y")
-                }
-            })
-        )
-    });
+    let requests = ["ca-host", "proxy-host"]
+        .into_iter()
+        .zip([VALID_SSH_KEY, VALID_SSH_KEY_TWO])
+        .map(|(host, ssh_public_key)| {
+            format!(
+                "REQUEST:{}\n",
+                serde_json::json!({
+                    "version": 1,
+                    "kind": "grafhome-user-enrollment-request",
+                    "user": "alice",
+                    "host": host,
+                    "ssh_public_key": ssh_public_key,
+                    "renewal_public_jwk": {
+                        "kid": format!("{host}-kid"),
+                        "kty": "EC",
+                        "crv": "P-256",
+                        "x": format!("{host}-x"),
+                        "y": format!("{host}-y")
+                    }
+                })
+            )
+        });
     let handles = requests.map(|request| {
         let config_root = fixture.config_root.clone();
         let log = fixture.log.clone();
@@ -4532,6 +6140,9 @@ fn renew_user_reads_password_from_stdin_and_refreshes_cert() {
     fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
     let password_file = dir.path().join("password");
     fs::write(&password_file, "user-owned-password\n").unwrap();
+    let registry = enrollment_registry_path(&fixture);
+    fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    fs::write(&registry, "malformed registry must be ignored by renewal\n").unwrap();
     let mut cmd = Command::cargo_bin("grafhome-ca").expect("binary exists");
 
     cmd.args(["renew", "user"])
@@ -4713,9 +6324,10 @@ fn revoke_host_removes_only_the_renewal_provisioner() {
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(
         &ca_json,
-        r#"{"authority":{"provisioners":[{"name":"grafhome-host-70726f78792d686f7374"},{"name":"grafhome-user-616c696365-70726f78792d686f7374"},{"name":"grafhome-user-616c696365-63612d686f7374"},{"type":"SSHPOP","name":"grafhome-host-renew"},{"name":"keep-me"}]}}"#,
+        r#"{"authority":{"provisioners":[{"name":"grafhome-host-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"proxy-host-host-x","y":"host-y"}},{"name":"grafhome-user-616c696365-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"proxy-host-user-x","y":"user-y"}},{"name":"grafhome-user-616c696365-63612d686f7374"},{"type":"SSHPOP","name":"grafhome-host-renew"},{"name":"keep-me"}]}}"#,
     )
     .unwrap();
+    seed_host_and_user_registry(&fixture, "proxy-host", "alice");
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
@@ -4732,7 +6344,7 @@ fn revoke_host_removes_only_the_renewal_provisioner() {
             "future issuance and renewal are disabled",
         ))
         .stdout(predicate::str::contains(
-            "remain valid until their current expiry",
+            "recorded 2 SSH keys for active revocation",
         ));
 
     let text = fs::read_to_string(ca_json).unwrap();
@@ -5091,9 +6703,10 @@ fn revoke_host_discovers_live_enrollment_after_policy_removal() {
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(
         &ca_json,
-        r#"{"authority":{"provisioners":[{"name":"grafhome-host-6465706172746564"},{"name":"grafhome-user-616c696365-6465706172746564"},{"name":"keep-me"}]}}"#,
+        r#"{"authority":{"provisioners":[{"name":"grafhome-host-6465706172746564","key":{"kty":"EC","crv":"P-256","x":"departed-host-x","y":"host-y"}},{"name":"grafhome-user-616c696365-6465706172746564","key":{"kty":"EC","crv":"P-256","x":"departed-user-x","y":"user-y"}},{"name":"keep-me"}]}}"#,
     )
     .unwrap();
+    seed_host_and_user_registry(&fixture, "departed", "alice");
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -5133,9 +6746,10 @@ fn revoke_user_discovers_every_live_client_after_policy_removal() {
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
     fs::write(
         &ca_json,
-        r#"{"authority":{"provisioners":[{"name":"grafhome-user-6465706172746564-63612d686f7374"},{"name":"grafhome-user-6465706172746564-70726f78792d686f7374"},{"name":"keep-me"}]}}"#,
+        r#"{"authority":{"provisioners":[{"name":"grafhome-user-6465706172746564-63612d686f7374","key":{"kty":"EC","crv":"P-256","x":"first-user-x","y":"user-y"}},{"name":"grafhome-user-6465706172746564-70726f78792d686f7374","key":{"kty":"EC","crv":"P-256","x":"second-user-x","y":"user-y"}},{"name":"keep-me"}]}}"#,
     )
     .unwrap();
+    seed_two_user_clients_registry(&fixture, "departed", "ca-host", "proxy-host");
 
     Command::cargo_bin("grafhome-ca")
         .expect("binary exists")
@@ -5566,6 +7180,61 @@ fn fresh_host_enrollment_then_revocation_disables_device_bound_renewal() {
 }
 
 #[cfg(unix)]
+#[test]
+fn reused_host_name_can_complete_two_distinct_enrollment_generations() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(&ca_json, HOST_BOOTSTRAP_CA_JSON).unwrap();
+
+    for (ssh_key, generation) in [(VALID_SSH_KEY, "first"), (VALID_SSH_KEY_TWO, "second")] {
+        let request = serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-host-enrollment-request",
+            "host": "proxy-host",
+            "ssh_public_key": ssh_key,
+            "renewal_public_jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": format!("{generation}-x"),
+                "y": format!("{generation}-y")
+            }
+        });
+        Command::cargo_bin("grafhome-ca")
+            .unwrap()
+            .args(["approve", "host", "--yes", "--config-root"])
+            .arg(&fixture.config_root)
+            .env("PATH", prepend_path(&fixture.fake_bin))
+            .env("FAKE_LOG", &fixture.log)
+            .write_stdin(format!("REQUEST:{request}\n"))
+            .assert()
+            .success();
+        Command::cargo_bin("grafhome-ca")
+            .unwrap()
+            .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
+            .arg(&fixture.config_root)
+            .env("PATH", prepend_path(&fixture.fake_bin))
+            .env("FAKE_LOG", &fixture.log)
+            .assert()
+            .success();
+    }
+
+    let policy = fs::read_to_string(fixture.config_root.join("policy/revocations.toml")).unwrap();
+    assert_eq!(policy.matches("[[ssh_keys]]").count(), 2);
+    assert_eq!(policy.matches("renewal_fingerprint = ").count(), 2);
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    assert_eq!(registry["records"].as_array().unwrap().len(), 2);
+    assert!(
+        registry["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["status"] == "revoked")
+    );
+}
+
+#[cfg(unix)]
 fn prefixed_document(output: &[u8], prefix: &str) -> String {
     String::from_utf8_lossy(output)
         .lines()
@@ -5588,7 +7257,7 @@ fn user_enrollment_request_for(host: &str) -> String {
             "kind": "grafhome-user-enrollment-request",
             "user": "alice",
             "host": host,
-            "ssh_public_key": format!("ssh-ed25519 AAAApublic alice@{host}"),
+            "ssh_public_key": format!("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw alice@{host}"),
             "renewal_public_jwk": {
                 "kid": "client-kid",
                 "kty": "EC",

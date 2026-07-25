@@ -137,6 +137,14 @@ fn validate_canonical_policy(config_root: &Path) -> Result<()> {
         schema_text: include_str!("../schemas/policy/users.schema.json"),
     };
     validate_policy_file(config_root, users.path, &users)?;
+    if config_root.join(policy::REVOCATIONS_POLICY_PATH).exists() {
+        let revocations = PolicySpec {
+            path: policy::REVOCATIONS_POLICY_PATH,
+            schema: "schemas/policy/revocations.schema.json",
+            schema_text: include_str!("../schemas/policy/revocations.schema.json"),
+        };
+        validate_policy_file(config_root, revocations.path, &revocations)?;
+    }
     let host_schema = include_str!("../schemas/policy/host.schema.json");
     for path in policy::input_paths(config_root)?
         .into_iter()
@@ -192,6 +200,33 @@ mod tests {
         assert!(error.contains("Additional properties are not allowed"));
         assert!(error.contains("legacy_flag"));
         assert!(error.contains("policy/hosts/ca-host.toml"));
+    }
+
+    #[test]
+    fn canonical_schema_validates_revocations_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        copy_tree(&example_config_root(), dir.path());
+        fs::write(
+            dir.path().join("policy/revocations.toml"),
+            r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "edge-host"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3"
+fingerprint = "not-an-openssh-fingerprint"
+revoked_at = "yesterday"
+unexpected = true
+"#,
+        )
+        .unwrap();
+
+        let error = crate::schema::validate_config_root(dir.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("policy/revocations.toml"));
+        assert!(error.contains("additional properties") || error.contains("fingerprint"));
     }
 
     #[test]
@@ -305,6 +340,19 @@ mod tests {
                 copy_dir(&entry.path(), &target);
             } else {
                 fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let destination = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &destination);
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
             }
         }
     }

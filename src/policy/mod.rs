@@ -20,6 +20,8 @@ pub use document::Format;
 pub const CA_POLICY_PATH: &str = "policy/ca.toml";
 /// Canonical stable user identity document.
 pub const USERS_POLICY_PATH: &str = "policy/users.toml";
+/// Canonical SSH key revocation document.
+pub const REVOCATIONS_POLICY_PATH: &str = "policy/revocations.toml";
 /// Canonical per-host policy directory.
 pub const HOST_POLICY_DIR: &str = "policy/hosts";
 
@@ -258,6 +260,102 @@ pub struct UserRemote {
     pub status: Status,
 }
 
+/// One permanently revoked SSH public key.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum RevokedSshKey {
+    /// SSH host identity key.
+    Host {
+        /// Reusable policy host name associated with the revoked key.
+        host: String,
+        /// Canonical OpenSSH public key without a comment.
+        public_key: String,
+        /// SHA-256 OpenSSH fingerprint derived from `public_key`.
+        fingerprint: String,
+        /// SHA-256 thumbprint of the device renewal JWK.
+        renewal_fingerprint: String,
+        /// UTC RFC 3339 revocation timestamp.
+        revoked_at: String,
+        /// Optional operator audit context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// SSH user identity key on one client host.
+    User {
+        /// Reusable policy user name associated with the revoked key.
+        user: String,
+        /// Client host where the revoked user key was enrolled.
+        client_host: String,
+        /// Canonical OpenSSH public key without a comment.
+        public_key: String,
+        /// SHA-256 OpenSSH fingerprint derived from `public_key`.
+        fingerprint: String,
+        /// SHA-256 thumbprint of the device renewal JWK.
+        renewal_fingerprint: String,
+        /// UTC RFC 3339 revocation timestamp.
+        revoked_at: String,
+        /// Optional operator audit context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl RevokedSshKey {
+    /// Policy host associated with this key.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        match self {
+            Self::Host { host, .. } => host,
+            Self::User { client_host, .. } => client_host,
+        }
+    }
+
+    /// Whether this is a user authentication key rather than a host identity key.
+    #[must_use]
+    pub const fn is_user(&self) -> bool {
+        matches!(self, Self::User { .. })
+    }
+
+    /// Canonical OpenSSH public key.
+    #[must_use]
+    pub fn public_key(&self) -> &str {
+        match self {
+            Self::Host { public_key, .. } | Self::User { public_key, .. } => public_key,
+        }
+    }
+
+    /// OpenSSH SHA-256 fingerprint.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        match self {
+            Self::Host { fingerprint, .. } | Self::User { fingerprint, .. } => fingerprint,
+        }
+    }
+
+    /// SHA-256 thumbprint of the permanently retired renewal JWK.
+    #[must_use]
+    pub fn renewal_fingerprint(&self) -> &str {
+        match self {
+            Self::Host {
+                renewal_fingerprint,
+                ..
+            }
+            | Self::User {
+                renewal_fingerprint,
+                ..
+            } => renewal_fingerprint,
+        }
+    }
+
+    /// RFC 3339 revocation timestamp.
+    #[must_use]
+    pub fn revoked_at(&self) -> &str {
+        match self {
+            Self::Host { revoked_at, .. } | Self::User { revoked_at, .. } => revoked_at,
+        }
+    }
+}
+
 /// Parsed policy set.
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -277,6 +375,8 @@ pub struct Policy {
     pub user_clients: Vec<UserClient>,
     /// User-to-host SSH access map.
     pub user_remotes: Vec<UserRemote>,
+    /// Permanently revoked SSH keys distributed to managed hosts.
+    pub revoked_ssh_keys: Vec<RevokedSshKey>,
 }
 
 impl Policy {
@@ -356,7 +456,8 @@ impl Policy {
             .filter(move |client| client.status.is_active() && client.user == user)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Validate all policy invariants after programmatic changes.
+    pub fn validate(&self) -> Result<()> {
         let mut roles = BTreeSet::new();
         for endpoint in &self.endpoints {
             if !matches!(
@@ -411,6 +512,86 @@ impl Policy {
         }
 
         self.validate_relations(&hosts)?;
+        self.validate_revocations()?;
+        Ok(())
+    }
+
+    fn validate_revocations(&self) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        let mut seen_renewal = BTreeSet::new();
+        for (index, revoked) in self.revoked_ssh_keys.iter().enumerate() {
+            let field = format!("{REVOCATIONS_POLICY_PATH}:ssh_keys[{index}]");
+            let identity = match revoked {
+                RevokedSshKey::Host { host, .. } => ("host", host.as_str()),
+                RevokedSshKey::User {
+                    user, client_host, ..
+                } => {
+                    validate_revocation_user(&format!("{field}.user"), user)?;
+                    ("client_host", client_host.as_str())
+                }
+            };
+            validate_revocation_host(&format!("{field}.{}", identity.0), identity.1)?;
+            let (canonical, fingerprint) =
+                canonical_ssh_public_key(revoked.public_key()).map_err(|message| {
+                    Error::Validation {
+                        field: format!("{field}.public_key"),
+                        message,
+                    }
+                })?;
+            if revoked.public_key() != canonical {
+                return Err(Error::Validation {
+                    field: format!("{field}.public_key"),
+                    message: "must use canonical '<algorithm> <base64>' form without a comment"
+                        .to_owned(),
+                });
+            }
+            if revoked.fingerprint() != fingerprint {
+                return Err(Error::Validation {
+                    field: format!("{field}.fingerprint"),
+                    message: "fingerprint does not match public_key".to_owned(),
+                });
+            }
+            validate_renewal_fingerprint(
+                &format!("{field}.renewal_fingerprint"),
+                revoked.renewal_fingerprint(),
+            )?;
+            let revoked_at = time::OffsetDateTime::parse(
+                revoked.revoked_at(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_err(|_| Error::Validation {
+                field: format!("{field}.revoked_at"),
+                message: "must be an RFC 3339 timestamp".to_owned(),
+            })?;
+            if revoked_at.offset() != time::UtcOffset::UTC || !revoked.revoked_at().ends_with('Z') {
+                return Err(Error::Validation {
+                    field: format!("{field}.revoked_at"),
+                    message: "must be a UTC RFC 3339 timestamp ending in Z".to_owned(),
+                });
+            }
+            if let Some(reason) = match revoked {
+                RevokedSshKey::Host { reason, .. } | RevokedSshKey::User { reason, .. } => reason,
+            } && reason.trim().is_empty()
+            {
+                return Err(Error::Validation {
+                    field: format!("{field}.reason"),
+                    message: "must not be empty".to_owned(),
+                });
+            }
+            let kind = if revoked.is_user() { "user" } else { "host" };
+            if !seen.insert((kind, revoked.fingerprint())) {
+                return Err(Error::Validation {
+                    field: format!("{field}.fingerprint"),
+                    message: format!("duplicate revoked {kind} key"),
+                });
+            }
+            if !seen_renewal.insert(revoked.renewal_fingerprint()) {
+                return Err(Error::Validation {
+                    field: format!("{field}.renewal_fingerprint"),
+                    message: "duplicate revoked renewal key".to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -698,6 +879,90 @@ impl Policy {
 
         Ok(())
     }
+}
+
+/// Canonicalize an OpenSSH public key and compute its SHA-256 fingerprint.
+pub fn canonical_ssh_public_key(value: &str) -> std::result::Result<(String, String), String> {
+    let algorithm = value
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "expected an OpenSSH public key".to_owned())?;
+    if algorithm.contains("-cert-v01@openssh.com") {
+        return Err(
+            "SSH certificates cannot be revoked as keys; provide the plain public key".to_owned(),
+        );
+    }
+    let mut key = ssh_key::PublicKey::from_openssh(value)
+        .map_err(|error| format!("invalid OpenSSH public key: {error}"))?;
+    key.set_comment("");
+    let canonical = key
+        .to_openssh()
+        .map_err(|error| format!("invalid OpenSSH public key: {error}"))?;
+    let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+    Ok((canonical, fingerprint))
+}
+
+/// Whether a host identity is safe in policy keys, file names, and provisioner names.
+#[must_use]
+pub fn valid_host_identity(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+}
+
+/// Whether a user identity matches the canonical Unix account policy syntax.
+#[must_use]
+pub fn valid_user_identity(value: &str) -> bool {
+    let base = value.strip_suffix('$').unwrap_or(value);
+    let mut characters = base.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase() || character == '_')
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || "_-".contains(character)
+        })
+}
+
+fn validate_revocation_host(field: &str, value: &str) -> Result<()> {
+    if !valid_host_identity(value) {
+        return Err(Error::Validation {
+            field: field.to_owned(),
+            message: "must match [A-Za-z0-9._-]+".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_revocation_user(field: &str, value: &str) -> Result<()> {
+    if !valid_user_identity(value) {
+        return Err(Error::Validation {
+            field: field.to_owned(),
+            message: "must match [a-z_][a-z0-9_-]*[$]?".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_renewal_fingerprint(field: &str, value: &str) -> Result<()> {
+    let Some(encoded) = value.strip_prefix("SHA256:") else {
+        return Err(Error::Validation {
+            field: field.to_owned(),
+            message: "must be a SHA-256 renewal JWK thumbprint".to_owned(),
+        });
+    };
+    if encoded.len() != 43
+        || !encoded
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+    {
+        return Err(Error::Validation {
+            field: field.to_owned(),
+            message: "must be a SHA-256 renewal JWK thumbprint".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Read a TOML policy document into a JSON value for schema validation.
@@ -1016,11 +1281,23 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Policy, SshRole, Status, User, UserClient, UserRemote, duration_at_most};
+    use super::{
+        Policy, SshRole, Status, User, UserClient, UserRemote, canonical_ssh_public_key,
+        duration_at_most,
+    };
+
+    const TEST_KEY_ONE: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3";
+    const TEST_KEY_ONE_FINGERPRINT: &str = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI";
+    const TEST_KEY_TWO: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw";
+    const TEST_KEY_TWO_FINGERPRINT: &str = "SHA256:+3AjrkPFtS9Wir1XpfmKixs1yTrmIGU28cbbOnEMW+o";
 
     #[test]
     fn checked_in_policy_loads() {
         let policy = Policy::load(crate::example_config_root()).expect("policy loads");
+
+        assert!(policy.revoked_ssh_keys.is_empty());
 
         assert_eq!(
             policy.endpoint("ca_api").unwrap().url(),
@@ -1061,6 +1338,199 @@ mod tests {
                 .status
                 .is_active()
         );
+    }
+
+    #[test]
+    fn canonical_policy_loads_reused_identities_with_distinct_revoked_keys() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "edge-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_ONE_FINGERPRINT}"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-25T03:14:15Z"
+reason = "device replaced"
+
+[[ssh_keys]]
+kind = "host"
+host = "edge-host"
+public_key = "{TEST_KEY_TWO}"
+fingerprint = "{TEST_KEY_TWO_FINGERPRINT}"
+renewal_fingerprint = "SHA256:grNhYzQm8G7RLKOUx2vpN4lqVj0aFJsYYfM1GxKXDnE"
+revoked_at = "2029-04-10T18:20:00Z"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let policy = Policy::load(&root).expect("revocation policy loads");
+
+        assert_eq!(policy.revoked_ssh_keys.len(), 2);
+        assert_eq!(policy.revoked_ssh_keys[0].host(), "edge-host");
+        assert_eq!(policy.revoked_ssh_keys[1].host(), "edge-host");
+        assert_ne!(
+            policy.revoked_ssh_keys[0].fingerprint(),
+            policy.revoked_ssh_keys[1].fingerprint()
+        );
+    }
+
+    #[test]
+    fn canonical_policy_rejects_a_mismatched_revocation_fingerprint() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "edge-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_TWO_FINGERPRINT}"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-25T03:14:15Z"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let error = Policy::load(&root).unwrap_err().to_string();
+
+        assert!(error.contains("fingerprint does not match public_key"));
+    }
+
+    #[test]
+    fn canonical_policy_requires_a_renewal_key_fingerprint_for_each_revocation() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "edge-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_ONE_FINGERPRINT}"
+revoked_at = "2026-07-25T03:14:15Z"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let error = Policy::load(&root).unwrap_err().to_string();
+
+        assert!(error.contains("renewal_fingerprint"));
+    }
+
+    #[test]
+    fn canonical_policy_accepts_a_machine_account_revocation() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "user"
+user = "service$"
+client_host = "edge-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_ONE_FINGERPRINT}"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-25T03:14:15Z"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let policy = Policy::load(&root).expect("machine account revocation loads");
+
+        assert_eq!(policy.revoked_ssh_keys.len(), 1);
+    }
+
+    #[test]
+    fn canonical_policy_rejects_duplicate_revoked_keys_of_one_kind() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "user"
+user = "alice"
+client_host = "ca-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_ONE_FINGERPRINT}"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-25T03:14:15Z"
+
+[[ssh_keys]]
+kind = "user"
+user = "alice"
+client_host = "edge-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_ONE_FINGERPRINT}"
+renewal_fingerprint = "SHA256:grNhYzQm8G7RLKOUx2vpN4lqVj0aFJsYYfM1GxKXDnE"
+revoked_at = "2026-07-25T03:15:15Z"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let error = Policy::load(&root).unwrap_err().to_string();
+
+        assert!(error.contains("duplicate revoked user key"));
+    }
+
+    #[test]
+    fn ssh_revocations_reject_certificates_and_malformed_key_blobs() {
+        let certificate_algorithm_only =
+            "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29t";
+        let trailing_wire_data = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5anVuaw==";
+
+        assert!(
+            canonical_ssh_public_key(certificate_algorithm_only)
+                .unwrap_err()
+                .contains("certificate")
+        );
+        assert!(
+            canonical_ssh_public_key(trailing_wire_data)
+                .unwrap_err()
+                .contains("invalid")
+        );
+    }
+
+    #[test]
+    fn canonical_policy_requires_utc_revocation_timestamps_and_valid_identities() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                r#"format_version = 1
+
+[[ssh_keys]]
+kind = "host"
+host = "../edge-host"
+public_key = "{TEST_KEY_ONE}"
+fingerprint = "{TEST_KEY_ONE_FINGERPRINT}"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15-07:00"
+"#,
+            ),
+        )
+        .unwrap();
+
+        let error = Policy::load(&root).unwrap_err().to_string();
+
+        assert!(error.contains("host") || error.contains("UTC"));
     }
 
     #[test]
@@ -1897,5 +2367,26 @@ mod tests {
             fs::copy(entry.path(), policy_dir.join(entry.file_name())).unwrap();
         }
         (dir, policy_dir)
+    }
+
+    fn copy_canonical_policy() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("grafhome-ca");
+        let source = crate::example_config_root();
+        copy_tree(&source, &root);
+        (dir, root)
+    }
+
+    fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let destination = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &destination);
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
     }
 }
