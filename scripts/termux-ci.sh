@@ -242,12 +242,15 @@ termux_home="$tmp/server-home"
 termux_prefix="$tmp/server-prefix"
 termux_bin="$termux_prefix/bin"
 termux_ssh="$termux_prefix/etc/ssh"
+# Termux ships $PREFIX/tmp as the app-private temporary root and exports it as
+# TMPDIR; the isolated prefix has to carry it for the same reason.
+termux_tmp="$termux_prefix/tmp"
 termux_log="$tmp/server.log"
 hostile_bin="$tmp/hostile-bin"
 hostile_log="$tmp/hostile.log"
-mkdir -p "$termux_home" "$termux_bin" "$termux_ssh" "$hostile_bin"
+mkdir -p "$termux_home" "$termux_bin" "$termux_ssh" "$termux_tmp" "$hostile_bin"
 chmod 0700 "$termux_home" "$termux_prefix" "$termux_prefix/etc" \
-  "$termux_bin" "$termux_ssh" "$hostile_bin"
+  "$termux_bin" "$termux_ssh" "$termux_tmp" "$hostile_bin"
 cp -R examples/site-config "$termux_home/site-config"
 termux_config="$termux_home/site-config"
 chmod -R go-w "$termux_config"
@@ -356,8 +359,14 @@ SH
   chmod 0755 "$hostile_bin/$executable"
 done
 
+# Unattended callers reach these commands through scrubbed environments — dot's
+# merge hooks run the binary under `env -i`, and cron jobs are no richer — so
+# drop TMPDIR here too. Android's fallback temporary directory is
+# /data/local/tmp, which the app sandbox denies to the Termux app user, and an
+# inherited TMPDIR would hide that from this job.
 termux_env=(
   env
+  -u TMPDIR
   HOME="$termux_home"
   PREFIX="$termux_prefix"
   TERMUX_VERSION="ci"
