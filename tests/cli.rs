@@ -980,6 +980,31 @@ fn system_host_and_ca_commands_reject_non_root_callers() {
 
 #[cfg(unix)]
 #[test]
+fn ca_mutation_root_guard_precedes_policy_and_request_reads() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let config_root = dir.path().join("grafhome-ca");
+    let missing = dir.path().join("must-not-be-read.json");
+    copy_dir(&example_config_root(), &config_root);
+    fs::write(config_root.join("policy/ca.toml"), "not valid TOML\n").unwrap();
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["approve", "host", "--yes", "--request-file"])
+        .arg(&missing)
+        .arg("--config-root")
+        .arg(&config_root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be run as root"))
+        .stderr(predicate::str::contains("must-not-be-read").not())
+        .stderr(predicate::str::contains("TOML").not());
+}
+
+#[cfg(unix)]
+#[test]
 fn apply_host_dry_run_does_not_write_or_reload() {
     let (dir, fixture) = exec_fixture();
     let install_root = dir.path().join("install");
@@ -1754,6 +1779,7 @@ fn apply_ca_rejects_a_non_origin_host() {
 fn ca_mutations_reject_off_origin_before_inputs_or_state_changes() {
     let (dir, fixture) = exec_fixture();
     let missing = dir.path().join("must-not-be-read.json");
+    let materialized = dir.path().join("must-not-be-written.json");
     let ca_policy = fixture.config_root.join("policy/ca.toml");
     let local_host = rustix::system::uname()
         .nodename()
@@ -1779,22 +1805,59 @@ fn ca_mutations_reject_off_origin_before_inputs_or_state_changes() {
     .unwrap();
     let revocations = fixture.config_root.join("policy/revocations.toml");
     let original_revocations = fs::read(&revocations).unwrap();
+    let enrollment_keys = dir.path().join("state/secrets/provisioners");
+    let snapshot_enrollment_keys = || {
+        let mut entries = fs::read_dir(&enrollment_keys)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    };
+    let original_enrollment_keys = snapshot_enrollment_keys();
 
-    let cases: &[(&str, &[&str], bool)] = &[
-        ("apply ca", &["apply", "ca"], false),
-        ("approve host", &["approve", "host", "--yes"], true),
-        ("approve user", &["approve", "user", "--yes"], true),
+    let cases = vec![
+        ("apply ca", vec!["apply", "ca"], false),
         (
-            "revoke host",
-            &["revoke", "host", "--host", "proxy-host"],
+            "materialize",
+            vec![
+                "materialize",
+                "--live-ca-json",
+                missing.to_str().unwrap(),
+                "--staged-ca-json",
+                missing.to_str().unwrap(),
+                "--jwk-dir",
+                missing.to_str().unwrap(),
+                "--out-file",
+                materialized.to_str().unwrap(),
+            ],
             false,
         ),
-        ("revoke user", &["revoke", "user", "--user", "alice"], false),
-        ("enrollment import", &["enrollment", "import"], true),
+        (
+            "migrate enrollment keys",
+            vec!["migrate", "enrollment-provisioner-keys"],
+            false,
+        ),
+        ("approve host", vec!["approve", "host", "--yes"], true),
+        ("approve user", vec!["approve", "user", "--yes"], true),
+        (
+            "revoke host",
+            vec!["revoke", "host", "--host", "proxy-host"],
+            false,
+        ),
+        (
+            "revoke user",
+            vec!["revoke", "user", "--user", "alice"],
+            false,
+        ),
+        ("enrollment import", vec!["enrollment", "import"], true),
     ];
-    for (name, args, reads_input) in cases {
+    for (name, args, reads_input) in &cases {
         let mut command = Command::cargo_bin("grafhome-ca").unwrap();
-        command.args(*args);
+        command.args(args);
         if *reads_input {
             command.arg("--request-file").arg(&missing);
         }
@@ -1808,13 +1871,19 @@ fn ca_mutations_reject_off_origin_before_inputs_or_state_changes() {
             .stderr(predicate::str::contains(format!(
                 "must be run on CA origin {off_origin}"
             )))
-            .stderr(predicate::str::contains(missing.display().to_string()).not());
+            .stderr(predicate::str::contains("must-not-be-read").not());
 
         assert!(!fixture.log.exists(), "{name} ran an external command");
+        assert!(!materialized.exists(), "{name} wrote materialized state");
         assert_eq!(
             fs::read(&revocations).unwrap(),
             original_revocations,
             "{name} changed revocation state"
+        );
+        assert_eq!(
+            snapshot_enrollment_keys(),
+            original_enrollment_keys,
+            "{name} changed enrollment keys"
         );
     }
 }
