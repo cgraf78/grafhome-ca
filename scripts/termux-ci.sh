@@ -366,6 +366,23 @@ termux_env=(
   TERMUX_HOSTILE_LOG="$hostile_log"
 )
 
+# CA-origin mutation remains a real-root boundary. The app-owner exception is
+# limited to host lifecycle operations even inside the Termux sandbox.
+if "${termux_env[@]}" .termux-ci/grafhome-ca apply ca \
+  --config-root "$termux_config" >"$tmp/termux-apply-ca.out" 2>"$tmp/termux-apply-ca.err"; then
+  printf '%s\n' 'Termux app owner unexpectedly passed the CA mutation root guard' >&2
+  exit 1
+fi
+if ! grep -Fq 'must be run as root' "$tmp/termux-apply-ca.err"; then
+  printf '%s\n' 'unexpected Termux CA mutation rejection:' >&2
+  cat "$tmp/termux-apply-ca.err" >&2
+  exit 1
+fi
+test ! -s "$tmp/termux-apply-ca.out"
+test ! -e "$termux_log"
+test ! -e "$hostile_log"
+printf '%s\n' 'ok: Termux CA mutation requires real root'
+
 # Host renewal credentials must never traverse a symlink out of the private
 # Termux home, even when every process involved runs as the app owner.
 bad_home="$tmp/bad-server-home"

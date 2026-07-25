@@ -542,7 +542,7 @@ fn run() -> grafhome_ca::Result<()> {
             jwk_dir,
             out_file,
         } => {
-            let model = load_root_model(config_root, "materialize", false)?;
+            let model = load_ca_mutation_model(config_root, "materialize")?;
             with_ca_lock(&model, || {
                 let step_bin = root_step_bin(&model)?;
                 let text = grafhome_ca::runtime_provisioners::materialize(
@@ -558,7 +558,7 @@ fn run() -> grafhome_ca::Result<()> {
         Command::Migrate {
             command: MigrateCommand::EnrollmentProvisionerKeys { config_root },
         } => {
-            let model = load_root_model(config_root, "migrate enrollment provisioner keys", false)?;
+            let model = load_ca_mutation_model(config_root, "migrate enrollment provisioner keys")?;
             with_ca_lock(&model, || migrate_enrollment_provisioner_keys(&model))
         }
         Command::Migrate {
@@ -588,7 +588,7 @@ fn run() -> grafhome_ca::Result<()> {
                     dry_run,
                 },
         } => {
-            let model = load_root_model(config_root, "apply ca", false)?;
+            let model = load_ca_mutation_model(config_root, "apply ca")?;
             apply_ca_policy(&model, dry_run)
         }
         Command::Apply {
@@ -618,7 +618,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_root_model(config_root, "approve host", false)?;
+            let model = load_ca_mutation_model(config_root, "approve host")?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -715,7 +715,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_root_model(config_root, "approve user", false)?;
+            let model = load_ca_mutation_model(config_root, "approve user")?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -755,7 +755,7 @@ fn run() -> grafhome_ca::Result<()> {
                     reason,
                 },
         } => {
-            let model = load_root_model(config_root, "revoke user", false)?;
+            let model = load_ca_mutation_model(config_root, "revoke user")?;
             revoke_user(&model, &user, host.as_deref(), reason.as_deref())
         }
         Command::Revoke {
@@ -766,7 +766,7 @@ fn run() -> grafhome_ca::Result<()> {
                     reason,
                 },
         } => {
-            let model = load_root_model(config_root, "revoke host", false)?;
+            let model = load_ca_mutation_model(config_root, "revoke host")?;
             revoke_host(&model, &host, reason.as_deref())
         }
         Command::Enrollment {
@@ -812,7 +812,7 @@ fn run() -> grafhome_ca::Result<()> {
                     request_file,
                 },
         } => {
-            let model = load_root_model(config_root, "enrollment import", false)?;
+            let model = load_ca_mutation_model(config_root, "enrollment import")?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -1311,18 +1311,17 @@ fn load_host_model(
     Ok(model)
 }
 
-fn load_root_model(
+fn load_ca_mutation_model(
     config_root: Option<PathBuf>,
     command: &str,
-    requires_install_root: bool,
 ) -> grafhome_ca::Result<SiteModel> {
     let config_root = resolve_config_root(config_root)?;
     #[cfg(unix)]
     let trusted_uid = rustix::process::geteuid().as_raw();
     #[cfg(not(unix))]
     let trusted_uid = 0;
+    require_root_or_isolated_test(&config_root, trusted_uid, command, false)?;
     grafhome_ca::provenance::validate_config_root(&config_root, trusted_uid)?;
-    require_root_or_isolated_test(&config_root, trusted_uid, command, requires_install_root)?;
     let model = load_valid_model_from_root(&config_root)?;
     require_ca_origin(&model, command)?;
     Ok(model)
