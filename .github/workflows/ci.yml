@@ -33,8 +33,11 @@ jobs:
           Arch)
             as_root pacman -S --noconfirm openssh
             ;;
-          "CentOS Stream")
+          "CentOS Stream" | Fedora)
             as_root dnf install -y openssh-clients
+            ;;
+          Alpine)
+            as_root apk add --no-cache openssh-client-default
             ;;
           Debian | Ubuntu | WSL)
             as_root apt-get update
