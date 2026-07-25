@@ -159,9 +159,10 @@ sudo install -o root -g wheel -m 0755 "$(command -v step)" /usr/local/bin/step
 
 Privileged operations use the configured `GRAFHOME_CA_ROOT_STEP_BIN` when it is
 available, then trusted standard system locations and `PATH`. A root process
-rejects a `step` binary, or any directory containing it, when it is writable or
-owned by another user. This prevents host enrollment from executing a
-user-controlled binary.
+rejects a `step` binary, or any directory containing it, when it is owned by
+another user or writable by one, except for root-owned sticky directories such
+as `/tmp`. This prevents host enrollment from executing a user-controlled
+binary.
 
 ```sh
 # Target host as root. Leave this running after copying its REQUEST line.

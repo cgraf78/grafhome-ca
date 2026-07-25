@@ -95,22 +95,49 @@ fn path_candidates_in(name: &str, path: Option<&OsStr>) -> Vec<PathBuf> {
 
 #[cfg(unix)]
 fn trusted_executable(path: &Path) -> Result<Option<PathBuf>> {
-    trusted_executable_for_uid(path, rustix::process::geteuid().as_raw())
+    let boundary = android_executable_boundary();
+    trusted_executable_for_uid_beneath(
+        path,
+        rustix::process::geteuid().as_raw(),
+        boundary.as_deref(),
+    )
 }
 
 #[cfg(not(unix))]
 fn trusted_executable(path: &Path) -> Result<Option<PathBuf>> {
-    trusted_executable_for_uid(path, 0)
+    trusted_executable_for_uid_beneath(path, 0, None)
 }
 
-fn trusted_executable_for_uid(path: &Path, trusted_uid: u32) -> Result<Option<PathBuf>> {
+fn trusted_executable_for_uid_beneath(
+    path: &Path,
+    trusted_uid: u32,
+    boundary: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[cfg(not(unix))]
+    let _ = trusted_uid;
 
     let path = match std::fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(Error::io(path, source)),
+    };
+    let boundary = match boundary {
+        Some(boundary) => {
+            let boundary = match std::fs::canonicalize(boundary) {
+                Ok(boundary) => boundary,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(source) => return Err(Error::io(boundary, source)),
+            };
+            let metadata =
+                std::fs::metadata(&boundary).map_err(|source| Error::io(&boundary, source))?;
+            if !metadata.is_dir() || path == boundary || !path.starts_with(&boundary) {
+                return Ok(None);
+            }
+            Some(boundary)
+        }
+        None => None,
     };
     let metadata = std::fs::metadata(&path).map_err(|source| Error::io(&path, source))?;
     if !metadata.is_file() {
@@ -123,21 +150,42 @@ fn trusted_executable_for_uid(path: &Path, trusted_uid: u32) -> Result<Option<Pa
         {
             return Ok(None);
         }
-        if trusted_uid == 0 {
-            let mut parent = path.parent();
-            while let Some(directory) = parent {
-                let metadata =
-                    std::fs::metadata(directory).map_err(|source| Error::io(directory, source))?;
-                if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
-                    return Ok(None);
-                }
-                parent = directory.parent();
+
+        for directory in path.ancestors().skip(1).take_while(|directory| {
+            boundary
+                .as_ref()
+                .is_none_or(|root| directory.starts_with(root))
+        }) {
+            let metadata =
+                std::fs::metadata(directory).map_err(|source| Error::io(directory, source))?;
+            let mode = metadata.permissions().mode();
+            if !directory_is_trusted(metadata.uid(), mode, trusted_uid) {
+                return Ok(None);
             }
         }
     }
     Ok(Some(path))
 }
 
+#[cfg(target_os = "android")]
+fn android_executable_boundary() -> Option<PathBuf> {
+    // PREFIX and its descendants are checked below; Android's app sandbox is
+    // the trust boundary for the system-owned ancestors outside PREFIX.
+    let prefix = PathBuf::from(std::env::var_os("PREFIX").filter(|value| !value.is_empty())?);
+    prefix.is_absolute().then_some(prefix)
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn android_executable_boundary() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn directory_is_trusted(owner: u32, mode: u32, invoking_uid: u32) -> bool {
+    owner_is_trusted(owner, invoking_uid) && (mode & 0o022 == 0 || owner == 0 && mode & 0o1000 != 0)
+}
+
+#[cfg(unix)]
 fn owner_is_trusted(owner: u32, invoking_uid: u32) -> bool {
     owner == invoking_uid || (invoking_uid != 0 && owner == 0)
 }
@@ -149,8 +197,8 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        ANDROID_USER_STEP_BINS, USER_STEP_BINS, owner_is_trusted, trusted_executable,
-        user_step_bin_in,
+        ANDROID_USER_STEP_BINS, USER_STEP_BINS, directory_is_trusted, owner_is_trusted,
+        trusted_executable, trusted_executable_for_uid_beneath, user_step_bin_in,
     };
 
     fn executable(path: &std::path::Path) {
@@ -274,6 +322,109 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert_eq!(trusted_executable(&executable).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_group_or_world_writable_ancestor() {
+        for mode in [0o770, 0o707] {
+            let temp = trusted_tempdir();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).unwrap();
+            let executable_path = bin.join("step");
+            executable(&executable_path);
+
+            assert_eq!(trusted_executable(&executable_path).unwrap(), None);
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn accepts_root_owned_sticky_ancestor() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let executable_path = temp.path().join("step");
+        executable(&executable_path);
+
+        assert_eq!(
+            trusted_executable(&executable_path).unwrap(),
+            Some(std::fs::canonicalize(executable_path).unwrap())
+        );
+    }
+
+    #[test]
+    fn sticky_exception_requires_root_ownership() {
+        assert!(directory_is_trusted(0, 0o1777, 501));
+        assert!(!directory_is_trusted(501, 0o1777, 501));
+    }
+
+    #[test]
+    fn explicit_sandbox_boundary_ignores_system_ancestors() {
+        let temp = trusted_tempdir();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let sandbox = temp.path().join("sandbox");
+        let bin = sandbox.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable_path = bin.join("step-cli");
+        executable(&executable_path);
+        let uid = rustix::process::geteuid().as_raw();
+
+        assert_eq!(trusted_executable(&executable_path).unwrap(), None);
+        assert_eq!(
+            trusted_executable_for_uid_beneath(&executable_path, uid, Some(&sandbox)).unwrap(),
+            Some(std::fs::canonicalize(executable_path).unwrap())
+        );
+    }
+
+    #[test]
+    fn explicit_sandbox_boundary_rejects_paths_outside_or_equal_to_it() {
+        let temp = trusted_tempdir();
+        let sandbox = temp.path().join("sandbox");
+        std::fs::create_dir(&sandbox).unwrap();
+        let executable_path = temp.path().join("step-cli");
+        executable(&executable_path);
+
+        assert_eq!(
+            trusted_executable_for_uid_beneath(
+                &executable_path,
+                rustix::process::geteuid().as_raw(),
+                Some(&sandbox),
+            )
+            .unwrap(),
+            None
+        );
+
+        let alias = temp.path().join("file-boundary-alias");
+        std::os::unix::fs::symlink(&executable_path, &alias).unwrap();
+        for boundary in [&executable_path, &alias] {
+            assert_eq!(
+                trusted_executable_for_uid_beneath(
+                    &executable_path,
+                    rustix::process::geteuid().as_raw(),
+                    Some(boundary),
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_symlinks_before_validating_ancestors() {
+        let temp = trusted_tempdir();
+        let real_bin = temp.path().join("real/bin");
+        std::fs::create_dir_all(&real_bin).unwrap();
+        let executable_path = real_bin.join("step");
+        executable(&executable_path);
+        let alias = temp.path().join("step-alias");
+        std::os::unix::fs::symlink(&executable_path, &alias).unwrap();
+
+        assert_eq!(
+            trusted_executable(&alias).unwrap(),
+            Some(std::fs::canonicalize(executable_path).unwrap())
+        );
+
+        std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(trusted_executable(&alias).unwrap(), None);
     }
 
     #[test]
