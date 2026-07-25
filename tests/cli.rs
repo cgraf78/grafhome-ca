@@ -3066,6 +3066,165 @@ fn enrollment_export_reads_existing_public_material_without_changing_state() {
 
 #[cfg(unix)]
 #[test]
+fn enrollment_host_export_round_trips_through_import() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let host_material = fixture
+        .config_root
+        .join("../server-step/secrets/hosts/proxy-host");
+    fs::create_dir_all(&host_material).unwrap();
+    fs::write(
+        host_material.join("provisioner.pub.json"),
+        r#"{"kty":"EC","crv":"P-256","x":"host-x","y":"host-y"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{
+            "type":"JWK",
+            "name":"grafhome-host-70726f78792d686f7374",
+            "key":{"kty":"EC","crv":"P-256","x":"host-x","y":"host-y"},
+            "options":{
+                "x509":{"template":"legacy-x509"},
+                "ssh":{"template":"{\"type\":\"host\",\"keyId\":{{ toJson .KeyID }},\"principals\":[\"proxy-host\"]}"}
+            }
+        }]}}"#,
+    )
+    .unwrap();
+
+    let export = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enrollment",
+            "export",
+            "host",
+            "--host",
+            "proxy-host",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .output()
+        .unwrap();
+    assert!(export.status.success());
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin(export.stdout)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported host proxy-host"));
+
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    let record = &registry["records"][0];
+    assert_eq!(record["status"], "active");
+    assert_eq!(record["host"], "proxy-host");
+    assert_eq!(
+        record["ssh_public_key"],
+        VALID_SSH_KEY
+            .split_once(" fixture")
+            .map(|(key, _)| key)
+            .unwrap()
+    );
+    assert_eq!(record["renewal_public_jwk"]["x"], "host-x");
+
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(ca_json).unwrap()).unwrap();
+    let template = config["authority"]["provisioners"][0]["options"]["ssh"]["template"]
+        .as_str()
+        .unwrap();
+    assert!(template.contains(VALID_SSH_KEY.split_whitespace().nth(1).unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn enrollment_user_export_round_trips_through_import() {
+    let (dir, fixture) = exec_fixture();
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    let home = dir.path().join("home");
+    let user_material = home.join(".config/grafhome-ca/users/alice/hosts/laptop-a");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(&user_material).unwrap();
+    fs::write(home.join(".ssh/id_ed25519.pub"), VALID_SSH_KEY_TWO).unwrap();
+    fs::write(
+        user_material.join("provisioner.pub.json"),
+        r#"{"kty":"EC","crv":"P-256","x":"user-x","y":"user-y"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(
+        &ca_json,
+        r#"{"authority":{"provisioners":[{
+            "type":"JWK",
+            "name":"grafhome-user-616c696365-6c6170746f702d61",
+            "key":{"kty":"EC","crv":"P-256","x":"user-x","y":"user-y"},
+            "options":{
+                "x509":{"template":"legacy-x509"},
+                "ssh":{"template":"{\"type\":\"user\",\"keyId\":{{ toJson .KeyID }},\"principals\":[\"alice\"]}"}
+            }
+        }]}}"#,
+    )
+    .unwrap();
+
+    let export = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "enrollment",
+            "export",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "laptop-a",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .output()
+        .unwrap();
+    assert!(export.status.success());
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["enrollment", "import", "--config-root"])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .write_stdin(export.stdout)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Imported user alice@laptop-a"));
+
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
+    let record = &registry["records"][0];
+    assert_eq!(record["status"], "active");
+    assert_eq!(record["user"], "alice");
+    assert_eq!(record["client_host"], "laptop-a");
+    assert_eq!(
+        record["ssh_public_key"],
+        VALID_SSH_KEY_TWO
+            .split_once(" test@fixture")
+            .map(|(key, _)| key)
+            .unwrap()
+    );
+    assert_eq!(record["renewal_public_jwk"]["x"], "user-x");
+
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(ca_json).unwrap()).unwrap();
+    let template = config["authority"]["provisioners"][0]["options"]["ssh"]["template"]
+        .as_str()
+        .unwrap();
+    assert!(template.contains(VALID_SSH_KEY_TWO.split_whitespace().nth(1).unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
 fn enrollment_import_binds_a_live_host_key_before_activating_the_registry() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
