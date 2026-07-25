@@ -2,3 +2,4 @@
 Host *
     UserKnownHostsFile ~/.ssh/known_hosts
     GlobalKnownHostsFile ${GRAFHOME_CA_SYSTEM_SSH_DIR}/ssh_known_hosts ${GRAFHOME_CA_SSH_TRUST_DIR}/ssh_known_hosts
+    RevokedHostKeys ${GRAFHOME_CA_SSH_TRUST_DIR}/revoked_host_keys

@@ -45,16 +45,34 @@ artifact retains structural cross-build coverage.
 Enrollment and identity revocation are the narrow live-mutation boundary.
 `approve user` and `approve host` install device-bound renewal JWK provisioners
 on the CA origin and roll back if CA activation or health verification fails.
-Private JWK material never leaves its enrolled host. `revoke user` and
-`revoke host` remove those provisioners, disabling future issuance and renewal
-without certificate serial lookup. Existing SSH certificates remain valid until
-expiry because OpenSSH does not perform online CA revocation checks.
+Private JWK material never leaves its enrolled host. Successful approval also
+records the SSH public key and canonical renewal public JWK in an owner-only,
+untracked registry on the CA origin. Routine renewal does not depend on that
+registry. Existing deployments backfill it by exporting target-local public
+material. Import verifies the live renewal JWK, binds the legacy provisioner's
+SSH template to the asserted key, and activates the registry only after a
+restart and health check. `revoke user` and `revoke host` use the registry to
+remove those provisioners and append exact plain public keys plus renewal JWK
+fingerprints to private tracked policy, without certificate serial lookup.
+Revoked registry and tracked records remain permanent tombstones, so a logical
+identity can be reused only with new SSH and renewal keys.
+
+OpenSSH does not perform online CA revocation checks. Host policy application
+therefore compiles the tracked user keys into the server-side `RevokedKeys` KRL
+and tracked host keys into the client-side `RevokedHostKeys` KRL. Revoking a
+plain key also rejects certificates renewed later for that key. KRL generation
+and validation occur before live writes; SSH configuration validation and
+reload share the existing rollback transaction. The tracked policy update is
+written before CA activation so a failed revoke can leave only a conservative,
+retryable state.
 The two broad enrollment provisioners keep only their public JWKs in `ca.json`.
 Their encrypted private JWKs and independent passwords are server-local inputs
 to operator token creation, so `/provisioners` cannot publish an offline
 password-cracking target. Enrollment provisioners deny X.509 issuance and force
 the intended SSH certificate type. Device-bound renewal provisioners pin exact
-principals, deny X.509 issuance, and enforce finite renewal claims.
+principals and the enrolled SSH public key, deny X.509 issuance, and enforce
+finite renewal claims. The broad enrollment issuers compare the requested SSH
+key with a signed custom token claim, so initial issuance is key-bound too.
 Authority-wide SSH allow-lists provide a final policy check over all configured
 user and host principals.
 Routine user enrollment grants retain document version 1. An exceptional
@@ -72,8 +90,8 @@ firewall, DNS, Apache, CA initialization, backup, and fleet rollout changes
 remain owned by private configuration management and explicit operator runbooks.
 
 Rendered files are staging artifacts, not an imperative deploy. They must
-either contain complete non-secret support files, such as empty revocation
-placeholders, or explicitly point at operator-provided runtime secret material.
+either contain complete non-secret support files, such as plain revocation key
+sources, or explicitly point at operator-provided runtime secret material.
 OpenSSH fragments in particular must not reference missing support files,
 because `RevokedKeys` failures can break all public-key authentication.
 `HostCertificate` is the deliberate exception: it points at the runtime host
@@ -94,3 +112,9 @@ principals, so real exports belong in private rollout state and must not be
 committed to the public repository. The command must never read from
 `step/secrets` or export provisioner tokens, encrypted JWKs, passwords, or
 private keys.
+
+Privileged CA mutation commands run only as root on the configured physical CA
+origin. The origin check uses the kernel hostname rather than the policy
+identity override used by local host/client commands. Approval reserves the
+registry record before activating step-ca; import, approval, and revocation all
+hold the CA mutation lock while reconciling live state.

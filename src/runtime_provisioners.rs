@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::model::SiteModel;
 use crate::policy::{
     PROVISIONER_ROLE_HOST_BOOTSTRAP, PROVISIONER_ROLE_PROXY_X509, PROVISIONER_ROLE_USER_ENROLLMENT,
-    Provisioner, ca_policy_field, step_max_ttl,
+    Provisioner, ca_policy_field, canonical_ssh_public_key, step_max_ttl,
 };
 
 const USER_CLIENT_X509_DENY_TEMPLATE: &str =
@@ -31,7 +31,8 @@ const USER_ENROLLMENT_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome user enrollment provisioner" }}"#;
 const HOST_BOOTSTRAP_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome host bootstrap provisioner" }}"#;
-const USER_ENROLLMENT_SSH_TEMPLATE: &str = r#"{
+const USER_ENROLLMENT_SSH_TEMPLATE: &str = r#"{{- if ne (b64enc (toString .Insecure.CR.Key.Marshal)) (toString .Token.user.grafhomeSSHPublicKey) }}{{ fail "SSH public key does not match enrollment" }}{{ end }}
+{
   "type": "user",
   "keyId": {{ toJson .KeyID }},
   "principals": {{ toJson .Principals }},
@@ -39,7 +40,8 @@ const USER_ENROLLMENT_SSH_TEMPLATE: &str = r#"{
   "extensions": {{ toJson .Extensions }}
 }
 "#;
-const HOST_BOOTSTRAP_SSH_TEMPLATE: &str = r#"{
+const HOST_BOOTSTRAP_SSH_TEMPLATE: &str = r#"{{- if ne (b64enc (toString .Insecure.CR.Key.Marshal)) (toString .Token.user.grafhomeSSHPublicKey) }}{{ fail "SSH public key does not match enrollment" }}{{ end }}
+{
   "type": "host",
   "keyId": {{ toJson .KeyID }},
   "principals": {{ toJson .Principals }},
@@ -448,6 +450,146 @@ fn host_provisioner(key: Value, name: &str, template: String, claims: Map<String
             "ssh": { "template": template },
         },
     })
+}
+
+/// Return the base64 OpenSSH wire blob used by Smallstep's SSH template context.
+pub fn ssh_public_key_blob(public_key: &str) -> Result<String> {
+    let (canonical, _) =
+        canonical_ssh_public_key(public_key).map_err(|message| Error::Validation {
+            field: "enrollment SSH public key".to_owned(),
+            message,
+        })?;
+    Ok(canonical
+        .split_whitespace()
+        .nth(1)
+        .expect("canonical OpenSSH key has a wire blob")
+        .to_owned())
+}
+
+/// Prepend an immutable SSH public-key constraint to a Smallstep SSH template.
+pub fn bind_ssh_template(template: &str, public_key: &str) -> Result<String> {
+    let key_blob = ssh_public_key_blob(public_key)?;
+    let marker = format!("{{{{/* grafhome-ca-ssh-key:{key_blob} */}}}}");
+    let guard = format!(
+        "{marker}\n{{{{- if ne (b64enc (toString .Insecure.CR.Key.Marshal)) \"{key_blob}\" }}}}{{{{ fail \"SSH public key does not match enrollment\" }}}}{{{{ end }}}}\n"
+    );
+    if let Some(first_line) = template.lines().next()
+        && first_line.starts_with("{{/* grafhome-ca-ssh-key:")
+    {
+        if first_line == marker && template.starts_with(&guard) {
+            return Ok(template.to_owned());
+        }
+        return Err(Error::Validation {
+            field: "renewal SSH template".to_owned(),
+            message: "has an invalid or different SSH public-key binding".to_owned(),
+        });
+    }
+    Ok(format!("{guard}{template}"))
+}
+
+/// Bind one existing live renewal provisioner to its imported SSH public key.
+pub fn bind_existing_renewal_provisioner(
+    ca_json: impl AsRef<Path>,
+    name: &str,
+    renewal_public_jwk: &Value,
+    ssh_public_key: &str,
+) -> Result<String> {
+    let ca_json = ca_json.as_ref();
+    let mut config = read_json(ca_json)?;
+    let provisioners = provisioners_mut(&mut config, ca_json)?;
+    let matching = provisioners
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.get("name").and_then(Value::as_str) == Some(name))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let index = match matching.as_slice() {
+        [index] => *index,
+        [] => {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("live enrollment provisioner {name} is missing"),
+            });
+        }
+        _ => {
+            return Err(Error::Validation {
+                field: format!("{}:authority.provisioners", ca_json.display()),
+                message: format!("live enrollment provisioner {name} is duplicated"),
+            });
+        }
+    };
+    let provisioner = provisioners[index]
+        .as_object_mut()
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("live enrollment provisioner {name} must be an object"),
+        })?;
+    if provisioner.get("type").and_then(Value::as_str) != Some("JWK") {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("live enrollment provisioner {name} must have type JWK"),
+        });
+    }
+    let live_key = provisioner.get("key").ok_or_else(|| Error::Validation {
+        field: format!("{}:authority.provisioners", ca_json.display()),
+        message: format!("live enrollment provisioner {name} has no public key"),
+    })?;
+    if jwk_public_material(live_key, &format!("live provisioner {name}.key"))?
+        != jwk_public_material(renewal_public_jwk, "imported renewal public JWK")?
+    {
+        return Err(Error::Validation {
+            field: "enrollment import".to_owned(),
+            message: format!("export does not match live provisioner {name}"),
+        });
+    }
+    let options = provisioner
+        .get_mut("options")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!(
+                "live enrollment provisioner {name} has no inline SSH template; temporarily restore its policy entry and re-approve or repair it before import"
+            ),
+        })?;
+    let x509_template = if parse_host_provisioner_name(name).is_some() {
+        HOST_X509_DENY_TEMPLATE
+    } else if parse_user_provisioner_name(name).is_some() {
+        USER_CLIENT_X509_DENY_TEMPLATE
+    } else {
+        return Err(Error::Validation {
+            field: "enrollment import".to_owned(),
+            message: format!("provisioner {name} is not a Grafhome renewal provisioner"),
+        });
+    };
+    options.insert("x509".to_owned(), json!({"template": x509_template}));
+    let ssh = options
+        .get_mut("ssh")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!("live enrollment provisioner {name} has no inline SSH template"),
+        })?;
+    let template = ssh.get("template").and_then(Value::as_str).ok_or_else(|| {
+        Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!(
+                "live enrollment provisioner {name} must use an inline SSH template before import"
+            ),
+        }
+    })?;
+    if !template.trim_start().starts_with('{') {
+        return Err(Error::Validation {
+            field: format!("{}:authority.provisioners", ca_json.display()),
+            message: format!(
+                "live enrollment provisioner {name} must use a non-empty plain-text SSH template before import"
+            ),
+        });
+    }
+    ssh.insert(
+        "template".to_owned(),
+        Value::String(bind_ssh_template(template, ssh_public_key)?),
+    );
+    serialize_config(config, ca_json)
 }
 
 /// Validate enrollment credentials and replace rendered JWK placeholders.
@@ -1096,6 +1238,67 @@ mod tests {
 
     use super::*;
 
+    const SSH_KEY_ONE: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3";
+    const SSH_KEY_TWO: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw";
+
+    #[test]
+    fn ssh_template_binding_is_exact_and_idempotent() {
+        let template = "{\"type\":\"user\"}\n";
+
+        let bound = bind_ssh_template(template, SSH_KEY_ONE).unwrap();
+
+        assert!(bound.contains("grafhome-ca-ssh-key:"));
+        assert!(bound.contains(".Insecure.CR.Key.Marshal"));
+        assert!(bound.ends_with(template));
+        assert_eq!(bind_ssh_template(&bound, SSH_KEY_ONE).unwrap(), bound);
+        assert!(
+            bind_ssh_template(&bound, SSH_KEY_TWO)
+                .unwrap_err()
+                .to_string()
+                .contains("different SSH public-key binding")
+        );
+
+        let marker_only = bound.lines().next().unwrap();
+        assert!(bind_ssh_template(marker_only, SSH_KEY_ONE).is_err());
+    }
+
+    #[test]
+    fn importing_a_base64_ssh_template_fails_closed() {
+        let dir = tempdir().unwrap();
+        let ca_json = dir.path().join("ca.json");
+        let name = crate::enrollment::host_provisioner_name("proxy-host");
+        let renewal_key = json!({
+            "kty": "EC", "crv": "P-256", "x": "host-x", "y": "host-y"
+        });
+        fs::write(
+            &ca_json,
+            serde_json::to_vec(&json!({
+                "authority": {
+                    "provisioners": [{
+                        "type": "JWK",
+                        "name": name.clone(),
+                        "key": renewal_key.clone(),
+                        "options": {
+                            "ssh": {
+                                "template": "eyJ0eXBlIjoiaG9zdCJ9"
+                            }
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = bind_existing_renewal_provisioner(&ca_json, &name, &renewal_key, SSH_KEY_ONE)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("plain-text SSH template"));
+    }
+
     #[test]
     fn reconciles_authority_policy_allow_lists_without_replacing_other_state() {
         let dir = tempdir().unwrap();
@@ -1157,6 +1360,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let model = SiteModel::load(crate::example_config_root()).unwrap();
         let ca_json = dir.path().join("ca.json");
+        let bound_host_template = bind_ssh_template(
+            r#"{"type":"host","principals":["proxy-host"]}"#,
+            SSH_KEY_ONE,
+        )
+        .unwrap();
         fs::write(
             &ca_json,
             serde_json::to_vec_pretty(&json!({
@@ -1184,6 +1392,7 @@ mod tests {
                             "type": "JWK",
                             "name": crate::enrollment::host_provisioner_name("proxy-host"),
                             "key": {"kid": "host"},
+                            "options": {"ssh": {"template": bound_host_template.clone()}},
                             "claims": {"maxHostSSHCertDuration": "24h"}
                         },
                         {
@@ -1222,6 +1431,10 @@ mod tests {
         assert_eq!(client["options"]["ssh"]["templateFile"], "preserve.tpl");
         assert_eq!(client["claims"]["maxUserSSHCertDuration"], "48h");
         let host_name = crate::enrollment::host_provisioner_name("proxy-host");
+        assert_eq!(
+            by_name[host_name.as_str()]["options"]["ssh"]["template"],
+            bound_host_template
+        );
         assert_eq!(
             by_name[host_name.as_str()]["claims"]["maxHostSSHCertDuration"],
             "720h"

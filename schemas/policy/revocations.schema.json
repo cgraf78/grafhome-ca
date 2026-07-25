@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/revocations.schema.json",
+  "title": "Grafhome SSH key revocations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format_version"],
+  "properties": {
+    "format_version": { "const": 1 },
+    "ssh_keys": {
+      "type": "array",
+      "items": {
+        "oneOf": [{ "$ref": "#/definitions/hostKey" }, { "$ref": "#/definitions/userKey" }]
+      }
+    }
+  },
+  "definitions": {
+    "publicKey": {
+      "type": "string",
+      "pattern": "^[^\\s]+ [A-Za-z0-9+/]+={0,2}$"
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "renewalFingerprint": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9_-]{43}$"
+    },
+    "hostKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "host",
+        "public_key",
+        "fingerprint",
+        "renewal_fingerprint",
+        "revoked_at"
+      ],
+      "properties": {
+        "kind": { "const": "host" },
+        "host": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "public_key": { "$ref": "#/definitions/publicKey" },
+        "fingerprint": { "$ref": "#/definitions/fingerprint" },
+        "renewal_fingerprint": { "$ref": "#/definitions/renewalFingerprint" },
+        "revoked_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "userKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "user",
+        "client_host",
+        "public_key",
+        "fingerprint",
+        "renewal_fingerprint",
+        "revoked_at"
+      ],
+      "properties": {
+        "kind": { "const": "user" },
+        "user": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]*[$]?$" },
+        "client_host": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "public_key": { "$ref": "#/definitions/publicKey" },
+        "fingerprint": { "$ref": "#/definitions/fingerprint" },
+        "renewal_fingerprint": { "$ref": "#/definitions/renewalFingerprint" },
+        "revoked_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

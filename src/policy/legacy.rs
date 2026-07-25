@@ -59,6 +59,7 @@ pub(super) fn load(root: &Path) -> Result<Policy> {
         provisioners,
         user_clients,
         user_remotes,
+        revoked_ssh_keys: Vec::new(),
     })
 }
 

@@ -98,7 +98,7 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
                 )?,
             )?,
             mode: 0o644,
-            content: String::new(),
+            content: revoked_ssh_key_source(model, true),
         });
         files.push(RenderedFile {
             path: host_path(
@@ -133,6 +133,17 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
                 &host.host,
                 absolute_child(
                     &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"],
+                    "revoked_host_keys",
+                )?,
+            )?,
+            mode: 0o644,
+            content: revoked_ssh_key_source(model, false),
+        });
+        files.push(RenderedFile {
+            path: host_path(
+                &host.host,
+                absolute_child(
+                    &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"],
                     "ssh_known_hosts",
                 )?,
             )?,
@@ -160,6 +171,23 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
 
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
+}
+
+fn revoked_ssh_key_source(model: &SiteModel, user_keys: bool) -> String {
+    let mut keys = model
+        .policy
+        .revoked_ssh_keys
+        .iter()
+        .filter(|entry| entry.is_user() == user_keys)
+        .map(|entry| entry.public_key())
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", keys.join("\n"))
+    }
 }
 
 const TEST_FIXTURE_PATH_PREFIX: &str = "/dev/null/grafhome-ca-test-fixture";
@@ -842,7 +870,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::render;
-    use crate::policy::Status;
+    use crate::policy::{RevokedSshKey, Status};
 
     #[test]
     fn renders_expected_files_without_live_paths() {
@@ -863,6 +891,67 @@ mod tests {
         ));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/auth_principals/alice".to_owned()));
         assert!(paths.iter().all(|path| !path.starts_with('/')));
+    }
+
+    #[test]
+    fn renders_role_scoped_plain_key_sources_for_krl_compilation() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let host_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOF9AFZbHgCPqUAtsZo9RLg6Fg4R+6rKThonym0jI0x3";
+        let user_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw";
+        model.policy.revoked_ssh_keys = vec![
+            RevokedSshKey::Host {
+                host: "retired-host".to_owned(),
+                public_key: host_key.to_owned(),
+                fingerprint: "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI".to_owned(),
+                renewal_fingerprint: "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+                    .to_owned(),
+                revoked_at: "2026-07-24T20:14:15Z".to_owned(),
+                reason: None,
+            },
+            RevokedSshKey::User {
+                user: "alice".to_owned(),
+                client_host: "retired-host".to_owned(),
+                public_key: user_key.to_owned(),
+                fingerprint: "SHA256:+3AjrkPFtS9Wir1XpfmKixs1yTrmIGU28cbbOnEMW+o".to_owned(),
+                renewal_fingerprint: "SHA256:grNhYzQm8G7RLKOUx2vpN4lqVj0aFJsYYfM1GxKXDnE"
+                    .to_owned(),
+                revoked_at: "2026-07-24T20:14:15Z".to_owned(),
+                reason: None,
+            },
+        ];
+
+        let files = render(&model).unwrap();
+        let user_source = files
+            .iter()
+            .find(|file| {
+                file.path
+                    .ends_with("hosts/ca-host/etc/ssh/grafhome/revoked_user_certs")
+            })
+            .unwrap();
+        let host_source = files
+            .iter()
+            .find(|file| {
+                file.path
+                    .ends_with("hosts/ca-host/etc/ssh/grafhome/revoked_host_keys")
+            })
+            .unwrap();
+        let client_config = files
+            .iter()
+            .find(|file| {
+                file.path
+                    .ends_with("hosts/ca-host/etc/ssh/ssh_config.d/grafhome-ca.conf")
+            })
+            .unwrap();
+
+        assert_eq!(user_source.content, format!("{user_key}\n"));
+        assert_eq!(host_source.content, format!("{host_key}\n"));
+        assert!(
+            client_config
+                .content
+                .contains("RevokedHostKeys /etc/ssh/grafhome/revoked_host_keys")
+        );
     }
 
     #[test]

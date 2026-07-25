@@ -10,15 +10,19 @@ name = "grafhome-ca"
 path = "src/bin/grafhome-ca.rs"
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4.5.50", features = ["derive"] }
 fs2 = "0.4.3"
 jsonschema = "0.18.0"
 rpassword = "7.4.0"
-rustix = { version = "1.1.2", features = ["fs", "process", "termios"] }
+rustix = { version = "1.1.2", features = ["fs", "process", "system", "termios"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10.9"
+ssh-key = { version = "0.6.7", default-features = false, features = ["ecdsa", "std"] }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
+time = { version = "0.3.45", features = ["formatting", "parsing"] }
 toml = "0.8.23"
 
 [dev-dependencies]
