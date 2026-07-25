@@ -1751,6 +1751,76 @@ fn apply_ca_rejects_a_non_origin_host() {
 
 #[cfg(unix)]
 #[test]
+fn ca_mutations_reject_off_origin_before_inputs_or_state_changes() {
+    let (dir, fixture) = exec_fixture();
+    let missing = dir.path().join("must-not-be-read.json");
+    let ca_policy = fixture.config_root.join("policy/ca.toml");
+    let local_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
+    let off_origin = format!("off-origin-{}", std::process::id());
+    let policy = fs::read_to_string(&ca_policy).unwrap().replacen(
+        &format!("target = \"{local_host}\""),
+        &format!("target = \"{off_origin}\""),
+        1,
+    );
+    fs::write(ca_policy, policy).unwrap();
+    fs::write(
+        fixture
+            .config_root
+            .join("policy/hosts")
+            .join(format!("{off_origin}.toml")),
+        format!("ssh_roles = []\nprincipals = [\"test-{off_origin}\"]\n"),
+    )
+    .unwrap();
+    let revocations = fixture.config_root.join("policy/revocations.toml");
+    let original_revocations = fs::read(&revocations).unwrap();
+
+    let cases: &[(&str, &[&str], bool)] = &[
+        ("apply ca", &["apply", "ca"], false),
+        ("approve host", &["approve", "host", "--yes"], true),
+        ("approve user", &["approve", "user", "--yes"], true),
+        (
+            "revoke host",
+            &["revoke", "host", "--host", "proxy-host"],
+            false,
+        ),
+        ("revoke user", &["revoke", "user", "--user", "alice"], false),
+        ("enrollment import", &["enrollment", "import"], true),
+    ];
+    for (name, args, reads_input) in cases {
+        let mut command = Command::cargo_bin("grafhome-ca").unwrap();
+        command.args(*args);
+        if *reads_input {
+            command.arg("--request-file").arg(&missing);
+        }
+        command
+            .arg("--config-root")
+            .arg(&fixture.config_root)
+            .env("PATH", prepend_path(&fixture.fake_bin))
+            .env("FAKE_LOG", &fixture.log)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "must be run on CA origin {off_origin}"
+            )))
+            .stderr(predicate::str::contains(missing.display().to_string()).not());
+
+        assert!(!fixture.log.exists(), "{name} ran an external command");
+        assert_eq!(
+            fs::read(&revocations).unwrap(),
+            original_revocations,
+            "{name} changed revocation state"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn apply_host_corrects_unsafe_special_mode_bits() {
     use std::os::unix::fs::PermissionsExt;
 
