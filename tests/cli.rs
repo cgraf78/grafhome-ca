@@ -4751,7 +4751,7 @@ fn status_reports_host_and_user_clients_from_live_ca_state() {
     let root = home.join(".config/grafhome/step/certs/root_ca.crt");
     fs::create_dir_all(root.parent().unwrap()).unwrap();
     fs::write(root, "root\n").unwrap();
-    let provisioners = r#"[{"name":"grafhome-host-70726f78792d686f7374"},{"name":"grafhome-user-616c696365-70726f78792d686f7374"}]"#;
+    let provisioners = r#"[{"name":"grafhome-host-70726f78792d686f7374","type":"JWK"},{"name":"grafhome-user-616c696365-70726f78792d686f7374","future":{"enabled":true}}]"#;
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -4890,6 +4890,80 @@ fn status_reports_host_and_user_clients_from_live_ca_state() {
         .failure()
         .stdout("")
         .stderr("");
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_user_if_enrolled_rejects_malformed_provisioner_entries() {
+    for (description, response, diagnostic) in [
+        ("non-array response", r#"{}"#, "invalid type: map"),
+        ("non-object entry", r#"[null]"#, "invalid type: null"),
+        ("missing name", r#"[{}]"#, "missing field `name`"),
+        (
+            "non-string name",
+            r#"[{"name":7}]"#,
+            "invalid type: integer",
+        ),
+        (
+            "empty name",
+            r#"[{"name":""}]"#,
+            "provisioner entry 0 has an empty name",
+        ),
+        (
+            "blank name",
+            r#"[{"name":" "}]"#,
+            "provisioner entry 0 has an empty name",
+        ),
+    ] {
+        let (dir, fixture) = exec_fixture();
+        let home = dir.path().join("home");
+        let root = home.join(".config/grafhome/step/certs/root_ca.crt");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(root, "root\n").unwrap();
+        let material = home.join(".config/grafhome-ca/users/alice/hosts/ca-host");
+        fs::create_dir_all(&material).unwrap();
+        fs::write(material.join("provisioner.priv.json"), "private\n").unwrap();
+        let password_file = dir.path().join("password");
+        fs::write(&password_file, "renewal-password\n").unwrap();
+
+        let output = Command::cargo_bin("grafhome-ca")
+            .expect("binary exists")
+            .args([
+                "renew",
+                "user",
+                "--user",
+                "alice",
+                "--host",
+                "ca-host",
+                "--if-enrolled",
+                "--quiet",
+                "--password-file",
+            ])
+            .arg(&password_file)
+            .arg("--config-root")
+            .arg(&fixture.config_root)
+            .env("HOME", &home)
+            .env("PATH", prepend_path(&fixture.fake_bin))
+            .env("FAKE_LOG", &fixture.log)
+            .env("FAKE_PROVISIONER_LIST", response)
+            .output()
+            .unwrap();
+
+        assert!(
+            !output.status.success(),
+            "{description} must not be treated as an empty provisioner list"
+        );
+        assert!(output.stdout.is_empty(), "{description} must stay quiet");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("step ca provisioner list") && stderr.contains(diagnostic),
+            "{description} should identify the malformed response: {}",
+            stderr
+        );
+        let log = fs::read_to_string(&fixture.log).unwrap();
+        assert!(log.contains("ca provisioner list"));
+        assert!(!log.contains("ssh needs-renewal"));
+    }
 }
 
 #[cfg(unix)]
