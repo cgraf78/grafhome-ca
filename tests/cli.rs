@@ -355,7 +355,9 @@ elif [ "$1" = "-k" ]; then
     exit 49
   fi
   if [ ! -e "$out" ]; then printf 'FAKE-KRL\n' > "$out"; fi
-  cat "$source" >> "$out"
+  while IFS= read -r key || [ -n "$key" ]; do
+    printf '%s\n' "$key" >> "$out"
+  done < "$source"
 elif [ "$1" = "-Q" ]; then
   krl=""
   source=""
@@ -367,11 +369,17 @@ elif [ "$1" = "-Q" ]; then
     source="$argument"
     previous="$argument"
   done
-  if ! grep -q '^FAKE-KRL$' "$krl" 2>/dev/null; then exit 44; fi
+  header=""
+  IFS= read -r header < "$krl" || true
+  if [ "$header" != "FAKE-KRL" ]; then exit 44; fi
   if [ "$list" = "1" ]; then exit 0; fi
   while IFS= read -r key || [ -n "$key" ]; do
     [ -z "$key" ] && continue
-    if ! grep -Fqx "$key" "$krl"; then exit 0; fi
+    found=0
+    while IFS= read -r revoked || [ -n "$revoked" ]; do
+      if [ "$revoked" = "$key" ]; then found=1; fi
+    done < "$krl"
+    if [ "$found" -ne 1 ]; then exit 0; fi
   done < "$source"
   exit 1
 fi
