@@ -7,6 +7,12 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+// Only the real-OpenSSH revocation test needs these, and that test does not
+// run on macOS, so keeping the module gated to its consumer avoids dead code
+// there.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod common;
+
 #[cfg(unix)]
 const USER_ENROLLMENT_CA_JSON: &str = r#"{"authority":{"provisioners":[{"type":"JWK","name":"grafhome-user-enrollment","key":{"kid":"enrollment-kid","kty":"EC"},"encryptedKey":"encrypted-enrollment","claims":{"defaultUserSSHCertDuration":"24h","maxUserSSHCertDuration":"2562047h","enableSSHCA":true}}]}}"#;
 #[cfg(unix)]
@@ -1168,6 +1174,221 @@ fn apply_host_compiles_krls_inside_the_resolved_scratch_root() {
             "{line}"
         );
     }
+}
+
+/// Render one revoked user-key entry. `renewal_fingerprint` is an independent
+/// JWK thumbprint that policy requires to be unique per entry.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn user_revocation(user: &str, client_host: &str, key: &Path, renewal_fingerprint: &str) -> String {
+    format!(
+        r#"
+[[ssh_keys]]
+kind = "user"
+user = "{user}"
+client_host = "{client_host}"
+public_key = "{}"
+fingerprint = "{}"
+renewal_fingerprint = "{renewal_fingerprint}"
+revoked_at = "2026-07-25T20:14:15Z"
+"#,
+        common::canonical_public_key(key),
+        common::key_fingerprint(key),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn host_revocation(host: &str, key: &Path, renewal_fingerprint: &str) -> String {
+    format!(
+        r#"
+[[ssh_keys]]
+kind = "host"
+host = "{host}"
+public_key = "{}"
+fingerprint = "{}"
+renewal_fingerprint = "{renewal_fingerprint}"
+revoked_at = "2026-07-25T20:14:15Z"
+"#,
+        common::canonical_public_key(key),
+        common::key_fingerprint(key),
+    )
+}
+
+// End-to-end revocation with genuine OpenSSH cryptography. Every other
+// `apply host` test shims `ssh-keygen`, which proves the plumbing but assumes
+// the compiled artifact behaves; this drives the real tool through
+// `grafhome-ca` and then asks OpenSSH itself whether the installed KRLs revoke
+// what site policy said to revoke.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_installs_krls_that_revoke_real_user_and_host_keys() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+    write_executable(
+        &fixture.fake_bin.join("ssh-keygen"),
+        &common::real_ssh_keygen_shim(),
+    );
+
+    let keys = dir.path().join("keys");
+    fs::create_dir_all(&keys).unwrap();
+    let user_ca = keys.join("user-ca");
+    let host_ca = keys.join("host-ca");
+    let revoked_user = keys.join("revoked-user");
+    let revoked_host = keys.join("revoked-host");
+    let retained_user = keys.join("retained-user");
+    for key in [
+        &user_ca,
+        &host_ca,
+        &revoked_user,
+        &revoked_host,
+        &retained_user,
+    ] {
+        common::generate_key(key);
+    }
+
+    let revocations = format!(
+        "format_version = 1\n{}{}",
+        user_revocation(
+            "alice",
+            "retired-client",
+            &revoked_user,
+            "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg",
+        ),
+        host_revocation(
+            "retired-host",
+            &revoked_host,
+            "SHA256:grNhYzQm8G7RLKOUx2vpN4lqVj0aFJsYYfM1GxKXDnE",
+        ),
+    );
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        &revocations,
+    )
+    .unwrap();
+
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+
+    let trust = install_root.join("etc/ssh/grafhome");
+    let user_krl = trust.join("revoked_user_certs");
+    let host_krl = trust.join("revoked_host_keys");
+
+    // Compiled binary KRLs, not the plain-key source that was rendered.
+    common::assert_valid_krl(&user_krl);
+    common::assert_valid_krl(&host_krl);
+
+    // Anchor the call log before any later assertion reasons about its
+    // absence: one compile per role, through the passthrough shim.
+    let first_log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        first_log.matches("ssh-keygen args=-k ").count(),
+        2,
+        "{first_log}"
+    );
+
+    let revoked_user_pub = common::public_key_path(&revoked_user);
+    let revoked_host_pub = common::public_key_path(&revoked_host);
+    let retained_user_pub = common::public_key_path(&retained_user);
+    assert!(common::krl_revokes(&user_krl, &revoked_user_pub));
+    assert!(common::krl_revokes(&host_krl, &revoked_host_pub));
+
+    // A key that policy never revoked must still authenticate.
+    assert!(!common::krl_revokes(&user_krl, &retained_user_pub));
+    assert!(!common::krl_revokes(&host_krl, &retained_user_pub));
+
+    // Role scoping is a real boundary, not just a rendering detail: the user
+    // KRL must not revoke host keys, and vice versa.
+    assert!(!common::krl_revokes(&user_krl, &revoked_host_pub));
+    assert!(!common::krl_revokes(&host_krl, &revoked_user_pub));
+
+    // README promises that revoking a plain key rejects the current
+    // certificate and any later one issued for that same key, so pin both.
+    // Today's KRLs revoke by key blob rather than serial; asserting the
+    // reissue keeps that promise honest if entries ever become serial-scoped.
+    let user_cert = common::certificate_path(&revoked_user);
+    common::sign_certificate(&user_ca, &revoked_user, "alice", 1, common::CertKind::User);
+    assert!(common::krl_revokes(&user_krl, &user_cert));
+    fs::remove_file(&user_cert).unwrap();
+    common::sign_certificate(&user_ca, &revoked_user, "alice", 2, common::CertKind::User);
+    assert!(common::krl_revokes(&user_krl, &user_cert));
+
+    let host_cert = common::certificate_path(&revoked_host);
+    common::sign_certificate(
+        &host_ca,
+        &revoked_host,
+        "retired-host.example.test",
+        1,
+        common::CertKind::Host,
+    );
+    assert!(common::krl_revokes(&host_krl, &host_cert));
+    fs::remove_file(&host_cert).unwrap();
+    common::sign_certificate(
+        &host_ca,
+        &revoked_host,
+        "retired-host.example.test",
+        2,
+        common::CertKind::Host,
+    );
+    assert!(common::krl_revokes(&host_krl, &host_cert));
+
+    // Certificates for a retained key stay usable.
+    common::sign_certificate(&user_ca, &retained_user, "alice", 3, common::CertKind::User);
+    assert!(!common::krl_revokes(
+        &user_krl,
+        &common::certificate_path(&retained_user)
+    ));
+
+    // Reapplying unchanged policy validates and reuses the installed KRLs
+    // instead of recompiling them. The surviving `-Q` traffic proves the shim
+    // is still wired, so the absent `-k` is real evidence and not a silent
+    // fixture failure.
+    fs::write(&fixture.log, "").unwrap();
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Host policy already current"));
+    let reuse_log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(reuse_log.contains("ssh-keygen args=-Q"), "{reuse_log}");
+    assert!(!reuse_log.contains("ssh-keygen args=-k"), "{reuse_log}");
+
+    // Adding a revocation extends the installed KRL in place with
+    // `ssh-keygen -k -u`. Nothing else exercises that update path, and a fake
+    // ssh-keygen cannot model it.
+    let also_revoked_user = keys.join("also-revoked-user");
+    common::generate_key(&also_revoked_user);
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        format!(
+            "{revocations}{}",
+            user_revocation(
+                "alice",
+                "other-retired-client",
+                &also_revoked_user,
+                "SHA256:8kWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg",
+            )
+        ),
+    )
+    .unwrap();
+
+    fs::write(&fixture.log, "").unwrap();
+    apply_host_command(&fixture, &install_root)
+        .assert()
+        .success();
+    let update_log = fs::read_to_string(&fixture.log).unwrap();
+    assert_eq!(
+        update_log.matches("ssh-keygen args=-k -u ").count(),
+        1,
+        "{update_log}"
+    );
+
+    common::assert_valid_krl(&user_krl);
+    assert!(common::krl_revokes(&user_krl, &revoked_user_pub));
+    assert!(common::krl_revokes(
+        &user_krl,
+        &common::public_key_path(&also_revoked_user)
+    ));
+    assert!(!common::krl_revokes(&user_krl, &retained_user_pub));
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
