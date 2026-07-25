@@ -4250,6 +4250,11 @@ fn remote_provisioner_names(
     user: Option<&str>,
     quiet: bool,
 ) -> grafhome_ca::Result<Option<Vec<String>>> {
+    #[derive(serde::Deserialize)]
+    struct RemoteProvisioner {
+        name: String,
+    }
+
     let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let Some((root, user_owned)) = status_root_cert_path(model, user)? else {
         if quiet {
@@ -4276,24 +4281,22 @@ fn remote_provisioner_names(
             .arg("--root")
             .arg(root),
     )?;
-    let provisioners: serde_json::Value =
+    let provisioners: Vec<RemoteProvisioner> =
         serde_json::from_slice(&output).map_err(|source| grafhome_ca::Error::Json {
             path: PathBuf::from("<step ca provisioner list>"),
             source,
         })?;
-    let provisioners = provisioners
-        .as_array()
-        .ok_or_else(|| grafhome_ca::Error::Validation {
-            field: "step ca provisioner list".to_owned(),
-            message: "expected a JSON array".to_owned(),
-        })?;
-    Ok(Some(
-        provisioners
-            .iter()
-            .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
-            .map(ToOwned::to_owned)
-            .collect(),
-    ))
+    let mut names = Vec::with_capacity(provisioners.len());
+    for (index, provisioner) in provisioners.into_iter().enumerate() {
+        if provisioner.name.trim().is_empty() {
+            return Err(grafhome_ca::Error::Validation {
+                field: "step ca provisioner list".to_owned(),
+                message: format!("provisioner entry {index} has an empty name"),
+            });
+        }
+        names.push(provisioner.name);
+    }
+    Ok(Some(names))
 }
 
 fn status_root_cert_path(
