@@ -149,17 +149,16 @@ fn check_chain(
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    if let Some(boundary) = boundary {
-        if path
+    if let Some(boundary) = boundary
+        && (path
             .components()
             .any(|part| part == std::path::Component::ParentDir)
-            || !path.starts_with(boundary)
-        {
-            return Err(provenance_error(
-                path,
-                &format!("path must remain beneath {}", boundary.display()),
-            ));
-        }
+            || !path.starts_with(boundary))
+    {
+        return Err(provenance_error(
+            path,
+            &format!("path must remain beneath {}", boundary.display()),
+        ));
     }
     let components = path
         .ancestors()

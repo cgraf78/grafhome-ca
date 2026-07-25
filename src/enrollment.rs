@@ -58,7 +58,7 @@ fn encode_identity(value: &str) -> String {
 }
 
 fn decode_identity(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes = value
