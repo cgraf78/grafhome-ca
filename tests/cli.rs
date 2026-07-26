@@ -8091,23 +8091,47 @@ fn fresh_host_enrollment_then_revocation_disables_device_bound_renewal() {
 
 #[cfg(unix)]
 #[test]
-fn reused_host_name_can_complete_two_distinct_enrollment_generations() {
+fn reused_host_and_user_names_can_complete_two_distinct_enrollment_generations() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = fixture.config_root.join("../state/step/config/ca.json");
     fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
-    fs::write(&ca_json, HOST_BOOTSTRAP_CA_JSON).unwrap();
+    let mut initial_ca: serde_json::Value = serde_json::from_str(HOST_BOOTSTRAP_CA_JSON).unwrap();
+    let user_enrollment_ca: serde_json::Value =
+        serde_json::from_str(USER_ENROLLMENT_CA_JSON).unwrap();
+    initial_ca["authority"]["provisioners"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            user_enrollment_ca["authority"]["provisioners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    fs::write(&ca_json, serde_json::to_vec(&initial_ca).unwrap()).unwrap();
 
-    for (ssh_key, generation) in [(VALID_SSH_KEY, "first"), (VALID_SSH_KEY_TWO, "second")] {
-        let request = serde_json::json!({
+    for (host_ssh_key, user_ssh_key, generation) in [
+        (
+            VALID_SSH_KEY,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIajJZ5/urnAxNPKkhl5Y1wpDs5znXzpd0gCHj+wO7ry third@test",
+            "first",
+        ),
+        (
+            VALID_SSH_KEY_TWO,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAinBuWCjGPuFs1K79fo8eInc6dYSht5LptzXaAwq7PC fourth@test",
+            "second",
+        ),
+    ] {
+        let host_request = serde_json::json!({
             "version": 1,
             "kind": "grafhome-host-enrollment-request",
             "host": "proxy-host",
-            "ssh_public_key": ssh_key,
+            "ssh_public_key": host_ssh_key,
             "renewal_public_jwk": {
                 "kty": "EC",
                 "crv": "P-256",
-                "x": format!("{generation}-x"),
-                "y": format!("{generation}-y")
+                "x": format!("{generation}-host-x"),
+                "y": format!("{generation}-host-y")
             }
         });
         Command::cargo_bin("grafhome-ca")
@@ -8116,9 +8140,33 @@ fn reused_host_name_can_complete_two_distinct_enrollment_generations() {
             .arg(&fixture.config_root)
             .env("PATH", prepend_path(&fixture.fake_bin))
             .env("FAKE_LOG", &fixture.log)
-            .write_stdin(format!("REQUEST:{request}\n"))
+            .write_stdin(format!("REQUEST:{host_request}\n"))
             .assert()
             .success();
+
+        let user_request = serde_json::json!({
+            "version": 1,
+            "kind": "grafhome-user-enrollment-request",
+            "user": "alice",
+            "host": "proxy-host",
+            "ssh_public_key": user_ssh_key,
+            "renewal_public_jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": format!("{generation}-user-x"),
+                "y": format!("{generation}-user-y")
+            }
+        });
+        Command::cargo_bin("grafhome-ca")
+            .unwrap()
+            .args(["approve", "user", "--yes", "--config-root"])
+            .arg(&fixture.config_root)
+            .env("PATH", prepend_path(&fixture.fake_bin))
+            .env("FAKE_LOG", &fixture.log)
+            .write_stdin(format!("REQUEST:{user_request}\n"))
+            .assert()
+            .success();
+
         Command::cargo_bin("grafhome-ca")
             .unwrap()
             .args(["revoke", "host", "--host", "proxy-host", "--config-root"])
@@ -8127,14 +8175,68 @@ fn reused_host_name_can_complete_two_distinct_enrollment_generations() {
             .env("FAKE_LOG", &fixture.log)
             .assert()
             .success();
+        // Host revocation already includes users enrolled on that device, so the explicit
+        // follow-up user command must remain a safe no-op in every generation.
+        Command::cargo_bin("grafhome-ca")
+            .unwrap()
+            .args([
+                "revoke",
+                "user",
+                "--host",
+                "proxy-host",
+                "--user",
+                "alice",
+                "--config-root",
+            ])
+            .arg(&fixture.config_root)
+            .env("PATH", prepend_path(&fixture.fake_bin))
+            .env("FAKE_LOG", &fixture.log)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "user alice is already revoked or was never enrolled",
+            ));
     }
 
-    let policy = fs::read_to_string(fixture.config_root.join("policy/revocations.toml")).unwrap();
-    assert_eq!(policy.matches("[[ssh_keys]]").count(), 2);
-    assert_eq!(policy.matches("renewal_fingerprint = ").count(), 2);
+    let policy: toml::Value = toml::from_str(
+        &fs::read_to_string(fixture.config_root.join("policy/revocations.toml")).unwrap(),
+    )
+    .unwrap();
+    let revoked_keys = policy["ssh_keys"].as_array().unwrap();
+    assert_eq!(revoked_keys.len(), 4);
+    assert_eq!(
+        revoked_keys
+            .iter()
+            .filter(|entry| entry["kind"].as_str() == Some("host"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        revoked_keys
+            .iter()
+            .filter(|entry| entry["kind"].as_str() == Some("user"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        revoked_keys
+            .iter()
+            .map(|entry| entry["fingerprint"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert_eq!(
+        revoked_keys
+            .iter()
+            .map(|entry| entry["renewal_fingerprint"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
     let registry: serde_json::Value =
         serde_json::from_slice(&fs::read(enrollment_registry_path(&fixture)).unwrap()).unwrap();
-    assert_eq!(registry["records"].as_array().unwrap().len(), 2);
+    assert_eq!(registry["records"].as_array().unwrap().len(), 4);
     assert!(
         registry["records"]
             .as_array()
