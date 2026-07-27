@@ -4246,7 +4246,7 @@ fn migrate_policy_creates_a_valid_host_centric_tree() {
     assert_eq!(ca.matches("renewal_max_ttl").count(), 1);
     assert!(!users.contains("principal = \"alice\""));
     assert!(!users.contains("status = \"active\""));
-    let edge_document = edge_host.parse::<toml::Value>().unwrap();
+    let edge_document = toml::from_str::<toml::Value>(&edge_host).unwrap();
     assert_eq!(
         edge_document["ssh_roles"],
         toml::Value::Array(vec![
