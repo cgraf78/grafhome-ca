@@ -10,7 +10,7 @@ name = "grafhome-ca"
 path = "src/bin/grafhome-ca.rs"
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.0"
 clap = { version = "4.5.50", features = ["derive"] }
 fs2 = "0.4.3"
 jsonschema = "0.18.0"
