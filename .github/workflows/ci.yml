@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.88.0
 
@@ -35,7 +35,7 @@ jobs:
         run: cargo check --locked --all-targets
 
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
     with:
       setup-command: |
         as_root() {
@@ -84,7 +84,7 @@ jobs:
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
     with:
       matrix-set: full
       profiles: base
@@ -100,7 +100,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Install OpenSSH server
         shell: bash
@@ -126,7 +126,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Install Smallstep packages
         shell: bash
