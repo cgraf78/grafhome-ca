@@ -755,7 +755,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{EnrollmentRecord, EnrollmentRegistry, RecordStatus};
+    use super::{EnrollmentRecord, EnrollmentRegistry, RecordStatus, canonical_jwk};
     use crate::enrollment::{HostRequest, UserRequest};
 
     const KEY_ONE: &str =
@@ -776,6 +776,23 @@ mod tests {
                 "y": "coordinate-y"
             }),
         )
+    }
+
+    #[test]
+    fn canonical_jwk_fingerprint_matches_golden_vector() {
+        let (_, fingerprint) = canonical_jwk(&json!({
+            "kid": "ignored",
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "first-x",
+            "y": "coordinate-y"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            fingerprint,
+            concat!("SHA256:vcY4BI33zQeIwYzdWKTuCFGTtZF", "oIGvxiz_NGZ11dFU")
+        );
     }
 
     #[test]
