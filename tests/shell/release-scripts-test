@@ -1,87 +1,114 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# grafhome-ca-specific release coverage.
+#
+# The release scripts themselves are vendored from cgraf78/actions and covered
+# by that repo's test/release-scripts-test: identity resolution, packaging,
+# smoke validation, and local tag cutting all live there. Re-asserting them here
+# would recreate the triplicated coverage this consolidation removed.
+#
+# What stays is what only this repo can know: that release.conf declares the
+# payload grafhome-ca ships, that no secret-bearing tree is shipped by accident,
+# and that the smoke hook works.
+
 repo_root=$(git rev-parse --show-toplevel)
-tmp=$(mktemp -d)
 
-cleanup() {
-  rm -rf "$tmp"
-}
-trap cleanup EXIT
-
-assert_contains() {
-  local needle=$1
-  local path=$2
-  local content
-
-  content=$(<"$path")
-  if [[ "$content" != *"$needle"* ]]; then
-    printf 'expected %s to contain %q\n' "$path" "$needle" >&2
-    printf '%s\n' "$content" >&2
-    exit 1
-  fi
+fail() {
+  printf 'release-scripts-test: %s\n' "$*" >&2
+  exit 1
 }
 
-export GRAFHOME_CA_BUILD_COMMIT=0123456789abcdef0123456789abcdef01234567
-export GRAFHOME_CA_BUILD_TIMESTAMP=20260708-120102
+# shellcheck source=../../scripts/release.conf
+. "$repo_root/scripts/release.conf"
 
-version=$("$repo_root/scripts/release-version.sh")
-if [[ "$version" != "20260708-120102-01234567" ]]; then
-  printf 'unexpected version: %s\n' "$version" >&2
-  exit 1
+[[ "$RELEASE_ENV_PREFIX" == GRAFHOME_CA ]] ||
+  fail "unexpected env prefix: $RELEASE_ENV_PREFIX"
+[[ "$RELEASE_ASSET_NAME" == grafhome-ca ]] ||
+  fail "unexpected asset name: $RELEASE_ASSET_NAME"
+
+# This project ships a bin/ layout. Publishing the binary at the archive root
+# would silently break every installer that expects bin/grafhome-ca.
+[[ "$RELEASE_BINARY_DEST" == bin/grafhome-ca ]] ||
+  fail "unexpected binary destination: $RELEASE_BINARY_DEST"
+
+for entry in "${RELEASE_PAYLOAD_FILES[@]}"; do
+  [[ -f "$repo_root/$entry" ]] || fail "declared payload file is missing: $entry"
+done
+
+# The runtime assets installers depend on. `completions` and `man` are declared
+# but not generated yet, so they are deliberately absent from this list.
+for required in schemas templates examples docs; do
+  found=0
+  for entry in "${RELEASE_PAYLOAD_DIRS[@]}"; do
+    [[ "$entry" == "$required" ]] && found=1
+  done
+  [[ "$found" == 1 ]] || fail "release.conf must ship the $required tree"
+  [[ -d "$repo_root/$required" ]] || fail "$required tree is missing from the checkout"
+done
+
+# This repo issues certificates. Payload directories are copied wholesale, so a
+# tree that could carry keys or issued material must never be declared.
+for forbidden in state secrets private keys ca out target; do
+  for entry in "${RELEASE_PAYLOAD_DIRS[@]}"; do
+    [[ "$entry" == "$forbidden" ]] &&
+      fail "release.conf must not ship the $forbidden tree"
+  done
+done
+
+# Same risk one level down: anything key-shaped inside a declared tree would be
+# packaged into a public archive.
+#
+# This walks the filesystem rather than the git index on purpose. Packaging
+# copies each tree wholesale with `cp -R`, so an untracked file is published
+# just like a tracked one, and scanning only tracked paths would miss exactly
+# the case that matters.
+scan_dirs=()
+for entry in "${RELEASE_PAYLOAD_DIRS[@]}"; do
+  [[ -d "$repo_root/$entry" ]] && scan_dirs+=("$repo_root/$entry")
+done
+
+if [[ "${#scan_dirs[@]}" -gt 0 ]]; then
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      *.key | *.pem | *_key | *.p12 | *.pfx | *id_ed25519 | *id_rsa)
+        fail "key-shaped file inside a packaged tree: ${candidate#"$repo_root/"}"
+        ;;
+    esac
+  done < <(find "${scan_dirs[@]}" -type f)
 fi
 
-tag=$("$repo_root/scripts/release-tag.sh")
-if [[ "$tag" != "$version" ]]; then
-  printf 'tag/version mismatch: %s vs %s\n' "$tag" "$version" >&2
-  exit 1
+# --- Smoke hook -------------------------------------------------------------
+
+# shellcheck source=../../scripts/release-smoke-hook.sh
+. "$repo_root/scripts/release-smoke-hook.sh"
+
+declare -F release_smoke_check >/dev/null ||
+  fail "release-smoke-hook.sh must define release_smoke_check"
+
+# The hook must exercise the bin/ layout, and a failing binary must fail smoke.
+hook_fake=$(mktemp -d)
+trap 'rm -rf "$hook_fake"' EXIT
+mkdir -p "$hook_fake/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$hook_fake/bin/grafhome-ca"
+chmod +x "$hook_fake/bin/grafhome-ca"
+release_smoke_check "$hook_fake" linux-x86_64-musl >/dev/null ||
+  fail "smoke hook rejected a working binary"
+
+printf '#!/usr/bin/env bash\nexit 4\n' >"$hook_fake/bin/grafhome-ca"
+if release_smoke_check "$hook_fake" linux-x86_64-musl >/dev/null 2>&1; then
+  fail "smoke hook swallowed a failing binary"
 fi
 
-if "$repo_root/scripts/package-release.sh" x86_64-unknown-linux-musl x86_64-unknown-linux-musl >/dev/null 2>"$tmp/package.err"; then
-  printf 'package script accepted a Rust target triple as asset label\n' >&2
-  exit 1
-fi
-assert_contains 'public release label' "$tmp/package.err"
+# --- Workflow contract ------------------------------------------------------
 
-if "$repo_root/scripts/smoke-release.sh" x86_64-unknown-linux-musl >/dev/null 2>"$tmp/smoke.err"; then
-  printf 'smoke script accepted a Rust target triple as asset label\n' >&2
-  exit 1
-fi
-assert_contains 'public release label' "$tmp/smoke.err"
+release_workflow=$(<"$repo_root/.github/workflows/release.yml")
+[[ "$release_workflow" == *'tag-command: scripts/release-tag.sh'* ]] ||
+  fail "release workflow must use the exact reusable tag command"
 
-android_smoke="$tmp/android-smoke"
-mkdir -p "$android_smoke/scripts" "$android_smoke/dist" \
-  "$android_smoke/stage/bin" "$android_smoke/stage/schemas" \
-  "$android_smoke/stage/templates" "$android_smoke/stage/examples"
-cp "$repo_root/scripts/smoke-release.sh" "$android_smoke/scripts/smoke-release.sh"
-cat >"$android_smoke/scripts/release-tag.sh" <<'SH'
-#!/usr/bin/env bash
-printf 'unused\n'
-SH
-chmod +x "$android_smoke/scripts/release-tag.sh"
-printf '#!/system/bin/sh\n' >"$android_smoke/stage/bin/grafhome-ca"
-chmod +x "$android_smoke/stage/bin/grafhome-ca"
-printf '{}\n' >"$android_smoke/stage/.grafhome-ca-install.json"
-android_tag=20990207-080910-abcdef12
-printf '%s\n' "$android_tag" >"$android_smoke/dist/.grafhome-ca-release-version"
-tar -C "$android_smoke/stage" -czf \
-  "$android_smoke/dist/grafhome-ca-${android_tag}-android-aarch64.tar.gz" .
-android_bin="$tmp/android-bin"
-mkdir -p "$android_bin"
-cat >"$android_bin/readelf" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$1" >>"$ANDROID_READELF_LOG"
-case "$1" in
-  -h) printf '  Machine:                           AArch64\n' ;;
-  -l) printf '      [Requesting program interpreter: /system/bin/linker64]\n' ;;
-  *) exit 2 ;;
-esac
-SH
-chmod +x "$android_bin/readelf"
-(
-  cd "$android_smoke"
-  ANDROID_READELF_LOG="$android_smoke/readelf.log" \
-    PATH="$android_bin:$PATH" scripts/smoke-release.sh android-aarch64
-)
-assert_contains '-h' "$android_smoke/readelf.log"
-assert_contains '-l' "$android_smoke/readelf.log"
+# Vendored copies are only equivalent to a single source while CI enforces it.
+ci_workflow=$(<"$repo_root/.github/workflows/ci.yml")
+[[ "$ci_workflow" == *verify-release-scripts* ]] ||
+  fail "ci workflow must verify the vendored release scripts"
+
+printf 'release-scripts-test: ok\n'
