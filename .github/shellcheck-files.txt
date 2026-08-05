@@ -1,8 +1,11 @@
 # type<TAB>repository-relative path
 # `fixture` records are discovered but intentionally excluded from ShellCheck.
 program	scripts/package-release.sh
+program	scripts/release-lib.sh
+program	scripts/release-smoke-hook.sh
 program	scripts/release-tag.sh
 program	scripts/release-version.sh
+program	scripts/release.conf
 program	scripts/release.sh
 program	scripts/smoke-release.sh
 program	scripts/termux-ci.sh
