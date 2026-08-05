@@ -35,7 +35,7 @@ jobs:
         run: cargo check --locked --all-targets
 
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
     with:
       setup-command: |
         as_root() {
@@ -73,12 +73,9 @@ jobs:
         install -m 0755 \
           "$target_dir/$RUST_TARGET/release/grafhome-ca" \
           .termux-ci/grafhome-ca
-      package-smoke-setup-command: |
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
-          rustup target add x86_64-unknown-linux-musl
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-        fi
+      # The package smoke exercises the same static Linux target releases
+      # publish. The shared workflow owns adding that target and its linker.
+      package-smoke-musl-target: x86_64-unknown-linux-musl
       package-smoke-command: |
         scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
         scripts/smoke-release.sh linux-x86_64-musl
