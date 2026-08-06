@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
+    # Stagger sibling repositories so scheduled full matrices and the advisory
+    # audit do not compete for the same runner capacity at the top of the hour.
     - cron: "7 8 * * *"
   workflow_dispatch:
 
@@ -18,25 +20,13 @@ env:
   STEP_CA_VERSION: 0.30.2
 
 jobs:
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: 1.88.0
-
-      - name: Check minimum supported Rust version
-        run: cargo check --locked --all-targets
-
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
+      # Cargo.toml makes Rust 1.88 part of the public compatibility contract.
+      # Running that check inside shared Rust CI keeps it under rust / Required
+      # and gives it the same locked, all-target, all-feature policy as peers.
+      msrv-toolchain: "1.88"
       setup-command: |
         as_root() {
           if [ "$(id -u)" -eq 0 ]; then
@@ -60,11 +50,12 @@ jobs:
             as_root apt-get install -y --no-install-recommends openssh-client
             ;;
         esac
+      # This project's supported physical-device release target is AArch64.
+      # The x86_64 build below is not another release artifact; it exists only
+      # to execute the binary in CI's x86_64 Android emulator.
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
-      clippy-command: cargo clippy --locked --all-targets --all-features -- -D warnings
-      doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
       termux-command: scripts/termux-ci.sh
       termux-host-command: |
         target_dir="$RUNNER_TEMP/grafhome-ca-termux-target"
@@ -73,15 +64,16 @@ jobs:
         install -m 0755 \
           "$target_dir/$RUST_TARGET/release/grafhome-ca" \
           .termux-ci/grafhome-ca
-      # The package smoke exercises the same static Linux target releases
-      # publish. The shared workflow owns adding that target and its linker.
+      # Tagged releases publish a static Linux archive, so regular CI builds and
+      # smokes that same artifact shape. The dependency graph is pure Rust: the
+      # shared default adds the target without an unnecessary apt/linker step.
       package-smoke-musl-target: x86_64-unknown-linux-musl
       package-smoke-command: |
-        scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
       matrix-set: full
       profiles: base
@@ -90,19 +82,22 @@ jobs:
 
   release-scripts:
     name: Release script sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # scripts/release-*.sh are vendored from cgraf78/actions. Catching drift
-      # on every pull request is what keeps the vendored copy equivalent to a
-      # single source rather than a fork that happens to look similar.
-      - uses: cgraf78/actions/.github/actions/verify-release-scripts@816817518ed623a59b6ffdd87949b23d15d73fa2
-        with:
-          scripts-dir: scripts
+      # The stable check name still protects release-script synchronization,
+      # while the broader verifier also proves every cgraf78/actions use comes
+      # from the same repository lock. GitHub requires literal action refs, so
+      # CI must catch any generated literal that drifts from that one source.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
 
+  # These jobs exercise grafhome-ca product behavior against real OpenSSH and
+  # Smallstep packages. They remain caller-owned because putting product
+  # services, environment flags, or privileged integration policy into the
+  # reusable Rust workflow would couple unrelated consumers to this repo.
   ssh-revocation:
     name: SSH Revocation / Ubuntu
     runs-on: ubuntu-latest
