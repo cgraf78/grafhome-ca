@@ -21,7 +21,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       # Cargo.toml makes Rust 1.88 part of the public compatibility contract.
       # Running that check inside shared Rust CI keeps it under rust / Required
@@ -73,26 +73,28 @@ jobs:
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       matrix-set: full
       profiles: base
       shellcheck-inventory-path: .github/shellcheck-files.txt
       test-command: tests/shell/release-scripts-test
 
-  release-scripts:
-    name: Release script sync
+  actions-sync:
+    name: cgraf78/actions sync
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # The stable check name still protects release-script synchronization,
-      # while the broader verifier also proves every cgraf78/actions use comes
-      # from the same repository lock. GitHub requires literal action refs, so
-      # CI must catch any generated literal that drifts from that one source.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+      # GitHub resolves literal `uses:` refs before a job can read repository
+      # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
+      # gate verifies every unavoidable action literal and all vendored release
+      # scripts still match that single reviewed dependency decision.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
 
   # These jobs exercise grafhome-ca product behavior against real OpenSSH and
   # Smallstep packages. They remain caller-owned because putting product
