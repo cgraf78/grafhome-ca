@@ -27,6 +27,12 @@ jobs:
       # Running that check inside shared Rust CI keeps it under rust / Required
       # and gives it the same locked, all-target, all-feature policy as peers.
       msrv-toolchain: "1.88"
+      # cargo-audit scans optional packages recorded in Cargo.lock even when no
+      # build can reach them. ssh-key declares RSA as optional, while this repo
+      # enables only ECDSA plus std; RUSTSEC-2023-0071 also has no fixed release.
+      # The setup guard below proves that RSA stays unreachable on every PR and
+      # push before this scheduled advisory exception is allowed to apply.
+      audit-command: cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071
       setup-command: |
         as_root() {
           if [ "$(id -u)" -eq 0 ]; then
@@ -50,6 +56,18 @@ jobs:
             as_root apt-get install -y --no-install-recommends openssh-client
             ;;
         esac
+
+        # RustSec itself runs only on schedules and manual dispatches because
+        # its database changes independently of the commit. Enforce the static
+        # premise behind the exception on every Rust CI event: if any target or
+        # root feature enables RSA, fail before tests instead of waiting for the
+        # next scheduled audit to reveal that this ignore became unsafe.
+        rsa_paths=$(cargo tree --locked --all-features --target all -i rsa)
+        if [[ -n "$rsa_paths" ]]; then
+          printf '%s\n' 'RSA is active; remove the RustSec exception and address RUSTSEC-2023-0071' >&2
+          printf '%s\n' "$rsa_paths" >&2
+          exit 1
+        fi
       # This project's supported physical-device release target is AArch64.
       # The x86_64 build below is not another release artifact; it exists only
       # to execute the binary in CI's x86_64 Android emulator.

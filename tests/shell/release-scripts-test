@@ -124,6 +124,13 @@ cargo_msrv=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' "$repo_root/Cargo.toml
   fail "ci workflow must inherit the shared locked all-target MSRV command"
 [[ "$ci_workflow" != *$'\n  rustsec:\n'* ]] ||
   fail "ci workflow must not duplicate the shared RustSec job"
+# `ssh-key` records its optional RSA implementation in Cargo.lock even though
+# grafhome-ca enables only ECDSA. Keep the unavoidable advisory exception tied
+# to a PR-time reachability guard so enabling RSA cannot land under the ignore.
+[[ "$ci_workflow" == *"setup-command: |"*"rsa_paths=\$(cargo tree --locked --all-features --target all -i rsa)"*"if [[ -n \"\$rsa_paths\" ]]"*"exit 1"* ]] ||
+  fail "Rust CI setup must fail closed when RSA becomes reachable"
+[[ "$ci_workflow" == *'audit-command: cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071'* ]] ||
+  fail "RustSec must ignore only the unreachable RSA advisory"
 [[ "$ci_workflow" != *'clippy-command:'* ]] ||
   fail "ci workflow must inherit the shared Clippy policy"
 [[ "$ci_workflow" != *'doc-command:'* ]] ||
