@@ -10,14 +10,17 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     permissions:
       contents: write
     with:
+      # CI's x86_64 Android build exists only for the emulator runtime. This
+      # project's supported physical-device release target is AArch64, so
+      # publishing an emulator-only archive would be misleading.
       android-aarch64: true
       tag-command: scripts/release-tag.sh
-      # Static Linux release binaries link C code, so musl targets need a musl
-      # linker. The shared workflow owns the matrix and its prerequisites.
-      install-musl-tools: true
+      # The shared matrix installs each Rust target. grafhome-ca has no native
+      # dependency, so Rust's bundled musl support is sufficient and releases
+      # avoid an unnecessary host package/network dependency.
       package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
       smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"

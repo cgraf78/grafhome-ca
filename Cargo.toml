@@ -5,6 +5,12 @@ edition = "2024"
 rust-version = "1.88"
 build = "build.rs"
 
+# Keep ordinary local Cargo commands aligned with CI's warnings-as-errors
+# policy. This catches warning regressions before they depend on Clippy's
+# command-line flags or a particular workflow entry point.
+[lints.rust]
+warnings = "deny"
+
 [[bin]]
 name = "grafhome-ca"
 path = "src/bin/grafhome-ca.rs"

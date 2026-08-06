@@ -105,10 +105,32 @@ fi
 release_workflow=$(<"$repo_root/.github/workflows/release.yml")
 [[ "$release_workflow" == *'tag-command: scripts/release-tag.sh'* ]] ||
   fail "release workflow must use the exact reusable tag command"
+[[ "$release_workflow" != *'install-musl-tools:'* ]] ||
+  fail "pure-Rust release builds must not install the host musl linker"
 
-# Vendored copies are only equivalent to a single source while CI enforces it.
+# Vendored copies and workflow action refs are only equivalent to a single
+# source while CI enforces both from the repository's canonical lock file.
 ci_workflow=$(<"$repo_root/.github/workflows/ci.yml")
-[[ "$ci_workflow" == *verify-release-scripts* ]] ||
-  fail "ci workflow must verify the vendored release scripts"
+[[ "$ci_workflow" == *verify-consumer-sync* ]] ||
+  fail "ci workflow must verify the actions lock and vendored release scripts"
+cargo_msrv=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' "$repo_root/Cargo.toml")
+[[ "$cargo_msrv" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
+  fail "Cargo.toml must declare one parseable rust-version"
+[[ "$ci_workflow" == *"msrv-toolchain: \"$cargo_msrv\""* ]] ||
+  fail "shared Rust CI toolchain must equal Cargo.toml rust-version"
+[[ "$ci_workflow" != *$'\n  msrv:\n'* ]] ||
+  fail "ci workflow must not duplicate the shared MSRV job"
+[[ "$ci_workflow" != *'msrv-command:'* ]] ||
+  fail "ci workflow must inherit the shared locked all-target MSRV command"
+[[ "$ci_workflow" != *$'\n  rustsec:\n'* ]] ||
+  fail "ci workflow must not duplicate the shared RustSec job"
+[[ "$ci_workflow" != *'clippy-command:'* ]] ||
+  fail "ci workflow must inherit the shared Clippy policy"
+[[ "$ci_workflow" != *'doc-command:'* ]] ||
+  fail "ci workflow must inherit the shared rustdoc policy"
+[[ "$ci_workflow" != *'package-smoke-install-musl-tools:'* ]] ||
+  fail "pure-Rust package smoke must not install the host musl linker"
+[[ "$ci_workflow" == *"scripts/package-release.sh \"\$RUST_TARGET\" linux-x86_64-musl"* ]] ||
+  fail "package smoke must reuse the target prepared by shared Rust CI"
 
 printf 'release-scripts-test: ok\n'
