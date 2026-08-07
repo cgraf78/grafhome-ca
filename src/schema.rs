@@ -31,16 +31,14 @@ fn validate_schema_text(
         path: Path::new(schema_name).to_path_buf(),
         source,
     })?;
-    let compiled =
-        jsonschema::JSONSchema::compile(&schema).map_err(|source| Error::Validation {
-            field: schema_name.to_owned(),
-            message: source.to_string(),
-        })?;
-    let errors = compiled
-        .validate(value)
-        .err()
-        .map(|errors| errors.map(|error| error.to_string()).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let validator = jsonschema::validator_for(&schema).map_err(|source| Error::Validation {
+        field: schema_name.to_owned(),
+        message: source.to_string(),
+    })?;
+    let errors: Vec<String> = validator
+        .iter_errors(value)
+        .map(|error| error.to_string())
+        .collect();
     if errors.is_empty() {
         Ok(())
     } else {
