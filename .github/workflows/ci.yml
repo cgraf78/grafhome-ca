@@ -21,7 +21,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@ce882e815cadd89f06a0a05fcfece953b22619b8
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@023a7d521187d9a1dc281a4b2beddbf03845d689
     with:
       # Cargo.toml makes Rust 1.88 part of the public compatibility contract.
       # Running that check inside shared Rust CI keeps it under rust / Required
@@ -57,11 +57,10 @@ jobs:
             ;;
         esac
 
-        # RustSec itself runs only on schedules and manual dispatches because
-        # its database changes independently of the commit. Enforce the static
-        # premise behind the exception on every Rust CI event: if any target or
-        # root feature enables RSA, fail before tests instead of waiting for the
-        # next scheduled audit to reveal that this ignore became unsafe.
+        # RustSec now runs on every Rust CI event, but its narrow ignore cannot
+        # prove the premise that makes that exception safe. Enforce that premise
+        # independently: if any target or root feature makes RSA reachable, fail
+        # before tests even though cargo-audit was told to ignore the advisory.
         rsa_paths=$(cargo tree --locked --all-features --target all -i rsa)
         if [[ -n "$rsa_paths" ]]; then
           printf '%s\n' 'RSA is active; remove the RustSec exception and address RUSTSEC-2023-0071' >&2
@@ -91,7 +90,7 @@ jobs:
         scripts/smoke-release.sh linux-x86_64-musl
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@ce882e815cadd89f06a0a05fcfece953b22619b8
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@023a7d521187d9a1dc281a4b2beddbf03845d689
     with:
       matrix-set: full
       profiles: base
@@ -112,7 +111,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@ce882e815cadd89f06a0a05fcfece953b22619b8
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@023a7d521187d9a1dc281a4b2beddbf03845d689
 
   # These jobs exercise grafhome-ca product behavior against real OpenSSH and
   # Smallstep packages. They remain caller-owned because putting product
