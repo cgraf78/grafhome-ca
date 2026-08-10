@@ -816,6 +816,16 @@ fn check_validates_example_config() {
 }
 
 #[test]
+fn example_config_tracks_an_empty_revocation_policy() {
+    let path = example_config_root().join("policy/revocations.toml");
+    assert_eq!(
+        fs::read_to_string(&path).expect("example revocation policy exists"),
+        "format_version = 1\n",
+        "the public example should be ready for a first revocation without containing inventory",
+    );
+}
+
+#[test]
 fn check_uses_xdg_config_home_by_default() {
     let dir = tempdir().unwrap();
     copy_dir(&example_config_root(), &dir.path().join("grafhome-ca"));
