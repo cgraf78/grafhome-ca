@@ -9,9 +9,14 @@ commit publicly and are used by the test suite to keep examples valid.
 ${XDG_CONFIG_HOME:-~/.config}/grafhome-ca/
   config/deployment.env
   policy/ca.toml
+  policy/revocations.toml
   policy/users.toml
   policy/hosts/<host>.toml
 ```
+
+The revocation policy intentionally starts empty. Tracking that file before a
+first revocation avoids an emergency policy bootstrap while keeping host and
+user inventory out of this public example.
 
 `legacy-site-config/` preserves the previous six-file policy shape as a
 migration and compatibility fixture. It is not the recommended authoring
