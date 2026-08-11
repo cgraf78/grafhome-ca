@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Grafhome CA's consumer-side contract for the generated release installer.
+#
+# The shared installer owns generic archive safety. This schema-faithful
+# synthetic archive test owns the public repository boundary: bin/grafhome-ca
+# plus the complete non-secret schemas, templates, examples, and docs payload
+# must stay aligned. The package-smoke CI job separately installs the exact
+# archive emitted by package-release.sh.
+
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+workspace=$(mktemp -d)
+trap 'rm -rf "$workspace"' EXIT
+pass=0
+failures=0
+
+pass() {
+  pass=$((pass + 1))
+  printf '  PASS: %s\n' "$1"
+}
+
+fail() {
+  failures=$((failures + 1))
+  printf '  FAIL: %s\n' "$1" >&2
+}
+
+assert_eq() {
+  local description=$1 expected=$2 actual=$3
+  if [[ "$expected" == "$actual" ]]; then
+    pass "$description"
+  else
+    fail "$description (expected '$expected', got '$actual')"
+  fi
+}
+
+sha256_file() {
+  local file=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$(dirname "$file")" && sha256sum "$(basename "$file")")
+  else
+    (cd "$(dirname "$file")" && shasum -a 256 "$(basename "$file")")
+  fi
+}
+
+# This consumer test owns Grafhome CA's archive schema and public payload, not
+# the shared installer's platform classifier. Pin a synthetic Linux host so the
+# same archive is meaningful on Linux, macOS, and Termux; cgraf78/actions tests
+# Linux, macOS, and Android platform selection independently. Clearing the
+# ambient Android marker is required because Termux exports it even when uname
+# is intentionally replaced for this fixture.
+uname_bin="$workspace/uname-bin"
+mkdir -p "$uname_bin"
+cat >"$uname_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case ${1:-} in
+  -s) printf '%s\n' Linux ;;
+  -m) printf '%s\n' x86_64 ;;
+  -o) printf '%s\n' GNU/Linux ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$uname_bin/uname"
+PATH="$uname_bin:$PATH"
+ANDROID_ROOT=
+export PATH ANDROID_ROOT
+
+make_archive() {
+  local directory=$1 version=$2 marker=$3
+  local platform=linux-x86_64-musl
+  local archive="$directory/grafhome-ca-${version}-${platform}.tar.gz"
+  local payload="$directory/payload-$marker"
+  local commit_suffix=${version##*-}
+
+  mkdir -p "$payload/bin" "$payload/schemas" "$payload/templates" \
+    "$payload/examples" "$payload/docs"
+  {
+    printf '%s\n' '#!/usr/bin/env sh'
+    printf "printf '%%s\\\\n' '%s'\n" "$marker"
+  } >"$payload/bin/grafhome-ca"
+  chmod 0755 "$payload/bin/grafhome-ca"
+  printf '%s\n' '# Grafhome CA fixture' >"$payload/README.md"
+  printf '%s\n' 'MIT fixture' >"$payload/LICENSE"
+  printf '%s\n' 'schema fixture' >"$payload/schemas/example.json"
+  printf '%s\n' 'template fixture' >"$payload/templates/example.toml"
+  printf '%s\n' 'example fixture' >"$payload/examples/example.toml"
+  printf '%s\n' 'documentation fixture' >"$payload/docs/example.md"
+  cat >"$payload/.grafhome-ca-install.json" <<EOF
+{
+  "schema": 1,
+  "method": "release",
+  "artifact_platform": "$platform",
+  "version": "$version",
+  "tag": "$version",
+  "commit": "${commit_suffix}${commit_suffix}${commit_suffix}${commit_suffix}${commit_suffix}",
+  "repo": "cgraf78/grafhome-ca"
+}
+EOF
+  tar -C "$payload" -czf "$archive" .
+  sha256_file "$archive" >"$archive.sha256"
+  printf '%s\n' "$archive"
+}
+
+printf '%s\n' '=== Standalone release installer ==='
+
+if [[ -x "$repo_root/install.sh" ]]; then
+  pass "installer: generated entry point exists and is executable"
+else
+  fail "installer: generated entry point exists and is executable"
+  printf '\nSummary: %d passed, %d failed\n' "$pass" "$failures"
+  exit 1
+fi
+
+home="$workspace/home"
+data_home="$workspace/data"
+bin_dir="$home/.local/bin"
+mkdir -p "$home"
+
+v1=20260810-120000-deadbeef
+archive_v1=$(make_archive "$workspace" "$v1" first)
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$repo_root/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
+assert_eq "installer: installs a valid local release archive" 0 "$rc"
+assert_eq "installer: public command executes installed release" \
+  first "$("$bin_dir/grafhome-ca")"
+
+stable_root="$data_home/cgraf78/grafhome-ca"
+for payload in README.md LICENSE schemas/example.json templates/example.toml \
+  examples/example.toml docs/example.md; do
+  if [[ -e "$stable_root/$payload" ]]; then
+    pass "installer: retains payload $payload"
+  else
+    fail "installer: retains payload $payload"
+  fi
+done
+
+# Installing the binary and public runtime assets must never materialize site
+# policy, enrollment state, keys, certificates, or host configuration.
+for forbidden in state secrets private keys ca policy; do
+  if [[ ! -e "$stable_root/$forbidden" && ! -e "$workspace/$forbidden" ]]; then
+    pass "installer: creates no forbidden path: $forbidden"
+  else
+    fail "installer: creates no forbidden path: $forbidden"
+  fi
+done
+
+first_target=$(readlink "$bin_dir/grafhome-ca")
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$repo_root/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
+assert_eq "installer: same-release reinstall is idempotent" 0 "$rc"
+assert_eq "installer: idempotence preserves command activation" \
+  "$first_target" "$(readlink "$bin_dir/grafhome-ca")"
+
+v2=20260810-120001-feedface
+archive_v2=$(make_archive "$workspace" "$v2" second)
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$repo_root/install.sh" \
+  --archive "$archive_v2" --checksum "$archive_v2.sha256" || rc=$?
+assert_eq "installer: activates a validated update" 0 "$rc"
+assert_eq "installer: updated command uses the new release" \
+  second "$("$bin_dir/grafhome-ca")"
+
+printf '%064d  %s\n' 0 "$(basename "$archive_v1")" >"$archive_v1.bad.sha256"
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$repo_root/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.bad.sha256" \
+  >"$workspace/bad.out" 2>"$workspace/bad.err" || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  pass "installer: rejects a corrupt checksum"
+else
+  fail "installer: rejects a corrupt checksum"
+fi
+assert_eq "installer: failed update preserves prior command" \
+  second "$("$bin_dir/grafhome-ca")"
+
+collision="$workspace/collision"
+collision_home="$collision/home"
+collision_data="$collision/data"
+mkdir -p "$collision_home/.local/bin"
+printf '%s\n' user-owned >"$collision_home/.local/bin/grafhome-ca"
+rc=0
+HOME="$collision_home" XDG_DATA_HOME="$collision_data" \
+  "$repo_root/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.sha256" \
+  >"$collision/out" 2>"$collision/err" || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  pass "installer: refuses a user-owned command"
+else
+  fail "installer: refuses a user-owned command"
+fi
+assert_eq "installer: preserves a user-owned command" \
+  user-owned "$(cat "$collision_home/.local/bin/grafhome-ca")"
+if [[ ! -e "$collision_data/cgraf78/grafhome-ca" ]]; then
+  pass "installer: command collision publishes no partial install"
+else
+  fail "installer: command collision publishes no partial install"
+fi
+
+printf '\nSummary: %d passed, %d failed\n' "$pass" "$failures"
+[[ "$failures" -eq 0 ]]
