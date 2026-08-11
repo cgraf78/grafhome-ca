@@ -29,6 +29,26 @@ inventory, internal addresses, VLAN/interface names, or access policy.
 - `src/`: Rust core APIs and CLIs.
 - `scripts/`: release helpers using generated commit-timestamp versions.
 
+## Installation
+
+Install the latest published CLI and its complete public runtime payload
+without a Rust toolchain:
+
+```sh
+git clone https://github.com/cgraf78/grafhome-ca.git
+cd grafhome-ca
+./install.sh
+```
+
+The installer verifies the release archive against its published SHA-256 file,
+keeps the complete release under `${XDG_DATA_HOME:-~/.local/share}/cgraf78`,
+and activates `grafhome-ca` under `~/.local/bin`. It installs no site policy,
+enrollment state, keys, certificates, or host configuration. Re-running it is
+an idempotent update. Use `--version <tag>` to pin a release.
+Use `--archive <path>` with `--checksum <path>` for a previously downloaded
+archive. Run `./install.sh --help` for destination overrides. A checksum
+detects corruption and wrong assets; it is not a signed provenance mechanism.
+
 ## Commands
 
 Validate site policy and config from the default XDG location:

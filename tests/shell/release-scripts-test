@@ -31,6 +31,8 @@ fail() {
 # would silently break every installer that expects bin/grafhome-ca.
 [[ "$RELEASE_BINARY_DEST" == bin/grafhome-ca ]] ||
   fail "unexpected binary destination: $RELEASE_BINARY_DEST"
+[[ "$RELEASE_STANDALONE_INSTALLER" == true ]] ||
+  fail "release config must opt into the generated standalone installer"
 
 for entry in "${RELEASE_PAYLOAD_FILES[@]}"; do
   [[ -f "$repo_root/$entry" ]] || fail "declared payload file is missing: $entry"
