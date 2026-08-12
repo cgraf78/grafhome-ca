@@ -127,6 +127,9 @@ fn reconcile_authority_policy(
         })?;
     let live = authority.entry("policy").or_insert_with(|| json!({}));
     let mut changed = false;
+    // ca.json also contains Smallstep/operator-owned policy. Grafhome owns only
+    // these projections of site policy, so update them in place rather than
+    // replacing the authority object and erasing unrelated live configuration.
     for path in [
         &["x509", "allow", "dns"][..],
         &["x509", "allowWildcardNames"],
@@ -242,6 +245,12 @@ fn proxy_claims(provisioner: &Provisioner) -> Map<String, Value> {
     ])
 }
 
+// Live provisioners carry runtime key material and may have Smallstep-owned
+// claims outside Grafhome's duration policy. Routine policy reconciliation
+// therefore merges only the claim keys Grafhome owns. An enrollment flow that
+// constructs a complete device-bound renewal provisioner has a narrower
+// contract: `upsert_renewal_provisioner` replaces that full object after proving
+// key identity, preventing stale fields from broadening its authority.
 fn reconcile_object(current: &mut Map<String, Value>, desired: Map<String, Value>) -> bool {
     let mut changed = false;
     for (key, value) in desired {
@@ -1146,6 +1155,13 @@ pub fn validate_enrollment_provisioner_key_files(
         });
     }
 
+    // `step` must briefly materialize the decrypted JWK so its public members
+    // can be compared with the enrolled public key. Keep that plaintext in a
+    // per-invocation TempDir beside the credentials rather than a shared system
+    // temp location; the guard owns best-effort cleanup on normal and error
+    // returns. The encrypted source remains untouched, and subprocess output is
+    // discarded so key material is never copied into command output or
+    // diagnostics.
     let temp = tempfile::Builder::new()
         .prefix(".grafhome-ca-enrollment-key-check-")
         .tempdir_in(jwk_dir)
