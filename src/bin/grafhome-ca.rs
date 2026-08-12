@@ -973,6 +973,12 @@ impl TermuxHostRuntime {
                 .to_string_lossy()
                 .into_owned(),
         );
+        // Android's system-owned app-data ancestors cannot satisfy OpenSSH's
+        // POSIX StrictModes checks. TermuxHostRuntime::detect has already
+        // replaced that check with recursive ownership, mode, and symlink
+        // validation of the security-relevant HOME/PREFIX paths used here.
+        // Disable the per-account authorized_keys file at the same boundary so
+        // that fallback cannot bypass the validated principals policy.
         values.insert(
             AUTHORIZED_KEYS_DIRECTIVE.to_owned(),
             "AuthorizedKeysFile none".to_owned(),
@@ -1400,6 +1406,15 @@ fn os_hostname() -> grafhome_ca::Result<String> {
     })
 }
 
+/// Enforce root-only host mutation, with one fail-closed test-fixture exception.
+///
+/// Integration tests need to exercise real system-path behavior without root.
+/// They may do so only when configuration, mutable CA state, keys, helper tools,
+/// and any redirected install root all resolve beneath one protected sandbox
+/// owned by the invoking user and not writable by group or others. Every new
+/// privileged path or executable used by these commands must join the inventory
+/// below: keeping it exhaustive is part of this boundary because an omitted
+/// path would not be confined by the non-root exception.
 fn require_root_or_isolated_test(
     config_root: &Path,
     trusted_uid: u32,
