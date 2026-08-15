@@ -58,6 +58,11 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
         )?,
     });
     files.push(RenderedFile {
+        path: host_path(&ca_host.host, "usr/libexec/grafhome-ca-wait-origin")?,
+        mode: 0o755,
+        content: include_str!("../templates/systemd/grafhome-ca-wait-origin").to_owned(),
+    });
+    files.push(RenderedFile {
         path: host_path(
             &proxy_host.host,
             absolute_child(
@@ -868,9 +873,66 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use super::render;
     use crate::policy::{RevokedSshKey, Status};
+
+    fn rendered_ca_origin_waiter() -> super::RenderedFile {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        render(&model)
+            .unwrap()
+            .into_iter()
+            .find(|file| {
+                file.path
+                    == std::path::Path::new("hosts/ca-host/usr/libexec/grafhome-ca-wait-origin")
+            })
+            .expect("CA origin readiness helper should be rendered")
+    }
+
+    fn write_ca_origin_waiter_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let waiter = rendered_ca_origin_waiter();
+        let path = directory.path().join("grafhome-ca-wait-origin");
+        fs::write(&path, waiter.content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(waiter.mode)).unwrap();
+        (directory, path)
+    }
+
+    fn write_fake_ip(directory: &std::path::Path) -> std::path::PathBuf {
+        let path = directory.join("ip");
+        fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s\\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn write_flapping_fake_ip(directory: &std::path::Path) -> std::path::PathBuf {
+        let path = directory.join("flapping-ip");
+        fs::write(
+            &path,
+            r#"#!/bin/sh
+count=$(cat "$FAKE_IP_COUNT" 2>/dev/null || printf '0')
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_IP_COUNT"
+case "$count" in
+  1) printf '1\n' >"$FAKE_CARRIER_FILE" ;;
+  2) printf '0\n' >"$FAKE_CARRIER_FILE" ;;
+  *) printf '1\n' >"$FAKE_CARRIER_FILE" ;;
+esac
+printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
 
     #[test]
     fn renders_expected_files_without_live_paths() {
@@ -883,6 +945,7 @@ mod tests {
 
         assert!(paths.contains(&"hosts/ca-host/srv/example-ca/step/config/ca.json".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/systemd/system/step-ca.service".to_owned()));
+        assert!(paths.contains(&"hosts/ca-host/usr/libexec/grafhome-ca-wait-origin".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/user_ca_keys.pem".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/revoked_user_certs".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/ssh_known_hosts".to_owned()));
@@ -891,6 +954,106 @@ mod tests {
         ));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/auth_principals/alice".to_owned()));
         assert!(paths.iter().all(|path| !path.starts_with('/')));
+    }
+
+    #[test]
+    fn ca_origin_waiter_fails_when_carrier_never_stabilizes() {
+        let (directory, waiter) = write_ca_origin_waiter_fixture();
+        let ip = write_fake_ip(directory.path());
+        let sys_class_net = directory.path().join("sys/class/net");
+        fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
+        fs::write(sys_class_net.join("br-test/carrier"), "0\n").unwrap();
+
+        let output = Command::new(waiter)
+            .args(["198.51.100.20", "1", "1"])
+            .env("GRAFHOME_CA_IP_BIN", ip)
+            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("CA origin 198.51.100.20 did not become ready")
+        );
+    }
+
+    #[test]
+    fn ca_origin_waiter_accepts_an_address_with_stable_carrier() {
+        let (directory, waiter) = write_ca_origin_waiter_fixture();
+        let ip = write_fake_ip(directory.path());
+        let sys_class_net = directory.path().join("sys/class/net");
+        fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
+        fs::write(sys_class_net.join("br-test/carrier"), "1\n").unwrap();
+
+        let status = Command::new(waiter)
+            .args(["198.51.100.20", "2", "1"])
+            .env("GRAFHOME_CA_IP_BIN", ip)
+            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[test]
+    fn ca_origin_waiter_rejects_missing_carrier_state() {
+        let (directory, waiter) = write_ca_origin_waiter_fixture();
+        let ip = write_fake_ip(directory.path());
+        let sys_class_net = directory.path().join("sys/class/net");
+        fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
+
+        let output = Command::new(waiter)
+            .args(["198.51.100.20", "1", "1"])
+            .env("GRAFHOME_CA_IP_BIN", ip)
+            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn ca_origin_waiter_requires_a_full_stable_interval_after_a_flap() {
+        let (directory, waiter) = write_ca_origin_waiter_fixture();
+        let ip = write_flapping_fake_ip(directory.path());
+        let sys_class_net = directory.path().join("sys/class/net");
+        let carrier_file = sys_class_net.join("br-test/carrier");
+        fs::create_dir_all(carrier_file.parent().unwrap()).unwrap();
+        fs::write(&carrier_file, "0\n").unwrap();
+        let count_file = directory.path().join("ip-count");
+        let started = Instant::now();
+
+        let status = Command::new(waiter)
+            .args(["198.51.100.20", "5", "1"])
+            .env("GRAFHOME_CA_IP_BIN", ip)
+            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
+            .env("FAKE_CARRIER_FILE", carrier_file)
+            .env("FAKE_IP_COUNT", count_file)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert!(started.elapsed() >= Duration::from_secs(3));
+    }
+
+    #[test]
+    fn step_ca_service_waits_for_the_policy_origin_address() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let service = files
+            .iter()
+            .find(|file| {
+                file.path
+                    == std::path::Path::new("hosts/ca-host/etc/systemd/system/step-ca.service")
+            })
+            .unwrap();
+
+        assert!(
+            service
+                .content
+                .contains("ExecStartPre=/usr/libexec/grafhome-ca-wait-origin 198.51.100.20 30 2")
+        );
     }
 
     #[test]
