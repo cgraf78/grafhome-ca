@@ -10,5 +10,6 @@ program	scripts/release.conf
 program	scripts/release.sh
 program	scripts/smoke-release.sh
 program	scripts/termux-ci.sh
+program	templates/systemd/grafhome-ca-wait-origin
 program	tests/shell/install-test
 program	tests/shell/release-scripts-test

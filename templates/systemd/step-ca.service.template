@@ -7,8 +7,10 @@ Wants=network-online.target
 User=${GRAFHOME_CA_SERVICE_USER}
 Group=${GRAFHOME_CA_SERVICE_USER}
 Environment=STEPPATH=${GRAFHOME_CA_STATE_DIR}/step
+ExecStartPre=/usr/libexec/grafhome-ca-wait-origin ${GRAFHOME_CA_ORIGIN_ADDRESS} 30 2
 ExecStart=${GRAFHOME_CA_STEP_CA_BIN} ${GRAFHOME_CA_STATE_DIR}/step/config/ca.json --password-file=${GRAFHOME_CA_PASSWORD_FILE}
 Restart=on-failure
+RestartSec=5s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
