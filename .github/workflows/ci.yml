@@ -21,7 +21,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@7ec8de6529c782568e2f26c39ecdb3061100cd7a
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@223a8327a467cf9a7039aaa00c2e2e2abf077723
     with:
       # Cargo.toml makes Rust 1.88 part of the public compatibility contract.
       # Running that check inside shared Rust CI keeps it under rust / Required
@@ -98,7 +98,7 @@ jobs:
         test -f "$install_root/data/cgraf78/grafhome-ca/schemas/policy/revocations.schema.json"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@7ec8de6529c782568e2f26c39ecdb3061100cd7a
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@223a8327a467cf9a7039aaa00c2e2e2abf077723
     with:
       matrix-set: full
       profiles: base
@@ -122,7 +122,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@7ec8de6529c782568e2f26c39ecdb3061100cd7a
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@223a8327a467cf9a7039aaa00c2e2e2abf077723
 
   # These jobs exercise grafhome-ca product behavior against real OpenSSH and
   # Smallstep packages. They remain caller-owned because putting product
