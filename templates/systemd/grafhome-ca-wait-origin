@@ -17,7 +17,7 @@ fi
 deadline=$((SECONDS + timeout))
 stable_since=-1
 
-while ((SECONDS < deadline)); do
+while :; do
   address_line="$("$ip_bin" -4 -o address show to "$address/32" 2>/dev/null)"
   interface=""
   if [[ -n "$address_line" ]]; then
@@ -36,6 +36,7 @@ while ((SECONDS < deadline)); do
     stable_since=-1
   fi
 
+  ((SECONDS < deadline)) || break
   sleep 1
 done
 
