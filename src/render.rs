@@ -913,6 +913,12 @@ mod tests {
         path
     }
 
+    fn write_fake_sleep_env(directory: &std::path::Path) -> std::path::PathBuf {
+        let path = directory.join("bash-env");
+        fs::write(&path, "sleep() {\n  SECONDS=$((SECONDS + 2))\n}\n").unwrap();
+        path
+    }
+
     fn write_flapping_fake_ip(directory: &std::path::Path) -> std::path::PathBuf {
         let path = directory.join("flapping-ip");
         fs::write(
@@ -988,6 +994,28 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
 
         let status = Command::new(waiter)
             .args(["198.51.100.20", "2", "1"])
+            .env("GRAFHOME_CA_IP_BIN", ip)
+            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[test]
+    fn ca_origin_waiter_checks_stability_after_sleep_crosses_the_deadline() {
+        let (directory, waiter) = write_ca_origin_waiter_fixture();
+        let ip = write_fake_ip(directory.path());
+        let bash_env = write_fake_sleep_env(directory.path());
+        let sys_class_net = directory.path().join("sys/class/net");
+        fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
+        fs::write(sys_class_net.join("br-test/carrier"), "1\n").unwrap();
+
+        // Advance the waiter's clock past its deadline in one deterministic
+        // polling sleep, as can happen when a loaded host schedules it late.
+        let status = Command::new(waiter)
+            .args(["198.51.100.20", "1", "1"])
+            .env("BASH_ENV", bash_env)
             .env("GRAFHOME_CA_IP_BIN", ip)
             .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
             .status()
