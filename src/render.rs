@@ -915,7 +915,17 @@ mod tests {
 
     fn write_fake_sleep_env(directory: &std::path::Path) -> std::path::PathBuf {
         let path = directory.join("bash-env");
-        fs::write(&path, "sleep() {\n  SECONDS=$((SECONDS + 2))\n}\n").unwrap();
+        // Unsetting Bash's special clock makes only the fake sleep advance it.
+        fs::write(
+            &path,
+            r#"unset SECONDS
+SECONDS=0
+sleep() {
+  SECONDS=$((SECONDS + 2))
+}
+"#,
+        )
+        .unwrap();
         path
     }
 
@@ -938,6 +948,23 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn fake_sleep_environment_uses_a_virtual_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let bash_env = write_fake_sleep_env(directory.path());
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                "before=$SECONDS; command sleep 1; printf '%s\\n' \"$((SECONDS - before))\"",
+            ])
+            .env("BASH_ENV", bash_env)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n");
     }
 
     #[test]
