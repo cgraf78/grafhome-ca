@@ -26,7 +26,7 @@ fs2 = "0.4.3"
 # is embedded with include_str! and only uses in-document "#/..." refs. The
 # published entry-point schemas under schemas/policy/ do carry cross-file
 # refs, but they exist for external consumers and are never compiled here.
-jsonschema = { version = "0.49.3", default-features = false }
+jsonschema = { version = "0.50.0", default-features = false }
 rpassword = "7.4.0"
 rustix = { version = "1.1.2", features = ["fs", "process", "system", "termios"] }
 serde = { version = "1.0.228", features = ["derive"] }
