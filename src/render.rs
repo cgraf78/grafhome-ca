@@ -902,6 +902,24 @@ mod tests {
         (directory, path)
     }
 
+    fn run_waiter(command: &mut Command) -> std::io::Result<std::process::Output> {
+        // Container overlay filesystems can transiently retain a write handle
+        // after publishing the fixture. Poll only that condition so the tests
+        // keep exercising its shebang and executable mode directly.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match command.output() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn write_fake_ip(directory: &std::path::Path) -> std::path::PathBuf {
         let path = directory.join("ip");
         fs::write(
@@ -997,12 +1015,13 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
         fs::write(sys_class_net.join("br-test/carrier"), "0\n").unwrap();
 
-        let output = Command::new(waiter)
-            .args(["198.51.100.20", "1", "1"])
-            .env("GRAFHOME_CA_IP_BIN", ip)
-            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
-            .output()
-            .unwrap();
+        let output = run_waiter(
+            Command::new(waiter)
+                .args(["198.51.100.20", "1", "1"])
+                .env("GRAFHOME_CA_IP_BIN", ip)
+                .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net),
+        )
+        .unwrap();
 
         assert!(!output.status.success());
         assert!(
@@ -1019,12 +1038,14 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
         fs::write(sys_class_net.join("br-test/carrier"), "1\n").unwrap();
 
-        let status = Command::new(waiter)
-            .args(["198.51.100.20", "2", "1"])
-            .env("GRAFHOME_CA_IP_BIN", ip)
-            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
-            .status()
-            .unwrap();
+        let status = run_waiter(
+            Command::new(waiter)
+                .args(["198.51.100.20", "2", "1"])
+                .env("GRAFHOME_CA_IP_BIN", ip)
+                .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net),
+        )
+        .unwrap()
+        .status;
 
         assert!(status.success());
     }
@@ -1040,13 +1061,15 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
 
         // Advance the waiter's clock past its deadline in one deterministic
         // polling sleep, as can happen when a loaded host schedules it late.
-        let status = Command::new(waiter)
-            .args(["198.51.100.20", "1", "1"])
-            .env("BASH_ENV", bash_env)
-            .env("GRAFHOME_CA_IP_BIN", ip)
-            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
-            .status()
-            .unwrap();
+        let status = run_waiter(
+            Command::new(waiter)
+                .args(["198.51.100.20", "1", "1"])
+                .env("BASH_ENV", bash_env)
+                .env("GRAFHOME_CA_IP_BIN", ip)
+                .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net),
+        )
+        .unwrap()
+        .status;
 
         assert!(status.success());
     }
@@ -1058,12 +1081,13 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         let sys_class_net = directory.path().join("sys/class/net");
         fs::create_dir_all(sys_class_net.join("br-test")).unwrap();
 
-        let output = Command::new(waiter)
-            .args(["198.51.100.20", "1", "1"])
-            .env("GRAFHOME_CA_IP_BIN", ip)
-            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
-            .output()
-            .unwrap();
+        let output = run_waiter(
+            Command::new(waiter)
+                .args(["198.51.100.20", "1", "1"])
+                .env("GRAFHOME_CA_IP_BIN", ip)
+                .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net),
+        )
+        .unwrap();
 
         assert!(!output.status.success());
     }
@@ -1079,14 +1103,16 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         let count_file = directory.path().join("ip-count");
         let started = Instant::now();
 
-        let status = Command::new(waiter)
-            .args(["198.51.100.20", "5", "1"])
-            .env("GRAFHOME_CA_IP_BIN", ip)
-            .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
-            .env("FAKE_CARRIER_FILE", carrier_file)
-            .env("FAKE_IP_COUNT", count_file)
-            .status()
-            .unwrap();
+        let status = run_waiter(
+            Command::new(waiter)
+                .args(["198.51.100.20", "5", "1"])
+                .env("GRAFHOME_CA_IP_BIN", ip)
+                .env("GRAFHOME_CA_SYS_CLASS_NET", sys_class_net)
+                .env("FAKE_CARRIER_FILE", carrier_file)
+                .env("FAKE_IP_COUNT", count_file),
+        )
+        .unwrap()
+        .status;
 
         assert!(status.success());
         assert!(started.elapsed() >= Duration::from_secs(3));
