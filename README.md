@@ -1,5 +1,7 @@
 # Grafhome CA
 
+![Tests](https://github.com/cgraf78/grafhome-ca/actions/workflows/test.yml/badge.svg?branch=main)
+
 Grafhome CA is the policy, enrollment, and certificate lifecycle tooling for the
 Grafhome SSH certificate authority. The CA cryptographic boundary stays in
 Smallstep: `step-ca` runs the server and `grafhome-ca` invokes `step` internally
