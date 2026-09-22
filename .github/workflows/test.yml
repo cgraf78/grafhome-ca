@@ -23,6 +23,9 @@ jobs:
   rust:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
     with:
+      # Full matrix on every PR: scheduled-only legs let main break
+      # silently between daily runs and cannot validate their fixes.
+      matrix-set: full
       # Cargo.toml makes Rust 1.88 part of the public compatibility contract.
       # Running that check inside shared Rust CI keeps it under rust / Required
       # and gives it the same locked, all-target, all-feature policy as peers.
