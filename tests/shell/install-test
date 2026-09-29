@@ -77,9 +77,10 @@ if [[ "$host_uname_s" == Linux && "$host_has_android_signal" -eq 1 ]]; then
 fi
 
 # The main archive cases own Grafhome CA's schema and public payload. Pin a
-# synthetic Linux host so the same archive is meaningful on Linux, macOS, and
-# Termux, then use targeted cases below to bind Android composition; the shared
-# installer suite owns the exhaustive platform matrix. Clearing the ambient
+# synthetic Linux host so the same archive is meaningful on Linux and macOS
+# (Termux runs only the Android cases), then use targeted cases below to bind
+# Android composition; the shared installer suite owns the exhaustive platform
+# matrix. Clearing the ambient
 # Android marker is required because Termux exports it even with the uname
 # fixture.
 uname_bin="$workspace/uname-bin"
@@ -283,200 +284,218 @@ else
   exit 1
 fi
 
-home="$workspace/home"
-data_home="$workspace/data"
-bin_dir="$home/.local/bin"
-mkdir -p "$home"
+# The synthetic Linux identity needs the host's /usr/bin/env: the installer
+# isolates a Linux release's version probe through it. Real Termux has none,
+# and never selects a Linux release, so there the Android cases below carry
+# the install contract.
+if [[ -x /usr/bin/env ]]; then
+  home="$workspace/home"
+  data_home="$workspace/data"
+  bin_dir="$home/.local/bin"
+  mkdir -p "$home"
 
-v1=20260810-120000-deadbeef
-archive_v1=$(make_archive "$workspace" "$v1" first)
-rc=0
-HOME="$home" XDG_DATA_HOME="$data_home" \
-  "$repo_root/install.sh" \
-  --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
-assert_eq "installer: installs a valid local release archive" 0 "$rc"
-installed_rc=0
-installed_output=$("$bin_dir/grafhome-ca") || installed_rc=$?
-assert_eq "installer: installed public command exits successfully" 0 "$installed_rc"
-assert_eq "installer: public command executes installed release" \
-  first "$installed_output"
+  v1=20260810-120000-deadbeef
+  archive_v1=$(make_archive "$workspace" "$v1" first)
+  rc=0
+  HOME="$home" XDG_DATA_HOME="$data_home" \
+    "$repo_root/install.sh" \
+    --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
+  assert_eq "installer: installs a valid local release archive" 0 "$rc"
+  installed_rc=0
+  installed_output=$("$bin_dir/grafhome-ca") || installed_rc=$?
+  assert_eq "installer: installed public command exits successfully" 0 "$installed_rc"
+  assert_eq "installer: public command executes installed release" \
+    first "$installed_output"
 
-stable_root="$data_home/cgraf78/grafhome-ca"
-for payload in README.md LICENSE schemas/example.json templates/example.toml \
-  examples/example.toml docs/example.md; do
-  if [[ -e "$stable_root/$payload" ]]; then
-    pass "installer: retains payload $payload"
+  stable_root="$data_home/cgraf78/grafhome-ca"
+  for payload in README.md LICENSE schemas/example.json templates/example.toml \
+    examples/example.toml docs/example.md; do
+    if [[ -e "$stable_root/$payload" ]]; then
+      pass "installer: retains payload $payload"
+    else
+      fail "installer: retains payload $payload"
+    fi
+  done
+
+  # Installing the binary and public runtime assets must never materialize site
+  # policy, enrollment state, keys, certificates, or host configuration.
+  for forbidden in state secrets private keys ca policy; do
+    if [[ ! -e "$stable_root/$forbidden" && ! -e "$workspace/$forbidden" ]]; then
+      pass "installer: creates no forbidden path: $forbidden"
+    else
+      fail "installer: creates no forbidden path: $forbidden"
+    fi
+  done
+
+  first_target=$(readlink "$bin_dir/grafhome-ca")
+  rc=0
+  HOME="$home" XDG_DATA_HOME="$data_home" \
+    "$repo_root/install.sh" \
+    --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
+  assert_eq "installer: same-release reinstall is idempotent" 0 "$rc"
+  assert_eq "installer: idempotence preserves command activation" \
+    "$first_target" "$(readlink "$bin_dir/grafhome-ca")"
+
+  v2=20260810-120001-feedface
+  archive_v2=$(make_archive "$workspace" "$v2" second)
+  rc=0
+  HOME="$home" XDG_DATA_HOME="$data_home" \
+    "$repo_root/install.sh" \
+    --archive "$archive_v2" --checksum "$archive_v2.sha256" || rc=$?
+  assert_eq "installer: activates a validated update" 0 "$rc"
+  updated_rc=0
+  updated_output=$("$bin_dir/grafhome-ca") || updated_rc=$?
+  assert_eq "installer: updated public command exits successfully" 0 "$updated_rc"
+  assert_eq "installer: updated command uses the new release" \
+    second "$updated_output"
+
+  printf '%064d  %s\n' 0 "$(basename "$archive_v1")" >"$archive_v1.bad.sha256"
+  rc=0
+  HOME="$home" XDG_DATA_HOME="$data_home" \
+    "$repo_root/install.sh" \
+    --archive "$archive_v1" --checksum "$archive_v1.bad.sha256" \
+    >"$workspace/bad.out" 2>"$workspace/bad.err" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    pass "installer: rejects a corrupt checksum"
   else
-    fail "installer: retains payload $payload"
+    fail "installer: rejects a corrupt checksum"
   fi
-done
+  preserved_rc=0
+  preserved_output=$("$bin_dir/grafhome-ca") || preserved_rc=$?
+  assert_eq "installer: preserved public command exits successfully" 0 "$preserved_rc"
+  assert_eq "installer: failed update preserves prior command" \
+    second "$preserved_output"
 
-# Installing the binary and public runtime assets must never materialize site
-# policy, enrollment state, keys, certificates, or host configuration.
-for forbidden in state secrets private keys ca policy; do
-  if [[ ! -e "$stable_root/$forbidden" && ! -e "$workspace/$forbidden" ]]; then
-    pass "installer: creates no forbidden path: $forbidden"
+  collision="$workspace/collision"
+  collision_home="$collision/home"
+  collision_data="$collision/data"
+  mkdir -p "$collision_home/.local/bin"
+  printf '%s\n' user-owned >"$collision_home/.local/bin/grafhome-ca"
+  rc=0
+  HOME="$collision_home" XDG_DATA_HOME="$collision_data" \
+    "$repo_root/install.sh" \
+    --archive "$archive_v1" --checksum "$archive_v1.sha256" \
+    >"$collision/out" 2>"$collision/err" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    pass "installer: refuses a user-owned command"
   else
-    fail "installer: creates no forbidden path: $forbidden"
+    fail "installer: refuses a user-owned command"
   fi
-done
+  assert_eq "installer: preserves a user-owned command" \
+    user-owned "$(cat "$collision_home/.local/bin/grafhome-ca")"
+  if [[ ! -e "$collision_data/cgraf78/grafhome-ca" ]]; then
+    pass "installer: command collision publishes no partial install"
+  else
+    fail "installer: command collision publishes no partial install"
+  fi
 
-first_target=$(readlink "$bin_dir/grafhome-ca")
-rc=0
-HOME="$home" XDG_DATA_HOME="$data_home" \
-  "$repo_root/install.sh" \
-  --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
-assert_eq "installer: same-release reinstall is idempotent" 0 "$rc"
-assert_eq "installer: idempotence preserves command activation" \
-  "$first_target" "$(readlink "$bin_dir/grafhome-ca")"
-
-v2=20260810-120001-feedface
-archive_v2=$(make_archive "$workspace" "$v2" second)
-rc=0
-HOME="$home" XDG_DATA_HOME="$data_home" \
-  "$repo_root/install.sh" \
-  --archive "$archive_v2" --checksum "$archive_v2.sha256" || rc=$?
-assert_eq "installer: activates a validated update" 0 "$rc"
-updated_rc=0
-updated_output=$("$bin_dir/grafhome-ca") || updated_rc=$?
-assert_eq "installer: updated public command exits successfully" 0 "$updated_rc"
-assert_eq "installer: updated command uses the new release" \
-  second "$updated_output"
-
-printf '%064d  %s\n' 0 "$(basename "$archive_v1")" >"$archive_v1.bad.sha256"
-rc=0
-HOME="$home" XDG_DATA_HOME="$data_home" \
-  "$repo_root/install.sh" \
-  --archive "$archive_v1" --checksum "$archive_v1.bad.sha256" \
-  >"$workspace/bad.out" 2>"$workspace/bad.err" || rc=$?
-if [[ "$rc" -ne 0 ]]; then
-  pass "installer: rejects a corrupt checksum"
+  # Exercise the README's no-argument path without reaching GitHub. The curl stub
+  # accepts only the generated installer's exact latest-redirect, checksum, and
+  # archive requests, then serves this repository's schema-faithful fixture.
+  latest_root="$workspace/latest-download"
+  latest_home="$latest_root/home"
+  latest_data="$latest_root/data"
+  latest_curl_bin="$latest_root/fake-bin"
+  latest_curl_log="$latest_root/curl.log"
+  latest_version=20260810-120002-cafebabe
+  mkdir -p "$latest_home"
+  latest_archive=$(make_archive "$latest_root" "$latest_version" latest)
+  make_curl_stub "$latest_curl_bin"
+  latest_archive_name=$(basename "$latest_archive")
+  latest_url=https://github.com/cgraf78/grafhome-ca/releases/latest
+  latest_tag_url=https://github.com/cgraf78/grafhome-ca/releases/tag/$latest_version
+  latest_download_base=https://github.com/cgraf78/grafhome-ca/releases/download/$latest_version
+  curl_stub_env=(
+    "INSTALL_TEST_CURL_LOG=/dev/null"
+    "INSTALL_TEST_LATEST_URL=$latest_url"
+    "INSTALL_TEST_TAG_URL=$latest_tag_url"
+    "INSTALL_TEST_CHECKSUM_URL=$latest_download_base/$latest_archive_name.sha256"
+    "INSTALL_TEST_ARCHIVE_URL=$latest_download_base/$latest_archive_name"
+    "INSTALL_TEST_CHECKSUM=$latest_archive.sha256"
+    "INSTALL_TEST_ARCHIVE=$latest_archive"
+  )
+  curl_network_args=(
+    --connect-timeout 10
+    --max-time 60
+    --speed-limit 1024
+    --speed-time 30
+    --retry 2
+    --retry-all-errors
+    --retry-delay 1
+  )
+  assert_curl_stub_rejects "installer fixture: curl requires -fsSL" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    --proto '=https' --proto-redir '=https' "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl rejects duplicate -fsSL" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL -fsSL --proto '=https' --proto-redir '=https' \
+    "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl requires --proto" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL --proto-redir '=https' "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL --proto '=https' --proto '=https' --proto-redir '=https' \
+    "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL --proto '=http' --proto-redir '=https' "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl requires --proto-redir" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL --proto '=https' "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto-redir" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL --proto '=https' --proto-redir '=https' --proto-redir '=https' \
+    "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto-redir" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    -fsSL --proto '=https' --proto-redir '=all' "${curl_network_args[@]}" \
+    -o /dev/null -w '%{url_effective}' "$latest_url"
+  rc=0
+  PATH="$latest_curl_bin:$PATH" \
+    HOME="$latest_home" XDG_DATA_HOME="$latest_data" \
+    INSTALL_TEST_CURL_LOG="$latest_curl_log" \
+    INSTALL_TEST_LATEST_URL="$latest_url" \
+    INSTALL_TEST_TAG_URL="$latest_tag_url" \
+    INSTALL_TEST_CHECKSUM_URL="$latest_download_base/$latest_archive_name.sha256" \
+    INSTALL_TEST_ARCHIVE_URL="$latest_download_base/$latest_archive_name" \
+    INSTALL_TEST_CHECKSUM="$latest_archive.sha256" \
+    INSTALL_TEST_ARCHIVE="$latest_archive" \
+    "$repo_root/install.sh" || rc=$?
+  assert_eq "installer: no-argument install resolves and installs latest" 0 "$rc"
+  latest_requests=$(printf '%s\n%s\n%s' \
+    "$latest_url" \
+    "$latest_download_base/$latest_archive_name.sha256" \
+    "$latest_download_base/$latest_archive_name")
+  assert_eq "installer: no-argument install requests the exact latest assets" \
+    "$latest_requests" "$(cat "$latest_curl_log")"
+  latest_command_rc=0
+  latest_command_output=$("$latest_home/.local/bin/grafhome-ca") ||
+    latest_command_rc=$?
+  assert_eq "installer: latest public command exits successfully" \
+    0 "$latest_command_rc"
+  assert_eq "installer: latest public command executes downloaded release" \
+    latest "$latest_command_output"
 else
-  fail "installer: rejects a corrupt checksum"
-fi
-preserved_rc=0
-preserved_output=$("$bin_dir/grafhome-ca") || preserved_rc=$?
-assert_eq "installer: preserved public command exits successfully" 0 "$preserved_rc"
-assert_eq "installer: failed update preserves prior command" \
-  second "$preserved_output"
-
-collision="$workspace/collision"
-collision_home="$collision/home"
-collision_data="$collision/data"
-mkdir -p "$collision_home/.local/bin"
-printf '%s\n' user-owned >"$collision_home/.local/bin/grafhome-ca"
-rc=0
-HOME="$collision_home" XDG_DATA_HOME="$collision_data" \
-  "$repo_root/install.sh" \
-  --archive "$archive_v1" --checksum "$archive_v1.sha256" \
-  >"$collision/out" 2>"$collision/err" || rc=$?
-if [[ "$rc" -ne 0 ]]; then
-  pass "installer: refuses a user-owned command"
-else
-  fail "installer: refuses a user-owned command"
-fi
-assert_eq "installer: preserves a user-owned command" \
-  user-owned "$(cat "$collision_home/.local/bin/grafhome-ca")"
-if [[ ! -e "$collision_data/cgraf78/grafhome-ca" ]]; then
-  pass "installer: command collision publishes no partial install"
-else
-  fail "installer: command collision publishes no partial install"
+  printf '  SKIP: %s\n' \
+    "installer: synthetic Linux cases (no /usr/bin/env on this host)"
 fi
 
-# Exercise the README's no-argument path without reaching GitHub. The curl stub
-# accepts only the generated installer's exact latest-redirect, checksum, and
-# archive requests, then serves this repository's schema-faithful fixture.
-latest_root="$workspace/latest-download"
-latest_home="$latest_root/home"
-latest_data="$latest_root/data"
-latest_curl_bin="$latest_root/fake-bin"
-latest_curl_log="$latest_root/curl.log"
-latest_version=20260810-120002-cafebabe
-mkdir -p "$latest_home"
-latest_archive=$(make_archive "$latest_root" "$latest_version" latest)
-make_curl_stub "$latest_curl_bin"
-latest_archive_name=$(basename "$latest_archive")
-latest_url=https://github.com/cgraf78/grafhome-ca/releases/latest
-latest_tag_url=https://github.com/cgraf78/grafhome-ca/releases/tag/$latest_version
-latest_download_base=https://github.com/cgraf78/grafhome-ca/releases/download/$latest_version
-curl_stub_env=(
-  "INSTALL_TEST_CURL_LOG=/dev/null"
-  "INSTALL_TEST_LATEST_URL=$latest_url"
-  "INSTALL_TEST_TAG_URL=$latest_tag_url"
-  "INSTALL_TEST_CHECKSUM_URL=$latest_download_base/$latest_archive_name.sha256"
-  "INSTALL_TEST_ARCHIVE_URL=$latest_download_base/$latest_archive_name"
-  "INSTALL_TEST_CHECKSUM=$latest_archive.sha256"
-  "INSTALL_TEST_ARCHIVE=$latest_archive"
-)
-curl_network_args=(
-  --connect-timeout 10
-  --max-time 60
-  --speed-limit 1024
-  --speed-time 30
-  --retry 2
-  --retry-all-errors
-  --retry-delay 1
-)
-assert_curl_stub_rejects "installer fixture: curl requires -fsSL" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  --proto '=https' --proto-redir '=https' "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl rejects duplicate -fsSL" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL -fsSL --proto '=https' --proto-redir '=https' \
-  "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl requires --proto" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto-redir '=https' "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=https' --proto '=https' --proto-redir '=https' \
-  "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=http' --proto-redir '=https' "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl requires --proto-redir" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=https' "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto-redir" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=https' --proto-redir '=https' --proto-redir '=https' \
-  "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto-redir" \
-  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=https' --proto-redir '=all' "${curl_network_args[@]}" \
-  -o /dev/null -w '%{url_effective}' "$latest_url"
-rc=0
-PATH="$latest_curl_bin:$PATH" \
-  HOME="$latest_home" XDG_DATA_HOME="$latest_data" \
-  INSTALL_TEST_CURL_LOG="$latest_curl_log" \
-  INSTALL_TEST_LATEST_URL="$latest_url" \
-  INSTALL_TEST_TAG_URL="$latest_tag_url" \
-  INSTALL_TEST_CHECKSUM_URL="$latest_download_base/$latest_archive_name.sha256" \
-  INSTALL_TEST_ARCHIVE_URL="$latest_download_base/$latest_archive_name" \
-  INSTALL_TEST_CHECKSUM="$latest_archive.sha256" \
-  INSTALL_TEST_ARCHIVE="$latest_archive" \
-  "$repo_root/install.sh" || rc=$?
-assert_eq "installer: no-argument install resolves and installs latest" 0 "$rc"
-latest_requests=$(printf '%s\n%s\n%s' \
-  "$latest_url" \
-  "$latest_download_base/$latest_archive_name.sha256" \
-  "$latest_download_base/$latest_archive_name")
-assert_eq "installer: no-argument install requests the exact latest assets" \
-  "$latest_requests" "$(cat "$latest_curl_log")"
-latest_command_rc=0
-latest_command_output=$("$latest_home/.local/bin/grafhome-ca") ||
-  latest_command_rc=$?
-assert_eq "installer: latest public command exits successfully" \
-  0 "$latest_command_rc"
-assert_eq "installer: latest public command executes downloaded release" \
-  latest "$latest_command_output"
+# The installer's version probe runs the staged binary through PREFIX/bin/env
+# with PATH=PREFIX/bin on Android, as real Termux provides. Give a synthetic
+# prefix the env and sh (the fixture binary's interpreter) it would have.
+link_termux_tools() {
+  mkdir -p "$1/bin"
+  ln -s "$(command -v env)" "$1/bin/env"
+  ln -s "$(command -v sh)" "$1/bin/sh"
+}
 
 # Exercise --version and Android destination policy with a published-platform
 # fixture. The host is synthetic here so every conventional matrix row covers
@@ -489,11 +508,8 @@ android_uname_bin="$android_root/uname-bin"
 android_curl_bin="$android_root/fake-bin"
 android_curl_log="$android_root/curl.log"
 android_version=20260810-120003-acde1234
-mkdir -p "$android_home" "$android_uname_bin" "$android_prefix/bin"
-# The installer's version probe isolates into PREFIX/bin on Android, mirroring
-# Termux, so the synthetic prefix needs the env and sh that Termux provides.
-ln -s "$(command -v env)" "$android_prefix/bin/env"
-ln -s "$(command -v sh)" "$android_prefix/bin/sh"
+mkdir -p "$android_home" "$android_uname_bin"
+link_termux_tools "$android_prefix"
 android_archive=$(make_archive \
   "$android_root" "$android_version" android android-aarch64)
 make_curl_stub "$android_curl_bin"
@@ -559,6 +575,7 @@ if [[ "$host_prefix" == /data/data/com.termux/files/usr &&
   termux_prefix="$termux_root/prefix"
   termux_curl_log="$termux_root/curl.log"
   mkdir -p "$termux_home"
+  link_termux_tools "$termux_prefix"
   rm -f "$termux_curl_log"
   case $host_uname_m in
     aarch64 | arm64)
