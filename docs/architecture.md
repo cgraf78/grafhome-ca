@@ -36,9 +36,17 @@ implementations.
   including Android/Bionic aarch64 builds for Termux.
 
 Hosted Linux CI checks Android archives structurally (AArch64 ELF plus the
-Bionic interpreter). A separate x86_64 Android build runs `check` against the
-public fixture tree inside the official Termux app, while the AArch64 release
-artifact retains structural cross-build coverage.
+Bionic interpreter). A separate x86_64 Android build runs a lifecycle smoke
+test inside the official Termux app: `check` against the public fixture tree,
+checks that the packaged OpenSSH configs load both drop-in directories, a
+quiet unenrolled `status`, request-only `enroll user` plus a rerun that reuses
+the stored renewal password, a real Termux `sshd`, configured with an
+`ssh-keygen` test CA and principals file, that must accept a CA-signed
+certificate and reject an unsigned key and KRL-revoked certificates, and the
+rootless host backend (`apply ca` refusal, symlinked credential path
+rejection, `enroll host`, `apply host`, and `renew host`) in an isolated app
+prefix with command shims.
+The AArch64 release artifact retains structural cross-build coverage.
 
 ## Safety Contract
 

@@ -50,6 +50,13 @@ an idempotent update. Use `--version <tag>` to pin a release.
 Use `--archive <path>` with `--checksum <path>` for a previously downloaded
 archive. Run `./install.sh --help` for destination overrides. A checksum
 detects corruption and wrong assets; it is not a signed provenance mechanism.
+For online installs, when GitHub CLI 2.49+ is logged in to github.com, the
+installer also verifies the archive's GitHub artifact attestation (signed by
+`cgraf78/actions`) and refuses an archive without a valid one. Otherwise it
+proceeds on the checksum alone and says so. `--require-attestation` makes
+verification mandatory: the installer fails before downloading unless GitHub
+CLI 2.49+ is logged in to github.com. `--archive` installs are checksum-only,
+and combining `--archive` with `--require-attestation` is an error.
 
 ## Commands
 
@@ -347,15 +354,20 @@ read it, just as they can use the unencrypted OpenSSH identity stored beside
 it. `renew user` reads the corresponding platform store for unattended renewal.
 Other deployments must provide equivalent scheduling.
 
-`enroll user` generates the SSH and renewal keys, stores the renewal password,
-prints the public request, and waits for the grant. After the grant is pasted,
-the same process bootstraps pinned CA trust, obtains the initial certificate,
-stores the identity at OpenSSH's standard `$HOME/.ssh/id_ed25519` paths,
-verifies renewal, and removes pending state. If any default identity file
-already exists, enrollment lists the conflicting paths and asks before
-replacing the complete key and certificate set; declining leaves every file
-unchanged. A terminated process can resume from pending state by running
-`enroll user` again. If the pending request is lost or damaged, run
+`enroll user` generates or reuses the SSH identity at OpenSSH's standard
+`$HOME/.ssh/id_ed25519` paths, generates or reuses the renewal key (validating
+the password against an existing key), stores the renewal password unless it
+is already stored or supplied with `--password-file`, prints the public
+request, and waits for the grant. After the grant is pasted, the same process
+bootstraps pinned CA trust, obtains the initial certificate, stores it beside
+the identity, verifies renewal, and removes pending state. If any default
+identity file already exists, enrollment lists the conflicting paths and
+offers the choice described above. When `id_ed25519` or `id_ed25519.pub` is
+missing or not a regular file, only replace or cancel (the default) is
+offered. Replace removes the complete key and certificate set;
+cancel leaves every file unchanged. A terminated process can resume from
+pending state by running `enroll user` again. If the pending request is lost
+or damaged, run
 `enroll user --restart` to rebuild and print it from the existing SSH and
 renewal public keys. Host enrollment supports the equivalent root-run
 `grafhome-ca enroll host --restart`. Restarting does not replace private keys;
