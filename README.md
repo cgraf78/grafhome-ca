@@ -60,6 +60,20 @@ and combining `--archive` with `--require-attestation` is an error.
 
 ## Commands
 
+### Offline policy queries
+
+`grafhome-ca policy user-enrollment` reads local policy and emits a JSON object
+with `user`, `host`, and a boolean `enabled`. It uses the same identity defaults
+as enrollment (`GRAFHOME_CA_LOCAL_USER` / `GRAFHOME_CA_LOCAL_HOST`, then the
+local account and hostname). Pass `--user`, `--host`, or `--config-root` to
+query a different identity or policy tree.
+
+An active enrollment relationship enables the check; destination login
+permissions do not. Both enabled and disabled decisions exit successfully.
+Invalid or missing policy exits unsuccessfully without a decision. The query
+does not contact the CA, invoke Smallstep, or read local enrollment credentials
+and certificates, making it suitable for offline health checks.
+
 Validate site policy and config from the default XDG location:
 
 ```sh

@@ -32,6 +32,131 @@ fn legacy_config_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/legacy-site-config")
 }
 
+fn enrollment_query(root: &Path, user: &str, host: &str) -> serde_json::Value {
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["policy", "user-enrollment", "--config-root"])
+        .arg(root)
+        .args(["--user", user, "--host", host])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+#[test]
+fn policy_user_enrollment_reads_active_relationship_offline() {
+    assert_eq!(
+        enrollment_query(&example_config_root(), "alice", "laptop-a"),
+        serde_json::json!({"user": "alice", "host": "laptop-a", "enabled": true})
+    );
+}
+
+#[test]
+fn policy_user_enrollment_does_not_confuse_login_with_enrollment() {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    let host = dir.path().join("policy/hosts/proxy-host.toml");
+    let contents = fs::read_to_string(&host).unwrap();
+    fs::write(&host, contents.replace("enrollment = true\n", "")).unwrap();
+    assert_eq!(
+        enrollment_query(dir.path(), "alice", "proxy-host")["enabled"],
+        false
+    );
+}
+
+#[test]
+fn policy_user_enrollment_absent_identity_is_disabled() {
+    assert_eq!(
+        enrollment_query(&example_config_root(), "absent", "laptop-a")["enabled"],
+        false
+    );
+}
+
+#[test]
+fn policy_user_enrollment_accepts_legacy_policy() {
+    assert_eq!(
+        enrollment_query(&legacy_config_root(), "alice", "laptop-a")["enabled"],
+        true
+    );
+}
+
+#[test]
+fn policy_user_enrollment_uses_local_identity_overrides() {
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["policy", "user-enrollment", "--config-root"])
+        .arg(example_config_root())
+        .env("GRAFHOME_CA_LOCAL_USER", "alice")
+        .env("GRAFHOME_CA_LOCAL_HOST", "laptop-a")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"enabled\":true"));
+}
+
+#[test]
+fn policy_user_enrollment_rejects_invalid_policy() {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    fs::write(dir.path().join("policy/ca.toml"), "not TOML").unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["policy", "user-enrollment", "--config-root"])
+        .arg(dir.path())
+        .args(["--user", "alice", "--host", "laptop-a"])
+        .assert()
+        .failure()
+        .stdout("");
+}
+
+fn enrollment_with_status(status: &str) -> serde_json::Value {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    let host = dir.path().join("policy/hosts/laptop-a.toml");
+    let contents = fs::read_to_string(&host).unwrap();
+    fs::write(
+        &host,
+        contents.replace(
+            "enrollment = true",
+            &format!("enrollment = {{ status = \"{status}\" }}"),
+        ),
+    )
+    .unwrap();
+    enrollment_query(dir.path(), "alice", "laptop-a")
+}
+
+#[test]
+fn policy_user_enrollment_ignores_disabled_relationship() {
+    assert_eq!(enrollment_with_status("disabled")["enabled"], false);
+}
+
+#[test]
+fn policy_user_enrollment_ignores_planned_relationship() {
+    assert_eq!(enrollment_with_status("planned")["enabled"], false);
+}
+
+#[test]
+fn policy_user_enrollment_accepts_nested_enrollment_options() {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    let host = dir.path().join("policy/hosts/laptop-a.toml");
+    let contents = fs::read_to_string(&host).unwrap();
+    fs::write(
+        &host,
+        contents.replace(
+            "enrollment = true",
+            "enrollment = { allow_effectively_infinite_cert = true }",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        enrollment_query(dir.path(), "alice", "laptop-a")["enabled"],
+        true
+    );
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {

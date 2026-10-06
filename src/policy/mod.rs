@@ -456,6 +456,20 @@ impl Policy {
             .filter(move |client| client.status.is_active() && client.user == user)
     }
 
+    /// Whether an active user may enroll from this host under local policy.
+    ///
+    /// Login permission on a destination host is deliberately independent of
+    /// this source-host relationship. Local keys and certificates do not alter
+    /// the policy decision, so lost enrollment material cannot hide a warning.
+    #[must_use]
+    pub fn user_enrollment_enabled(&self, user: &str, host: &str) -> bool {
+        self.user(user)
+            .is_some_and(|identity| identity.status.is_active())
+            && self
+                .active_user_clients(user)
+                .any(|client| client.host == host)
+    }
+
     /// Validate all policy invariants after programmatic changes.
     pub fn validate(&self) -> Result<()> {
         let mut roles = BTreeSet::new();
