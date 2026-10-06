@@ -71,6 +71,11 @@ struct Cli {
 enum Command {
     /// Print the generated build version.
     Version,
+    /// Query local policy without contacting the CA or reading enrollment secrets.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
     /// Validate site config and policy.
     Check {
         /// Site config root containing config/ and policy/.
@@ -182,6 +187,30 @@ enum Command {
         #[arg(long)]
         renewable: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Emit JSON describing whether local policy enables user enrollment.
+    UserEnrollment {
+        /// Site config root containing policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Policy user; defaults to the same identity as user enrollment.
+        #[arg(long)]
+        user: Option<String>,
+        /// Policy host; defaults to the same identity as user enrollment.
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+/// Machine-readable policy decision, distinct from live enrollment readiness.
+#[derive(serde::Serialize)]
+struct UserEnrollmentPolicy {
+    user: String,
+    host: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -454,6 +483,29 @@ fn run() -> grafhome_ca::Result<()> {
     match Cli::parse().command {
         Command::Version => {
             outln!("grafhome-ca {}", grafhome_ca::version::cli());
+            Ok(())
+        }
+        Command::Policy {
+            command:
+                PolicyCommand::UserEnrollment {
+                    config_root,
+                    user,
+                    host,
+                },
+        } => {
+            let root = resolve_config_root(config_root)?;
+            let policy = grafhome_ca::policy::Policy::load(&root)?;
+            let user = resolve_user(user.as_deref())?;
+            let host = resolve_host(host.as_deref())?;
+            let decision = UserEnrollmentPolicy {
+                enabled: policy.user_enrollment_enabled(&user, &host),
+                user,
+                host,
+            };
+            outln!(
+                "{}",
+                serde_json::to_string(&decision).expect("policy decision serializes")
+            );
             Ok(())
         }
         Command::Check { config_root } => {

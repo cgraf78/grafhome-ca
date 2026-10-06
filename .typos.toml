@@ -1,0 +1,3 @@
+[default]
+# SSH fingerprints are opaque base64 digests, not words to spell-check.
+extend-ignore-re = ["SHA256:[A-Za-z0-9+/=]+"]
