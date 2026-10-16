@@ -9,10 +9,12 @@ real site data.
 
 ## Layout
 
-- `src/bin/grafhome-ca.rs`: the CLI. `src/` holds the library: `config`,
-  `model`, `policy/`, `render`, `enrollment`, `enrollment_registry`,
-  `runtime_provisioners`, `provenance`, `public_material`, and `smallstep`
-  (the only module that shells out to `step`).
+- `src/bin/grafhome-ca.rs`: the CLI and most command workflows. `src/` holds
+  the library: `config`, `model`, `policy/`, `render`, `enrollment`,
+  `enrollment_registry`, `runtime_provisioners`, `provenance`,
+  `public_material`, and `executable` (trusted `step`/`step-cli` lookup).
+  `step` runs from the CLI, `public_material`, and `runtime_provisioners`;
+  `smallstep` is only a placeholder type.
 - `schemas/` (canonical policy schemas versioned under
   `schemas/policy/canonical/`), `templates/` (non-secret SSH, Apache,
   systemd, and Smallstep), `examples/site-config/` (the sanitized fixture
@@ -31,20 +33,22 @@ real site data.
 - Keep the dependency graph pure Rust (the release is a static musl build)
   and keep `jsonschema` default features off. Never enable `ssh-key` RSA
   support.
-- Every public item needs rustdoc.
 
 ## Testing
 
 - `cargo test --locked`, `cargo fmt --check`, and
   `cargo clippy --locked --all-targets --all-features -- -D warnings`.
-- `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`.
+- `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`: every
+  public item needs rustdoc.
 - MSRV: `rustup run 1.88 cargo check --locked --all-targets --all-features`.
-- `cargo tree -q --locked --all-features --target all -i rsa` must print
-  nothing; CI fails otherwise.
+- `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071`. The ignore is
+  safe only while `cargo tree -q --locked --all-features --target all -i rsa`
+  prints nothing, which CI also enforces.
 - Shell: `tests/shell/install-test` and `tests/shell/release-scripts-test`.
   CI also runs the full Rust matrix, including Termux via
   `scripts/termux-ci.sh`.
-- CI-only integration tests, which skip silently unless both flags are set:
+- CI-only integration tests. Without the `RUN` flag they skip with only a
+  captured stderr note; `REQUIRE` turns that skip into a failure:
   `GRAFHOME_CA_RUN_SSH_REVOCATION=1 GRAFHOME_CA_REQUIRE_SSH_REVOCATION=1 cargo test --locked --test cli`
   (Linux, non-root, OpenSSH server installed) and
   `GRAFHOME_CA_RUN_STEP_CA_INTEGRATION=1 GRAFHOME_CA_REQUIRE_STEP_CA_INTEGRATION=1 cargo test --locked --test step_ca_integration`
@@ -74,8 +78,7 @@ real site data.
 - `tests/shell/release-scripts-test` pins text in `test.yml` and
   `release.yml`, and requires `msrv-toolchain` to equal `Cargo.toml`'s
   `rust-version`; edit them together.
-- The release payload (`scripts/release.conf`) must never ship state,
-  secrets, or keys; key-shaped files in payload directories fail CI.
+- Key-shaped files in release payload directories fail CI.
 - `retry-infrastructure.yml` keys on the workflow name `Tests`; don't rename
   it.
 

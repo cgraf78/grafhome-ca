@@ -35,8 +35,8 @@ certificate lifecycle:
 4. Scheduled `grafhome-ca renew` and `grafhome-ca apply host` jobs keep
    certificates, trust files, and revocation lists current.
 
-Only the explicit enrollment, approval, renewal, revocation, and apply
-commands change live state. Distributing private site config is left to your
+Only explicit commands change live state: enrollment, approval, renewal,
+revocation, apply, and the one-time migrations. Distributing private site config is left to your
 own configuration management. The `examples/site-config` tree uses reserved
 example names and addresses, so tests validate a complete config without any
 real site data.
