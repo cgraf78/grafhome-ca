@@ -2,25 +2,44 @@
 
 ![Tests](https://github.com/cgraf78/grafhome-ca/actions/workflows/test.yml/badge.svg?branch=main)
 
-Grafhome CA is the policy, enrollment, and certificate lifecycle tooling for the
-Grafhome SSH certificate authority. The CA cryptographic boundary stays in
-Smallstep: `step-ca` runs the server and `grafhome-ca` invokes `step` internally
-for client operations. Users and enrollment operators interact through the
-`grafhome-ca` CLI rather than running `step` commands themselves.
-This repo owns the typed local policy model, schemas, templates, packaging, and
-operator commands. Real site policy is loaded at runtime from the XDG config
-root and should live in a private repo or private host configuration system.
+Auto-renewing SSH certificates for a small fleet, without hand-managed
+`authorized_keys` or `known_hosts`. `grafhome-ca` drives a
+[Smallstep](https://smallstep.com) `step-ca` from typed TOML policy. Hosts and
+users enroll through a copy-paste request and grant exchange, certificates
+renew unattended on macOS, Linux, and Android/Termux from an hourly cron or
+timer job you install, and revocation is enforced on every managed server
+through OpenSSH key revocation lists.
 
-Generated deployment files are written only to operator-chosen staging
-directories. Live mutation is limited to explicit enrollment, approval,
-renewal, revocation, and local host-policy application commands. Distribution
-of private site config remains owned by the private configuration-management
-system.
+**Status:** this is the author's home-lab CA tooling, published as a working
+reference. The code contains no site data: real policy lives in your own config
+directory, and `examples/site-config` is a complete sanitized example. It is
+not a general product. There is no stability promise, first-time CA setup
+isn't documented step by step, and upgrades can require the migration steps
+described in this README.
 
-The source tree is intentionally free of real site topology. The checked-in
-`examples/site-config` tree uses reserved example names and addresses so tests
-can validate a complete config without exposing private hostnames, account
-inventory, internal addresses, VLAN/interface names, or access policy.
+## How it works
+
+Smallstep owns the cryptography: `step-ca` runs the CA server, and
+`grafhome-ca` invokes `step` internally, so users and operators never run
+`step` commands themselves. `grafhome-ca` owns the policy, enrollment, and
+certificate lifecycle:
+
+1. Write site policy under `${XDG_CONFIG_HOME:-~/.config}/grafhome-ca`, kept in
+   a private repo or configuration system, and validate it with
+   `grafhome-ca check`.
+2. `grafhome-ca render` writes non-secret deployment files (Smallstep,
+   OpenSSH, systemd) into a staging directory you choose, for review and
+   deployment.
+3. A host or user runs `grafhome-ca enroll`, and an operator on the CA origin
+   runs `grafhome-ca approve`; the two exchange one pasted request and grant.
+4. Scheduled `grafhome-ca renew` and `grafhome-ca apply host` jobs keep
+   certificates, trust files, and revocation lists current.
+
+Only the explicit enrollment, approval, renewal, revocation, and apply
+commands change live state. Distributing private site config is left to your
+own configuration management. The `examples/site-config` tree uses reserved
+example names and addresses, so tests validate a complete config without any
+real site data.
 
 ## Layout
 
@@ -58,6 +77,21 @@ verification mandatory: the installer fails before downloading unless GitHub
 CLI 2.49+ is logged in to github.com. `--archive` installs are checksum-only,
 and combining `--archive` with `--require-attestation` is an error.
 
+## Quick start
+
+From the clone, validate and preview the bundled example site with the
+installed binary. Neither command contacts a CA or writes files:
+
+```sh
+grafhome-ca check --config-root examples/site-config
+grafhome-ca render --dry-run --config-root examples/site-config
+```
+
+`check` prints `ok: config and policy valid; ...` with the example CA URLs, and
+`render --dry-run` lists every deployment file it would write, with its mode.
+Copy `examples/site-config` to `${XDG_CONFIG_HOME:-~/.config}/grafhome-ca` as
+the starting point for your own policy.
+
 ## Commands
 
 ### Offline policy queries
@@ -77,19 +111,19 @@ and certificates, making it suitable for offline health checks.
 Validate site policy and config from the default XDG location:
 
 ```sh
-cargo run --bin grafhome-ca -- check
+grafhome-ca check
 ```
 
 Validate the checked-in example config:
 
 ```sh
-cargo run --bin grafhome-ca -- check --config-root examples/site-config
+grafhome-ca check --config-root examples/site-config
 ```
 
 Render reviewed deployment files into a staging directory:
 
 ```sh
-cargo run --bin grafhome-ca -- render --out-dir /tmp/grafhome-ca-render
+grafhome-ca render --out-dir /tmp/grafhome-ca-render
 ```
 
 Use `--clean` for rollout staging directories so removed or renamed generated
@@ -98,20 +132,20 @@ roots, such as `hosts/`, while preserving unrelated files in the output
 directory:
 
 ```sh
-cargo run --bin grafhome-ca -- render --clean --out-dir /tmp/grafhome-ca-render
+grafhome-ca render --clean --out-dir /tmp/grafhome-ca-render
 ```
 
 Preview rendered files without writing:
 
 ```sh
-cargo run --bin grafhome-ca -- render --dry-run
+grafhome-ca render --dry-run
 ```
 
 After CA state has been initialized, export public trust material for private
 rollout:
 
 ```sh
-cargo run --bin grafhome-ca -- export --out-dir /tmp/grafhome-ca-public
+grafhome-ca export --out-dir /tmp/grafhome-ca-public
 ```
 
 The export bundle contains no secrets: `root_ca.crt`, `root_fingerprint`,
@@ -125,7 +159,7 @@ deterministic public test provisioners and live CA state paths rewritten to
 unusable fixture paths:
 
 ```sh
-cargo run --bin grafhome-ca -- materialize-test-ca-fixture > /tmp/grafhome-ca-fixture.json
+grafhome-ca materialize-test-ca-fixture > /tmp/grafhome-ca-fixture.json
 ```
 
 Enrollment provisioner private JWKs live only on the CA origin under
@@ -183,7 +217,7 @@ the migration (or after new bootstrap keys have been generated in the same
 private directory):
 
 ```sh
-cargo run --bin grafhome-ca -- materialize \
+grafhome-ca materialize \
   --live-ca-json /srv/example-ca/step/config/ca.json \
   --staged-ca-json /tmp/grafhome-ca-render/hosts/ca-host/srv/example-ca/step/config/ca.json \
   --jwk-dir /srv/example-ca/secrets/provisioners \
@@ -345,7 +379,8 @@ return successfully without output when enrollment or local renewal material
 is absent. `--if-reachable` also skips while a short TCP connection to the
 configured CA address cannot be established; configuration, trust, and renewal
 errors remain visible. An advisory per-scope lock prevents overlapping renewal
-runs. Grafhome's private dotfiles install these jobs hourly. User enrollment
+runs. `grafhome-ca` installs no schedule; run these hourly from cron or a
+systemd timer. User enrollment
 stores the password in macOS Keychain on macOS. On Linux it uses an encrypted
 systemd credential and also stores the password in Secret Service when
 available. It first attempts a user-scoped credential, supported by systemd 256
@@ -527,8 +562,9 @@ it verifies the filesystem provenance of every config and policy input. Every
 lexical path component, symlink, resolved target component, and input file must
 be owned by root or the invoking account and must not permit group or world
 writes. Root-owned sticky directories such as `/tmp` retain their normal Unix
-exception. This accepts protected dot-managed symlinks while preventing another
-local account from substituting policy for a privileged invocation. On the
+exception. This accepts protected symlinks from a configuration manager while
+preventing another local account from substituting policy for a privileged
+invocation. On the
 documented root-run workflows, the invoking account is root, so the complete
 input chain must be root-owned.
 
@@ -556,8 +592,7 @@ the examples use `grafhome-user-enrollment`.
 
 ## Release Versioning
 
-Release identity follows the same generated scheme used by `hive-memory` and
-`shdeps`:
+Release identity is generated from the commit:
 
 ```text
 YYYYMMDD-HHMMSS-<8hex>
@@ -655,3 +690,18 @@ deterministic public JWKs, and omits private JWK material and `encryptedKey` so
 tests can validate config shape without checking in provisioner issuance
 credentials. Runtime rollout must still replace the placeholders in rendered
 deployment files with operator-generated Smallstep provisioner objects.
+
+## Development
+
+```sh
+cargo test --locked
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+CI runs more than this, including opt-in OpenSSH and `step-ca` integration
+tests; see [`AGENTS.md`](AGENTS.md).
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
