@@ -89,3 +89,7 @@ pushes `main` and a `YYYYMMDD-HHMMSS-<8hex>` tag (UTC commit time and short
 hash). `Cargo.toml`'s `0.1.0` is not the release version. The tag triggers
 `release.yml`, which publishes per-platform archives with SHA-256 files and
 GitHub artifact attestations.
+
+Verify published assets using the [shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+Constrain the source repository and the shared signer workflow commit pinned
+at the release tag, including when verifying older releases.

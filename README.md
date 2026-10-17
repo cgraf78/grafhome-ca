@@ -76,6 +76,10 @@ proceeds on the checksum alone and says so. `--require-attestation` makes
 verification mandatory: the installer fails before downloading unless GitHub
 CLI 2.49+ is logged in to github.com. `--archive` installs are checksum-only,
 and combining `--archive` with `--require-attestation` is an error.
+For manual verification and troubleshooting, see the
+[shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+It explains how to constrain the source repository and the separate shared
+signer workflow pinned by the release.
 
 ## Quick start
 
@@ -600,6 +604,11 @@ YYYYMMDD-HHMMSS-<8hex>
 
 The timestamp is the UTC commit timestamp. The suffix is the first eight
 hex characters of the commit hash. There is no hand-maintained `VERSION` file.
+
+After publication, follow the [shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations)
+to verify downloaded assets against this source repository and the shared
+signer workflow commit pinned at the release tag. Use the release-time pin
+when verifying older releases.
 
 ## Site Config
 
