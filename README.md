@@ -1,6 +1,10 @@
 # Grafhome CA
 
-![Tests](https://github.com/cgraf78/grafhome-ca/actions/workflows/test.yml/badge.svg?branch=main)
+[![Tests](https://github.com/cgraf78/grafhome-ca/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/grafhome-ca/actions/workflows/test.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/release-date/cgraf78/grafhome-ca?display_date=published_at&label=latest%20release)](https://github.com/cgraf78/grafhome-ca/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.88-blue)](Cargo.toml)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Termux-lightgrey)](#installation)
 
 Auto-renewing SSH certificates for a small fleet, without hand-managed
 `authorized_keys` or `known_hosts`. `grafhome-ca` drives a
