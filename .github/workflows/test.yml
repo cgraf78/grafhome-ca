@@ -21,7 +21,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@3b726ff80de78ae9407dc1f609c11d951c56bd3b
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@6ecbf5dafaeb9483aeeba3915321544b31572172
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -103,7 +103,7 @@ jobs:
         test -f "$install_root/data/cgraf78/grafhome-ca/schemas/policy/revocations.schema.json"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@3b726ff80de78ae9407dc1f609c11d951c56bd3b
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6ecbf5dafaeb9483aeeba3915321544b31572172
     with:
       matrix-set: full
       profiles: base
@@ -132,7 +132,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@3b726ff80de78ae9407dc1f609c11d951c56bd3b
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@6ecbf5dafaeb9483aeeba3915321544b31572172
 
   # These jobs exercise grafhome-ca product behavior against real OpenSSH and
   # Smallstep packages. They remain caller-owned because putting product
