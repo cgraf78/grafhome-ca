@@ -236,17 +236,21 @@ mod tests {
         use std::process::Command;
         use std::time::{Duration, Instant};
 
-        // A freshly written executable can transiently remain busy after
-        // it is published: a filesystem can retain a write handle briefly
-        // after close, so the first execution fails with
-        // `ExecutableFileBusy` even though no writer remains in this
-        // process (the same fixture-publication race `run_waiter` in the
-        // render tests synchronizes on). Poll only that condition until
-        // the fixture is executable; every other outcome is a broken
-        // fixture and fails here instead of inside `collect`. The fake
-        // step is a pure `printf` with no side effects, so executing it
-        // for readiness is idempotent, and `collect` still runs and is
-        // asserted exactly once afterwards.
+        // The test harness runs tests on parallel threads, so another test
+        // can fork a child while `fs::write` still holds the fixture open
+        // for writing. `O_CLOEXEC` closes that inherited descriptor only
+        // when the child execs, and until then the kernel refuses to exec
+        // the fixture with `ExecutableFileBusy` (rust-lang/rust#114554).
+        // The window closes once that child execs or exits, so poll only
+        // that condition; every other outcome is a broken fixture and
+        // fails here instead of inside `collect`.
+        //
+        // Probing before `collect` is enough: `fs::write` already closed
+        // this thread's descriptor, so once one exec succeeds every
+        // inherited copy is gone, and nothing reopens the fixture for
+        // writing, so no later fork can make it busy again. The fake step
+        // is a pure `printf`, so the probe has no side effects, and
+        // `collect` still runs and is asserted exactly once afterwards.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match Command::new(step_bin)
