@@ -171,10 +171,47 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+/// Write a fake tool without this process ever holding it open for writing.
+///
+/// The test harness runs tests on parallel threads. If this process wrote the
+/// fixture itself, another test could fork while the write descriptor was
+/// open; the child keeps the inherited descriptor until it execs, and until
+/// then the kernel refuses to exec the fixture with `ExecutableFileBusy`
+/// (rust-lang/rust#114554), which the binary under test cannot retry. A
+/// short-lived shell opens the file and copies the content from its stdin
+/// instead, so the descriptor only exists in that child's process tree, which
+/// no test thread can fork from, and it is closed before this returns.
 #[cfg(unix)]
 fn write_executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", r#"cat >"$1""#, "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawning sh to write {}: {error}", path.display()));
+    // Dropping stdin after the write sends EOF. A write error only matters
+    // if the shell still succeeded; otherwise its stderr explains it.
+    let written = child.stdin.take().unwrap().write_all(content.as_bytes());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "writing {} failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    written.unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Copy a fake tool through `write_executable`, for the same reason.
+#[cfg(unix)]
+fn copy_executable(from: &Path, to: &Path) {
+    write_executable(to, &fs::read_to_string(from).unwrap());
 }
 
 #[cfg(unix)]
@@ -799,8 +836,7 @@ fn reset_user_enrollment_request(home: &Path) {
 fn configure_step_path_fallback(dir: &tempfile::TempDir, fixture: &ExecFixture) -> String {
     let path_bin = dir.path().join("path-bin");
     fs::create_dir(&path_bin).unwrap();
-    fs::copy(fixture.fake_bin.join("step"), path_bin.join("step")).unwrap();
-    fs::set_permissions(path_bin.join("step"), fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(&fixture.fake_bin.join("step"), &path_bin.join("step"));
     let deployment_path = fixture.config_root.join("config/deployment.env");
     let deployment = fs::read_to_string(&deployment_path).unwrap().replace(
         &format!(
@@ -829,11 +865,9 @@ fn prepare_termux_host_runtime(
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&ssh).unwrap();
     for executable in ["ssh", "ssh-keygen", "sshd", "sv"] {
-        fs::copy(fixture.fake_bin.join(executable), bin.join(executable)).unwrap();
-        fs::set_permissions(bin.join(executable), fs::Permissions::from_mode(0o755)).unwrap();
+        copy_executable(&fixture.fake_bin.join(executable), &bin.join(executable));
     }
-    fs::copy(fixture.fake_bin.join("step"), bin.join("step-cli")).unwrap();
-    fs::set_permissions(bin.join("step-cli"), fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(&fixture.fake_bin.join("step"), &bin.join("step-cli"));
     fs::write(ssh.join("ssh_host_ed25519_key"), "host-private\n").unwrap();
     fs::write(
         ssh.join("ssh_host_ed25519_key.pub"),
@@ -4534,8 +4568,6 @@ fn export_dry_run_lists_bundle_without_live_ca_state() {
 #[cfg(unix)]
 #[test]
 fn export_writes_trust_bundle_and_manifest() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = trusted_tempdir();
     let config_root = dir.path().join("grafhome-ca");
     let ca_state = dir.path().join("state");
@@ -4558,12 +4590,10 @@ fn export_writes_trust_bundle_and_manifest() {
         "ssh-ed25519 AAAAuser grafhome-user-ca\n",
     )
     .unwrap();
-    fs::write(
+    write_executable(
         &step_bin,
         "#!/bin/sh\nprintf '%s\\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-    )
-    .unwrap();
-    fs::set_permissions(&step_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let deployment = fs::read_to_string(config_root.join("config/deployment.env")).unwrap();
     let deployment = deployment

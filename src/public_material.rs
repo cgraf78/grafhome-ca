@@ -228,6 +228,66 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_for_fake_step(
+        step_bin: &std::path::Path,
+        root_cert_path: &std::path::Path,
+        expected_fingerprint: &str,
+    ) {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // The test harness runs tests on parallel threads, so another test
+        // can fork a child while `fs::write` still holds the fixture open
+        // for writing. `O_CLOEXEC` closes that inherited descriptor only
+        // when the child execs, and until then the kernel refuses to exec
+        // the fixture with `ExecutableFileBusy` (rust-lang/rust#114554).
+        // The window closes once that child execs or exits, so poll only
+        // that condition; every other outcome is a broken fixture and
+        // fails here instead of inside `collect`.
+        //
+        // Probing before `collect` is enough: `fs::write` already closed
+        // this thread's descriptor, so once one exec succeeds every
+        // inherited copy is gone, and nothing reopens the fixture for
+        // writing, so no later fork can make it busy again. The fake step
+        // is a pure `printf`, so the probe has no side effects, and
+        // `collect` still runs and is asserted exactly once afterwards.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match Command::new(step_bin)
+                .arg("certificate")
+                .arg("fingerprint")
+                .arg(root_cert_path)
+                .output()
+            {
+                Ok(output) => {
+                    assert!(
+                        output.status.success(),
+                        "fake-step should succeed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout).trim(),
+                        expected_fingerprint
+                    );
+                    return;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    panic!("fake-step still busy after 1s (ExecutableFileBusy): {error}");
+                }
+                Err(error) => {
+                    panic!("fake-step should be executable: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn exports_only_public_trust_material() {
         use std::os::unix::fs::PermissionsExt;
@@ -252,9 +312,11 @@ mod tests {
             "ssh-ed25519 AAAAuser grafhome-user-ca\n",
         )
         .unwrap();
+        let expected_fingerprint =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         fs::write(
             &step_bin,
-            "#!/bin/sh\nprintf '%s\\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+            format!("#!/bin/sh\nprintf '%s\\n' {expected_fingerprint}\n"),
         )
         .unwrap();
         fs::set_permissions(&step_bin, fs::Permissions::from_mode(0o755)).unwrap();
@@ -265,6 +327,12 @@ mod tests {
         model.deployment.values.insert(
             "GRAFHOME_CA_ROOT_STEP_BIN".to_owned(),
             step_bin.display().to_string(),
+        );
+
+        wait_for_fake_step(
+            &step_bin,
+            &ca_state.join("step/certs/root_ca.crt"),
+            expected_fingerprint,
         );
 
         let files = collect(&model).unwrap();

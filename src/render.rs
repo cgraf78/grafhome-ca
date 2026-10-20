@@ -903,9 +903,12 @@ mod tests {
     }
 
     fn run_waiter(command: &mut Command) -> std::io::Result<std::process::Output> {
-        // Container overlay filesystems can transiently retain a write handle
-        // after publishing the fixture. Poll only that condition so the tests
-        // keep exercising its shebang and executable mode directly.
+        // Another test thread can fork while a fixture is still open for
+        // writing; the child holds the inherited descriptor until it execs,
+        // and until then executing the fixture fails with
+        // `ExecutableFileBusy` (rust-lang/rust#114554). Poll only that
+        // condition so the tests keep exercising its shebang and executable
+        // mode directly.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match command.output() {
@@ -928,6 +931,26 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        // The waiter execs this fixture itself, outside `run_waiter`, and
+        // treats a failed lookup as "not ready", so a busy first call can
+        // push it past its deadline (deterministically in the virtual-clock
+        // test) or decide a test for the wrong reason. Exec it once here
+        // instead: after one exec succeeds, no later fork can make it busy
+        // again. It is a pure `printf`, so the probe has no effect.
+        let output = run_waiter(Command::new(&path).args([
+            "-4",
+            "-o",
+            "address",
+            "show",
+            "to",
+            "198.51.100.20/32",
+        ]))
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "fake ip should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         path
     }
 
