@@ -228,6 +228,62 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_for_fake_step(
+        step_bin: &std::path::Path,
+        root_cert_path: &std::path::Path,
+        expected_fingerprint: &str,
+    ) {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // A freshly written executable can transiently remain busy after
+        // it is published: a filesystem can retain a write handle briefly
+        // after close, so the first execution fails with
+        // `ExecutableFileBusy` even though no writer remains in this
+        // process (the same fixture-publication race `run_waiter` in the
+        // render tests synchronizes on). Poll only that condition until
+        // the fixture is executable; every other outcome is a broken
+        // fixture and fails here instead of inside `collect`. The fake
+        // step is a pure `printf` with no side effects, so executing it
+        // for readiness is idempotent, and `collect` still runs and is
+        // asserted exactly once afterwards.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match Command::new(step_bin)
+                .arg("certificate")
+                .arg("fingerprint")
+                .arg(root_cert_path)
+                .output()
+            {
+                Ok(output) => {
+                    assert!(
+                        output.status.success(),
+                        "fake-step should succeed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout).trim(),
+                        expected_fingerprint
+                    );
+                    return;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    panic!("fake-step still busy after 1s (ExecutableFileBusy): {error}");
+                }
+                Err(error) => {
+                    panic!("fake-step should be executable: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn exports_only_public_trust_material() {
         use std::os::unix::fs::PermissionsExt;
@@ -252,9 +308,11 @@ mod tests {
             "ssh-ed25519 AAAAuser grafhome-user-ca\n",
         )
         .unwrap();
+        let expected_fingerprint =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         fs::write(
             &step_bin,
-            "#!/bin/sh\nprintf '%s\\n' 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+            format!("#!/bin/sh\nprintf '%s\\n' {expected_fingerprint}\n"),
         )
         .unwrap();
         fs::set_permissions(&step_bin, fs::Permissions::from_mode(0o755)).unwrap();
@@ -265,6 +323,12 @@ mod tests {
         model.deployment.values.insert(
             "GRAFHOME_CA_ROOT_STEP_BIN".to_owned(),
             step_bin.display().to_string(),
+        );
+
+        wait_for_fake_step(
+            &step_bin,
+            &ca_state.join("step/certs/root_ca.crt"),
+            expected_fingerprint,
         );
 
         let files = collect(&model).unwrap();
