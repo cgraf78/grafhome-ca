@@ -140,7 +140,7 @@ cargo_msrv=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' "$repo_root/Cargo.toml
 # the curve stack cannot land under the ignores.
 [[ "$ci_workflow" == *"setup-command: |"*"rsa_paths=\$(cargo tree -q --locked --all-features --target all -i rsa)"*"if [[ -n \"\$rsa_paths\" ]]"*"exit 1"* ]] ||
   fail "Rust CI setup must fail closed when RSA becomes reachable"
-[[ "$ci_workflow" == *"crypto_bigint_paths=\$(cargo tree -q --locked --all-features --target all -i crypto-bigint)"*"if [[ -n \"\$crypto_bigint_paths\" ]]"*"exit 1"* ]] ||
+[[ "$ci_workflow" == *"setup-command: |"*"crypto_bigint_paths=\$(cargo tree -q --locked --all-features --target all -i crypto-bigint)"*"if [[ -n \"\$crypto_bigint_paths\" ]]"*"exit 1"* ]] ||
   fail "Rust CI setup must fail closed when crypto-bigint becomes reachable"
 [[ "$ci_workflow" == *'audit-command: cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387'* ]] ||
   fail "RustSec must ignore only the unreachable RSA and crypto-bigint advisories"
