@@ -41,9 +41,10 @@ real site data.
 - `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`: every
   public item needs rustdoc.
 - MSRV: `rustup run 1.88 cargo check --locked --all-targets --all-features`.
-- `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071`. The ignore is
-  safe only while `cargo tree -q --locked --all-features --target all -i rsa`
-  prints nothing, which CI also enforces.
+- `cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387`.
+  The ignores are safe only while
+  `cargo tree -q --locked --all-features --target all -i rsa` and the same
+  query for `crypto-bigint` print nothing, which CI also enforces.
 - Shell: `tests/shell/install-test` and `tests/shell/release-scripts-test`.
   CI also runs the full Rust matrix, including Termux via
   `scripts/termux-ci.sh`.

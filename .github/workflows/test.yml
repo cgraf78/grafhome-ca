@@ -31,11 +31,19 @@ jobs:
       # and gives it the same locked, all-target, all-feature policy as peers.
       msrv-toolchain: "1.88"
       # cargo-audit scans optional packages recorded in Cargo.lock even when no
-      # build can reach them. ssh-key declares RSA as optional, while this repo
-      # enables only ECDSA plus std; RUSTSEC-2023-0071 also has no fixed release.
-      # The setup guard below proves that RSA stays unreachable on every PR and
-      # push before this scheduled advisory exception is allowed to apply.
-      audit-command: cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071
+      # build can reach them. ssh-key declares RSA and the NIST curve crates
+      # (p256/p384/p521, hence elliptic-curve and crypto-bigint) as optional,
+      # while this repo enables only ECDSA plus std; RUSTSEC-2023-0071 also has
+      # no fixed release, and RUSTSEC-2026-0387 is fixed only in crypto-bigint
+      # >=0.7.6, which the locked elliptic-curve 0.13 stack cannot use (it pins
+      # crypto-bigint 0.5) and which otherwise arrives only via the pre-release
+      # ssh-key 0.7.0-rc series. The setup guard below re-proves on every PR
+      # and push that RSA and crypto-bigint stay unreachable; these scheduled
+      # advisory exceptions are only safe while it keeps passing. Remove the
+      # RUSTSEC-2026-0387 ignore once a stable ssh-key release reaches
+      # crypto-bigint >=0.7.6 via elliptic-curve >=0.14, or whenever the
+      # guard fires.
+      audit-command: cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387
       setup-command: |
         as_root() {
           if [ "$(id -u)" -eq 0 ]; then
@@ -60,16 +68,23 @@ jobs:
             ;;
         esac
 
-        # RustSec now runs on every Rust CI event, but its narrow ignore cannot
-        # prove the premise that makes that exception safe. Enforce that premise
-        # independently: if any target or root feature makes RSA reachable, fail
-        # before tests even though cargo-audit was told to ignore the advisory.
+        # RustSec now runs on every Rust CI event, but its narrow ignores cannot
+        # prove the premise that makes those exceptions safe. Enforce that
+        # premise independently: if any target or root feature makes RSA or
+        # crypto-bigint reachable, fail before tests even though cargo-audit
+        # was told to ignore the advisories.
         # `-q` drops cargo's "nothing to print" warning in the passing case;
         # the tree itself and resolution errors still print.
         rsa_paths=$(cargo tree -q --locked --all-features --target all -i rsa)
         if [[ -n "$rsa_paths" ]]; then
           printf '%s\n' 'RSA is active; remove the RustSec exception and address RUSTSEC-2023-0071' >&2
           printf '%s\n' "$rsa_paths" >&2
+          exit 1
+        fi
+        crypto_bigint_paths=$(cargo tree -q --locked --all-features --target all -i crypto-bigint)
+        if [[ -n "$crypto_bigint_paths" ]]; then
+          printf '%s\n' 'crypto-bigint is active; remove the RustSec exception and address RUSTSEC-2026-0387' >&2
+          printf '%s\n' "$crypto_bigint_paths" >&2
           exit 1
         fi
       # This project's supported physical-device release target is AArch64.
