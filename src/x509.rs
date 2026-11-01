@@ -278,8 +278,9 @@ fn live_key(live: &Value) -> Result<&Value> {
 ///
 /// The whole object is replaced, so stale fields cannot widen its authority, and
 /// policy stays the one source for its names, usage, and lifetime. A provisioner
-/// with no active declaration is refused rather than left alone: its host could
-/// otherwise keep issuing a name that policy has since given to another host.
+/// with no active declaration is refused rather than silently kept, because its
+/// host could be issuing a name that policy has since given to another host. The
+/// refusal stops the command, not the provisioner: it keeps issuing until revoked.
 pub fn reconcile_live(policy: &Policy, live: &Value) -> Result<Value> {
     let name = live_name(live);
     let (host, certificate) =

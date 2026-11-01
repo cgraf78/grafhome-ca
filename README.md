@@ -360,7 +360,8 @@ while any JWK provisioner other than an enrolled X.509 one lacks the X.509 deny
 template, removes every ACME provisioner except the active `proxy_x509` row, and
 removes X.509 provisioners whose key is tombstoned. A live X.509 provisioner with
 no active policy declaration stops the command until the declaration is restored
-or the enrollment is revoked.
+or the enrollment is revoked. That refusal stops the command, not the provisioner,
+which keeps issuing until it is revoked.
 
 ### X.509 enrollment
 
@@ -375,8 +376,9 @@ it, and it cannot issue SSH certificates.
 grafhome-ca x509 enroll nfs-client
 
 # CA origin as root. Paste the REQUEST line, or pass --request-file.
-# Run `grafhome-ca apply ca` first when the declared names are new to the
-# authority allow-list; approval does not change it.
+# Run `grafhome-ca apply ca` as well when the declared names are new to the
+# authority allow-list; approval does not change it, and issuance is refused
+# until it runs.
 grafhome-ca x509 approve
 
 # CA origin as root.

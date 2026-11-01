@@ -4010,7 +4010,9 @@ fn approve_x509(
         Ok(())
     })?;
     eprintln!("Approved {identity}.");
-    eprintln!("Run `grafhome-ca apply ca` first if these names are new to the CA allow-list.");
+    eprintln!(
+        "Run `grafhome-ca apply ca` now if these names are new to the CA allow-list; issuance is refused until it runs."
+    );
     Ok(())
 }
 
@@ -5371,6 +5373,7 @@ fn revoke_user(
                 .policy
                 .root
                 .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+            SSH_REVOCATION_NEXT_STEP,
         )
     })
 }
@@ -5427,9 +5430,13 @@ fn revoke_host(
                 .policy
                 .root
                 .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+            SSH_REVOCATION_NEXT_STEP,
         )
     })
 }
+
+/// What an SSH revocation still needs: servers read keys from the distributed KRL.
+const SSH_REVOCATION_NEXT_STEP: &str = "run `grafhome-ca apply host` on managed SSH hosts";
 
 fn revoke_x509(
     model: &SiteModel,
@@ -5470,6 +5477,7 @@ fn revoke_x509(
                 .policy
                 .root
                 .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+            &format!("rerun `grafhome-ca x509 enroll {name}` on {host} to enroll a new key"),
         )
     })
 }
@@ -5630,7 +5638,7 @@ fn require_registry_coverage(
     Err(grafhome_ca::Error::Validation {
         field: "revoke enrollment".to_owned(),
         message: format!(
-            "live enrollment keys are absent from the CA registry: {}; export them on each target and run `grafhome-ca enrollment import` before revoking",
+            "live enrollment keys are absent from the CA registry: {}; before revoking, export SSH enrollments on each target and run `grafhome-ca enrollment import`, or restore X.509 enrollments from a registry backup",
             missing.join(", ")
         ),
     })
@@ -5803,6 +5811,7 @@ fn print_active_revocation_result(
     newly_revoked: usize,
     ledger_added: LedgerAdditions,
     policy_path: &Path,
+    next_step: &str,
 ) -> grafhome_ca::Result<()> {
     if newly_revoked == 0 && ledger_added.is_empty() {
         outln!("{identity} is already revoked or was never enrolled.");
@@ -5820,7 +5829,7 @@ fn print_active_revocation_result(
         );
     }
     outln!(
-        "Commit and distribute {}, then run `grafhome-ca apply host` on managed SSH hosts.",
+        "Commit and distribute {}, then {next_step}.",
         policy_path.display()
     );
     Ok(())

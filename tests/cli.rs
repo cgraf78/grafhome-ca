@@ -8831,7 +8831,10 @@ fn approve_x509_adds_the_provisioner_and_activates_the_record() {
     approve_x509_command(&fixture, &request)
         .assert()
         .success()
-        .stdout(predicate::str::contains(EDGE_X509_PROVISIONER));
+        .stdout(predicate::str::contains(EDGE_X509_PROVISIONER))
+        .stderr(predicate::str::contains(
+            "Run `grafhome-ca apply ca` now if these names are new",
+        ));
 
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
     assert_eq!(
@@ -9030,7 +9033,11 @@ fn revoke_x509_removes_provisioner_and_writes_tombstone() {
     )
     .assert()
     .success()
-    .stdout(predicate::str::contains("recorded 1 X.509 keys"));
+    .stdout(predicate::str::contains("recorded 1 X.509 keys"))
+    .stdout(predicate::str::contains(
+        "rerun `grafhome-ca x509 enroll nfs-client` on edge-host",
+    ))
+    .stdout(predicate::str::contains("apply host").not());
 
     assert_eq!(live_provisioner_names(&ca_json), ["keep-me"]);
     assert_eq!(registry_statuses(&fixture), ["revoked"]);
@@ -9094,7 +9101,10 @@ fn revoke_x509_refuses_a_live_provisioner_missing_from_the_registry() {
     x509_command(&fixture, &["revoke", "--host", "edge-host", "nfs-client"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("absent from the CA registry"));
+        .stderr(predicate::str::contains("absent from the CA registry"))
+        .stderr(predicate::str::contains(
+            "restore X.509 enrollments from a registry backup",
+        ));
 
     assert_eq!(live_provisioner_names(&ca_json), [EDGE_X509_PROVISIONER]);
 }
@@ -9662,6 +9672,125 @@ fn apply_ca_keeps_active_acme_but_removes_a_stray_one() {
     let names = live_provisioner_names(&ca_json);
     assert!(names.contains(&"grafhome-x509-ca-proxy".to_owned()));
     assert!(!names.contains(&"stray-acme".to_owned()));
+}
+
+/// Every X.509 deny text a release has written to a live provisioner.
+///
+/// These are literal copies, not the current constants: they stand for state
+/// already on disk, which a later rename of a constant does not change.
+#[cfg(unix)]
+const HISTORIC_X509_DENY: [&str; 8] = [
+    r#"{{ fail "x509 issuance disabled for Grafhome user/device provisioner" }}"#,
+    r#"{{ fail "x509 issuance disabled for Grafhome user/client-host provisioner" }}"#,
+    r#"{{ fail "x509 issuance disabled for Grafhome host provisioner" }}"#,
+    r#"{{ fail "x509 issuance disabled for Grafhome user renewal provisioner" }}"#,
+    r#"{{ fail "x509 issuance disabled for Grafhome host renewal provisioner" }}"#,
+    r#"{{ fail "x509 issuance disabled for Grafhome user enrollment provisioner" }}"#,
+    r#"{{ fail "x509 issuance disabled for Grafhome host bootstrap provisioner" }}"#,
+    r#"{{ fail "x509 disabled" }}"#,
+];
+
+/// Add a user and a host renewal provisioner holding each historic deny text.
+#[cfg(unix)]
+fn add_historic_renewal_provisioners(ca_json: &Path) -> Vec<(String, &'static str)> {
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(ca_json).unwrap()).unwrap();
+    let provisioners = value["authority"]["provisioners"].as_array_mut().unwrap();
+    let mut expected = Vec::new();
+    for (index, template) in HISTORIC_X509_DENY.into_iter().enumerate() {
+        let identity = format!("retired-{index}");
+        for name in [
+            grafhome_ca::enrollment::user_provisioner_name(&identity, "ca-host"),
+            grafhome_ca::enrollment::host_provisioner_name(&identity),
+        ] {
+            provisioners.push(serde_json::json!({
+                "type": "JWK",
+                "name": name,
+                "key": {"kid": name},
+                "options": {"x509": {"template": template}},
+            }));
+            expected.push((name, template));
+        }
+    }
+    fs::write(ca_json, serde_json::to_vec(&value).unwrap()).unwrap();
+    expected
+}
+
+/// Identify everything under `root` except the fake tools' own call log.
+///
+/// The inode catches an atomic replacement that writes back identical bytes, and
+/// the modification time catches an in-place rewrite that does the same.
+#[cfg(unix)]
+fn tree_state(
+    root: &Path,
+    log: &Path,
+) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, Vec<u8>)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let log_name = log.file_name().unwrap().to_string_lossy().into_owned();
+    let mut state = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with(&log_name) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let bytes = if metadata.is_dir() {
+                pending.push(path.clone());
+                Vec::new()
+            } else if metadata.is_file() {
+                fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            state.insert(path, (metadata.ino(), metadata.modified().unwrap(), bytes));
+        }
+    }
+    state
+}
+
+/// Release runs this path unattended through the merge hook, on a CA that still
+/// holds its ACME row and every deny text an earlier release wrote.
+#[cfg(unix)]
+#[test]
+fn apply_ca_leaves_settled_release_state_untouched() {
+    let (dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
+    let historic = add_historic_renewal_provisioners(&ca_json);
+
+    // The first run settles claims and the allow-list. If it also dropped the ACME
+    // row or rewrote a deny text, the run under test would be a no-op only because
+    // the state it was meant to preserve had already gone.
+    apply_ca_command(&fixture).assert().success();
+    let settled: serde_json::Value = serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+    let provisioners = settled["authority"]["provisioners"].as_array().unwrap();
+    assert!(
+        provisioners
+            .iter()
+            .any(|item| item["type"] == "ACME" && item["name"] == "grafhome-x509-ca-proxy")
+    );
+    for (name, template) in &historic {
+        let item = provisioners
+            .iter()
+            .find(|item| item["name"] == name.as_str())
+            .unwrap_or_else(|| panic!("{name} was removed"));
+        assert_eq!(item["options"]["x509"]["template"], *template);
+    }
+
+    fs::write(&fixture.log, "").unwrap();
+    let before = tree_state(dir.path(), &fixture.log);
+    assert!(before.contains_key(&dir.path().join("state/step/config/ca.json")));
+
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CA policy already current"));
+
+    assert_eq!(tree_state(dir.path(), &fixture.log), before);
+    assert_eq!(restart_count(&fixture), 0);
 }
 
 #[cfg(unix)]

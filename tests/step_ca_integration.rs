@@ -1698,18 +1698,23 @@ fn run_fails(command: &mut Command) {
     );
 }
 
-/// Assert the CA itself refused `command`.
+/// Assert the CA itself refused `command`, in the words of `refusal`.
 ///
 /// A bare non-zero exit also covers CLI usage errors that never reach the CA, so
 /// that alone cannot show a control works.
-fn run_refused(command: &mut Command) {
+fn run_refused_with(command: &mut Command, refusal: &str) {
     let output = command.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success() && stderr.contains("lacked necessary authorization"),
-        "expected a CA refusal, status {:?}\nstderr:\n{stderr}",
+        !output.status.success() && stderr.contains(refusal),
+        "expected a CA refusal containing {refusal:?}, status {:?}\nstderr:\n{stderr}",
         output.status
     );
+}
+
+/// Assert the CA refused `command` for lack of authorization.
+fn run_refused(command: &mut Command) {
+    run_refused_with(command, "lacked necessary authorization");
 }
 
 const X509_NAME: &str = "edge-host.example.test";
@@ -1942,7 +1947,14 @@ fn jwk_refuses_unenrolled_public_key() {
     let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
         return;
     };
-    for (kty, curve) in [("EC", "P-256"), ("EC", "P-384"), ("OKP", "Ed25519")] {
+    // The guard names an EC key it rejects. An Ed25519 key has no curve for it to
+    // read, so the template fails in execution, which step-ca reports as a 500.
+    let mismatch = "certificate public key does not match enrollment";
+    for (kty, curve, refusal) in [
+        ("EC", "P-256", mismatch),
+        ("EC", "P-384", mismatch),
+        ("OKP", "Ed25519", "Internal Server Error"),
+    ] {
         run(Command::new("step")
             .args(["crypto", "keypair"])
             .arg(ca.path("other.pub"))
@@ -1950,9 +1962,13 @@ fn jwk_refuses_unenrolled_public_key() {
             .args(["--kty", kty, "--crv", curve])
             .args(["--no-password", "--insecure", "--force"]));
         let csr = ca.csr(X509_NAME, "other.key", serde_json::json!({}));
-        run_fails(&mut ca.sign_command(&csr, X509_NAME));
+        run_refused_with(&mut ca.sign_command(&csr, X509_NAME), refusal);
         assert!(!ca.path("issued.crt").exists(), "{curve} was issued");
     }
+
+    // That 500 alone could mean a broken template, so show this one still issues.
+    let enrolled = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+    assert_pinned(&ca.issue(&enrolled, X509_NAME), "client_auth");
 }
 
 #[test]

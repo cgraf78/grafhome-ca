@@ -646,7 +646,7 @@ impl EnrollmentRegistry {
                 return Err(Error::Validation {
                     field: "enrollment registry".to_owned(),
                     message: format!(
-                        "{} reuses a {} or renewal key already assigned to {}",
+                        "{} reuses the {} or renewal key already assigned to {}",
                         candidate.identity(),
                         candidate.key_kind(),
                         record.identity()
@@ -1079,7 +1079,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE73fnTG0+dIVc6rYompVn1sa8O2+L
                 .reserve(x509_record(CERT_KEY, "first-x"))
                 .unwrap_err()
                 .to_string()
-                .contains("already assigned")
+                .contains("reuses the certificate or renewal key already assigned")
         );
     }
 
