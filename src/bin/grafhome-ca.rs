@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use fs2::FileExt;
 use grafhome_ca::enrollment::{
     HostGrant, HostRequest, UserGrant, UserRequest, host_provisioner_name,
@@ -139,20 +139,83 @@ enum Command {
         #[command(subcommand)]
         command: MigrateCommand,
     },
-    /// Apply current policy to a local host.
+    /// Reconcile live Smallstep CA policy with site policy.
     Apply {
         #[command(subcommand)]
         command: ApplyCommand,
     },
+    /// Manage SSH certificate enrollment, renewal, and host policy.
+    Ssh {
+        #[command(subcommand)]
+        command: SshCommand,
+    },
     /// Approve a public enrollment request on the CA origin.
+    #[command(hide = true)]
     Approve {
         #[command(subcommand)]
         command: ApproveCommand,
     },
     /// Enroll a host or user using a grant read from stdin by default.
+    #[command(hide = true)]
     Enroll {
         #[command(subcommand)]
         command: EnrollCommand,
+    },
+    /// Renew a host or user SSH certificate.
+    #[command(hide = true)]
+    Renew {
+        #[command(subcommand)]
+        command: RenewCommand,
+    },
+    /// Disable future issuance and renewal for a host or user.
+    #[command(hide = true)]
+    Revoke {
+        #[command(subcommand)]
+        command: RevokeCommand,
+    },
+    /// Export or import public enrollment key inventory.
+    #[command(hide = true)]
+    Enrollment {
+        #[command(subcommand)]
+        command: EnrollmentCommand,
+    },
+    /// Report enrollment and local renewal readiness from live CA state.
+    #[command(hide = true)]
+    Status(StatusArgs),
+}
+
+/// Options shared by `ssh status` and its hidden legacy spelling `status`.
+#[derive(Debug, Args)]
+struct StatusArgs {
+    /// Site config root containing config/ and policy/.
+    #[arg(long, value_name = "DIR")]
+    config_root: Option<PathBuf>,
+    /// Policy user. With no filters, defaults to GRAFHOME_CA_LOCAL_USER, then the current non-root account.
+    #[arg(long)]
+    user: Option<String>,
+    /// Policy host. With no filters, defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+    #[arg(long)]
+    host: Option<String>,
+    /// Print nothing and exit unsuccessfully when the requested enrollment is absent.
+    #[arg(long)]
+    quiet: bool,
+    /// Also require the local credential material needed for unattended renewal.
+    #[arg(long)]
+    renewable: bool,
+}
+
+/// Credential-first SSH commands; each maps onto a legacy top-level command.
+#[derive(Debug, Subcommand)]
+enum SshCommand {
+    /// Enroll a host or user using a grant read from stdin by default.
+    Enroll {
+        #[command(subcommand)]
+        command: EnrollCommand,
+    },
+    /// Approve a public enrollment request on the CA origin.
+    Approve {
+        #[command(subcommand)]
+        command: ApproveCommand,
     },
     /// Renew a host or user SSH certificate.
     Renew {
@@ -164,29 +227,36 @@ enum Command {
         #[command(subcommand)]
         command: RevokeCommand,
     },
+    /// Reconcile this host's Grafhome-managed OpenSSH policy.
+    Apply(ApplyHostArgs),
     /// Export or import public enrollment key inventory.
     Enrollment {
         #[command(subcommand)]
         command: EnrollmentCommand,
     },
     /// Report enrollment and local renewal readiness from live CA state.
-    Status {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Policy user. With no filters, defaults to GRAFHOME_CA_LOCAL_USER, then the current non-root account.
-        #[arg(long)]
-        user: Option<String>,
-        /// Policy host. With no filters, defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
-        #[arg(long)]
-        host: Option<String>,
-        /// Print nothing and exit unsuccessfully when the requested enrollment is absent.
-        #[arg(long)]
-        quiet: bool,
-        /// Also require the local credential material needed for unattended renewal.
-        #[arg(long)]
-        renewable: bool,
-    },
+    Status(StatusArgs),
+}
+
+impl Command {
+    /// Rewrites `ssh ...` into the legacy command it aliases, so one handler
+    /// serves both spellings and they cannot drift apart.
+    fn normalize(self) -> Self {
+        let Command::Ssh { command } = self else {
+            return self;
+        };
+        match command {
+            SshCommand::Enroll { command } => Command::Enroll { command },
+            SshCommand::Approve { command } => Command::Approve { command },
+            SshCommand::Renew { command } => Command::Renew { command },
+            SshCommand::Revoke { command } => Command::Revoke { command },
+            SshCommand::Apply(args) => Command::Apply {
+                command: ApplyCommand::Host(args),
+            },
+            SshCommand::Enrollment { command } => Command::Enrollment { command },
+            SshCommand::Status(args) => Command::Status(args),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,23 +357,28 @@ enum ApplyCommand {
         dry_run: bool,
     },
     /// Reconcile this host's Grafhome-managed OpenSSH policy.
-    Host {
-        /// Site config root containing config/ and policy/.
-        #[arg(long, value_name = "DIR")]
-        config_root: Option<PathBuf>,
-        /// Local policy host identity instead of hostname or environment inference.
-        #[arg(long)]
-        host: Option<String>,
-        /// Show changes without writing files or reloading SSH.
-        #[arg(long)]
-        dry_run: bool,
-        /// Exit successfully when this host has no local renewal enrollment.
-        #[arg(long)]
-        if_enrolled: bool,
-        /// Suppress routine success and no-op output while preserving errors.
-        #[arg(long, conflicts_with = "dry_run")]
-        quiet: bool,
-    },
+    #[command(hide = true)]
+    Host(ApplyHostArgs),
+}
+
+/// Options shared by `ssh apply` and its hidden legacy spelling `apply host`.
+#[derive(Debug, Args)]
+struct ApplyHostArgs {
+    /// Site config root containing config/ and policy/.
+    #[arg(long, value_name = "DIR")]
+    config_root: Option<PathBuf>,
+    /// Local policy host identity instead of hostname or environment inference.
+    #[arg(long)]
+    host: Option<String>,
+    /// Show changes without writing files or reloading SSH.
+    #[arg(long)]
+    dry_run: bool,
+    /// Exit successfully when this host has no local renewal enrollment.
+    #[arg(long)]
+    if_enrolled: bool,
+    /// Suppress routine success and no-op output while preserving errors.
+    #[arg(long, conflicts_with = "dry_run")]
+    quiet: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -480,7 +555,7 @@ fn main() {
 }
 
 fn run() -> grafhome_ca::Result<()> {
-    match Cli::parse().command {
+    match Cli::parse().command.normalize() {
         Command::Version => {
             outln!("grafhome-ca {}", grafhome_ca::version::cli());
             Ok(())
@@ -645,13 +720,13 @@ fn run() -> grafhome_ca::Result<()> {
         }
         Command::Apply {
             command:
-                ApplyCommand::Host {
+                ApplyCommand::Host(ApplyHostArgs {
                     config_root,
                     host,
                     dry_run,
                     if_enrolled,
                     quiet,
-                },
+                }),
         } => {
             let model = load_host_model(config_root, "apply host", true)?;
             let host = resolve_host(host.as_deref())?;
@@ -873,13 +948,13 @@ fn run() -> grafhome_ca::Result<()> {
             )?;
             import_enrollment(&model, &text)
         }
-        Command::Status {
+        Command::Status(StatusArgs {
             config_root,
             user,
             host,
             quiet,
             renewable,
-        } => {
+        }) => {
             let (user, host) = resolve_status_scope(user, host)?;
             let mut model = load_valid_model(config_root)?;
             if user.is_none() && host.is_some() {
@@ -940,6 +1015,8 @@ fn run() -> grafhome_ca::Result<()> {
             };
             renew_user(&model, &user, Some(&host), &password, quiet)
         }
+        // `normalize` has already rewritten every `ssh` form.
+        Command::Ssh { .. } => unreachable!("ssh commands are normalized before dispatch"),
     }
 }
 
