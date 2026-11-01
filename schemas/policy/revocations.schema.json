@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/cgraf78/grafhome-ca/main/schemas/policy/revocations.schema.json",
-  "title": "Grafhome SSH key revocations",
+  "title": "Grafhome key revocations",
   "type": "object",
   "additionalProperties": false,
   "required": ["format_version"],
@@ -12,6 +12,10 @@
       "items": {
         "oneOf": [{ "$ref": "#/definitions/hostKey" }, { "$ref": "#/definitions/userKey" }]
       }
+    },
+    "x509_keys": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/x509Key" }
     }
   },
   "definitions": {
@@ -26,6 +30,19 @@
     "renewalFingerprint": {
       "type": "string",
       "pattern": "^SHA256:[A-Za-z0-9_-]{43}$"
+    },
+    "x509Key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "name", "public_key_fingerprint", "renewal_fingerprint", "revoked_at"],
+      "properties": {
+        "host": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "public_key_fingerprint": { "$ref": "#/definitions/fingerprint" },
+        "renewal_fingerprint": { "$ref": "#/definitions/renewalFingerprint" },
+        "revoked_at": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
     },
     "hostKey": {
       "type": "object",

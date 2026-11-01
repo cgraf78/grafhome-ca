@@ -19,7 +19,7 @@ use grafhome_ca::enrollment::{
     user_provisioner_name, user_provisioner_prefix,
 };
 use grafhome_ca::enrollment_registry::{
-    EnrollmentRecord, EnrollmentRegistry, RecordStatus, canonical_jwk, now_utc,
+    EnrollmentRecord, EnrollmentRegistry, RecordStatus, Revocation, canonical_jwk, now_utc,
 };
 use grafhome_ca::executable::{root_step_bin, user_step_bin};
 use grafhome_ca::model::SiteModel;
@@ -28,6 +28,11 @@ use grafhome_ca::policy::{
     PROVISIONER_ROLE_USER_ENROLLMENT, Provisioner, STEP_EFFECTIVE_UNLIMITED_TTL, SshRole,
     UNLIMITED_TTL, User, UserClient, ca_policy_field, duration_at_most, host_policy_field,
     user_policy_field, valid_step_duration_expression,
+};
+use grafhome_ca::runtime_provisioners::ClaimsReconciliation;
+use grafhome_ca::x509::{
+    Assessment, CertificateKey, Condition, LocalCertificate, Renewal, X509Paths, X509Request,
+    parse_x509_provisioner_name, x509_identity, x509_provisioner, x509_provisioner_name,
 };
 
 const USER_KEY_NAME: &str = "id_ed25519";
@@ -149,6 +154,11 @@ enum Command {
         #[command(subcommand)]
         command: SshCommand,
     },
+    /// Manage X.509 certificate enrollment, renewal, and revocation.
+    X509 {
+        #[command(subcommand)]
+        command: X509Command,
+    },
     /// Approve a public enrollment request on the CA origin.
     #[command(hide = true)]
     Approve {
@@ -236,6 +246,85 @@ enum SshCommand {
     },
     /// Report enrollment and local renewal readiness from live CA state.
     Status(StatusArgs),
+}
+
+/// Credential-first X.509 commands.
+#[derive(Debug, Subcommand)]
+enum X509Command {
+    /// Create this host's certificate key and renewal JWK, and print a public request.
+    Enroll {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Certificate name from this host's policy manifest.
+        name: String,
+    },
+    /// Approve a public X.509 enrollment request on the CA origin.
+    Approve {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Read the public enrollment request from this file instead of stdin.
+        #[arg(long, value_name = "FILE")]
+        request_file: Option<PathBuf>,
+        /// Approve without an interactive confirmation (for automation).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Issue or renew this host's certificates when they are due.
+    Renew {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Certificate name. Omit to cover every active certificate on this host.
+        name: Option<String>,
+        /// Exit successfully without output for a certificate this host has not enrolled.
+        #[arg(long)]
+        if_enrolled: bool,
+        /// Exit successfully when renewal is not possible but the live certificate still works.
+        #[arg(long)]
+        if_reachable: bool,
+        /// Suppress routine output. With --if-reachable, also suppress CA outages.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Report whether this host's certificates are healthy. Works offline.
+    Status {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Certificate name. Omit to cover every active certificate on this host.
+        name: Option<String>,
+        /// Exit successfully without output for a certificate this host has not enrolled.
+        #[arg(long)]
+        if_enrolled: bool,
+        /// Print nothing for a healthy certificate. Alerts are always printed.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Remove a certificate's provisioner and tombstone its keys.
+    Revoke {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Policy host holding the certificate.
+        #[arg(long)]
+        host: String,
+        /// Certificate name.
+        name: String,
+        /// Optional audit reason stored with the tombstone.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 impl Command {
@@ -895,6 +984,88 @@ fn run() -> grafhome_ca::Result<()> {
         } => {
             let model = load_ca_mutation_model(config_root, "revoke host")?;
             revoke_host(&model, &host, reason.as_deref())
+        }
+        Command::X509 {
+            command:
+                X509Command::Enroll {
+                    config_root,
+                    host,
+                    name,
+                },
+        } => {
+            let model = load_host_model(config_root, "x509 enroll", false)?;
+            enroll_x509(&model, host.as_deref(), &name)
+        }
+        Command::X509 {
+            command:
+                X509Command::Approve {
+                    config_root,
+                    request_file,
+                    yes,
+                },
+        } => {
+            let model = load_ca_mutation_model(config_root, "x509 approve")?;
+            let mut stdin = std::io::stdin().lock();
+            let text = read_document_or_file(
+                request_file.as_deref(),
+                &mut stdin,
+                "public x509 enrollment request",
+            )?;
+            let request: X509Request =
+                parse_enrollment_document(&text, "public x509 enrollment request")?;
+            approve_x509(&model, &request, yes)
+        }
+        Command::X509 {
+            command:
+                X509Command::Renew {
+                    config_root,
+                    host,
+                    name,
+                    if_enrolled,
+                    if_reachable,
+                    quiet,
+                },
+        } => {
+            let model = load_host_model(config_root, "x509 renew", false)?;
+            let host = resolve_host(host.as_deref())?;
+            let flags = X509RenewFlags {
+                if_enrolled,
+                if_reachable,
+                quiet,
+            };
+            if !renew_x509(&model, &host, name.as_deref(), flags)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::X509 {
+            command:
+                X509Command::Status {
+                    config_root,
+                    host,
+                    name,
+                    if_enrolled,
+                    quiet,
+                },
+        } => {
+            let model = load_host_model(config_root, "x509 status", false)?;
+            let host = resolve_host(host.as_deref())?;
+            if !status_x509(&model, &host, name.as_deref(), if_enrolled, quiet)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::X509 {
+            command:
+                X509Command::Revoke {
+                    config_root,
+                    host,
+                    name,
+                    reason,
+                },
+        } => {
+            let model = load_ca_mutation_model(config_root, "x509 revoke")?;
+            revoke_x509(&model, &host, &name, reason.as_deref())
         }
         Command::Enrollment {
             command:
@@ -1582,15 +1753,25 @@ fn require_root_or_isolated_test(
     }
     let deployment =
         grafhome_ca::config::Deployment::load(config_root.join("config/deployment.env"))?;
-    for key in [
+    let x509_dir = deployment.x509_dir();
+    for path in [
         "GRAFHOME_CA_STATE_DIR",
         "GRAFHOME_CA_SERVER_STEPPATH",
         "GRAFHOME_CA_ROOT_STEP_BIN",
         "GRAFHOME_CA_HELPER_BIN",
         "GRAFHOME_CA_HOST_KEY_PATH",
         "GRAFHOME_CA_PASSWORD_FILE",
-    ] {
-        let path = Path::new(&deployment.values[key]);
+    ]
+    .into_iter()
+    .map(|key| Path::new(&deployment.values[key]))
+    // Only an explicit override needs checking: the default lies under `/etc`,
+    // which an isolated run cannot write.
+    .chain(
+        deployment
+            .values
+            .contains_key("GRAFHOME_CA_X509_DIR")
+            .then_some(x509_dir.as_path()),
+    ) {
         if !path.is_absolute() {
             return Err(root_required(command));
         }
@@ -2080,10 +2261,13 @@ fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Resul
 }
 
 fn ca_api_reachable(model: &SiteModel) -> grafhome_ca::Result<bool> {
-    endpoint_reachable_with(
-        required_endpoint(model, ENDPOINT_ROLE_CA_API)?,
-        |address, timeout| TcpStream::connect_timeout(address, timeout).map(drop),
-    )
+    endpoint_reachable(required_endpoint(model, ENDPOINT_ROLE_CA_API)?)
+}
+
+fn endpoint_reachable(endpoint: &Endpoint) -> grafhome_ca::Result<bool> {
+    endpoint_reachable_with(endpoint, |address, timeout| {
+        TcpStream::connect_timeout(address, timeout).map(drop)
+    })
 }
 
 fn endpoint_reachable_with(
@@ -2728,13 +2912,14 @@ fn parse_imported_enrollment(text: &str) -> grafhome_ca::Result<ImportedEnrollme
 fn import_enrollment(model: &SiteModel, text: &str) -> grafhome_ca::Result<()> {
     let imported = parse_imported_enrollment(text)?;
     let timestamp = now_utc()?;
-    let (candidate, provisioner) = match &imported {
+    let (candidate, provisioner, ssh_public_key) = match &imported {
         ImportedEnrollment::Host(request) => {
             request.validate()?;
             validate_explicit_host_identity("enrollment import host", &request.host)?;
             (
                 EnrollmentRecord::pending_host(request, &timestamp)?,
                 host_provisioner_name(&request.host),
+                &request.ssh_public_key,
             )
         }
         ImportedEnrollment::User(request) => {
@@ -2744,11 +2929,12 @@ fn import_enrollment(model: &SiteModel, text: &str) -> grafhome_ca::Result<()> {
             (
                 EnrollmentRecord::pending_user(request, &timestamp)?,
                 user_provisioner_name(&request.user, &request.host),
+                &request.ssh_public_key,
             )
         }
     };
     let identity = candidate.identity();
-    let ssh_fingerprint = candidate.ssh_fingerprint().to_owned();
+    let ssh_fingerprint = candidate.key_fingerprint().to_owned();
     let renewal_fingerprint = candidate.renewal_fingerprint().to_owned();
     with_ca_lock(model, || {
         ensure_enrollment_keys_not_revoked(model, &candidate)?;
@@ -2759,7 +2945,7 @@ fn import_enrollment(model: &SiteModel, text: &str) -> grafhome_ca::Result<()> {
             &ca_json,
             &provisioner,
             candidate.renewal_public_jwk(),
-            candidate.ssh_public_key(),
+            ssh_public_key,
         )?;
         let path = enrollment_registry_path(model);
         let registry = EnrollmentRegistry::load(&path)?;
@@ -2810,10 +2996,16 @@ fn reserve_approval_record(
             });
         }
         if existing_status.is_none() {
+            // X.509 enrollments have no export to import: the registry is their only copy
+            // of the pinned key, so a lost record has to be restored from a backup.
+            let recovery = match candidate {
+                EnrollmentRecord::X509 { .. } => "restore the enrollment registry from a backup",
+                _ => "run `grafhome-ca enrollment import` first",
+            };
             return Err(grafhome_ca::Error::Validation {
                 field: "approve enrollment".to_owned(),
                 message: format!(
-                    "{} is already live but is absent from the enrollment registry; run `grafhome-ca enrollment import` first",
+                    "{} is already live but is absent from the enrollment registry; {recovery}",
                     candidate.identity()
                 ),
             });
@@ -2839,24 +3031,41 @@ fn ensure_enrollment_keys_not_revoked(
     candidate: &EnrollmentRecord,
 ) -> grafhome_ca::Result<()> {
     let policy = grafhome_ca::policy::Policy::load(&model.policy.root)?;
-    if policy
+    // A renewal key must stay dead across credential types, so SSH and X.509
+    // tombstones are checked together.
+    let key_revoked = policy
         .revoked_ssh_keys
         .iter()
-        .any(|entry| entry.fingerprint() == candidate.ssh_fingerprint())
-    {
+        .map(|entry| entry.fingerprint())
+        .chain(
+            policy
+                .revoked_x509_keys
+                .iter()
+                .map(|entry| entry.public_key_fingerprint.as_str()),
+        )
+        .any(|fingerprint| fingerprint == candidate.key_fingerprint());
+    if key_revoked {
+        let kind = candidate.key_kind();
         return Err(grafhome_ca::Error::Validation {
-            field: "enrollment SSH public key".to_owned(),
+            field: format!("enrollment {kind} public key"),
             message: format!(
-                "{} reuses a previously revoked SSH key; generate a new SSH key before enrolling",
+                "{} reuses a previously revoked {kind} key; generate a new {kind} key before enrolling",
                 candidate.identity()
             ),
         });
     }
-    if policy
+    let renewal_revoked = policy
         .revoked_ssh_keys
         .iter()
-        .any(|entry| entry.renewal_fingerprint() == candidate.renewal_fingerprint())
-    {
+        .map(|entry| entry.renewal_fingerprint())
+        .chain(
+            policy
+                .revoked_x509_keys
+                .iter()
+                .map(|entry| entry.renewal_fingerprint.as_str()),
+        )
+        .any(|fingerprint| fingerprint == candidate.renewal_fingerprint());
+    if renewal_revoked {
         return Err(grafhome_ca::Error::Validation {
             field: "enrollment renewal public key".to_owned(),
             message: format!(
@@ -3778,6 +3987,340 @@ fn approve_host_enrollment(
     Ok(())
 }
 
+fn enroll_x509(model: &SiteModel, host: Option<&str>, name: &str) -> grafhome_ca::Result<()> {
+    let host = resolve_host(host)?;
+    let cert = grafhome_ca::x509::active_cert(&model.policy, &host, name)?;
+    // The certificate is useless to a host that cannot verify the CA, and SSH host
+    // enrollment is how a host pins the root.
+    if !local_renewal_ready(model, None, Some(&host))? {
+        return Err(grafhome_ca::Error::Validation {
+            field: "x509 enroll".to_owned(),
+            message: format!(
+                "host {host} is not enrolled; run `grafhome-ca ssh enroll host` first"
+            ),
+        });
+    }
+    let paths = x509_paths(model, &host, name);
+    let step_bin = root_step_bin(model)?;
+    let request = grafhome_ca::x509::prepare_enrollment(
+        &paths,
+        Path::new(&step_bin),
+        &model.policy,
+        cert,
+        &random_secret()?,
+    )?;
+    eprintln!(
+        "Created a public X.509 enrollment request for {}.",
+        x509_identity(&host, name)
+    );
+    eprintln!("Copy the REQUEST line to: sudo grafhome-ca x509 approve");
+    outln!(
+        "REQUEST:{}",
+        serde_json::to_string(&request).expect("x509 enrollment request serializes")
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|source| grafhome_ca::Error::io("<stdout>", source))
+}
+
+/// Flags that decide how `x509 renew` treats each certificate.
+#[derive(Clone, Copy)]
+struct X509RenewFlags {
+    if_enrolled: bool,
+    if_reachable: bool,
+    quiet: bool,
+}
+
+/// The declarations a command covers on this host.
+///
+/// With `--if-enrolled`, a certificate with no local material at all is left out,
+/// so a host-independent cron line or unit can run everywhere and such a host needs
+/// neither `step` nor a declaration. Any material keeps it in, however incomplete:
+/// a usable certificate stays quiet, an unusable one fails and alerts, and a `NAME`
+/// passed explicitly that policy no longer declares is refused. With no `NAME`, the
+/// list comes from policy, so a removed declaration is skipped.
+fn x509_targets<'a>(
+    model: &'a SiteModel,
+    host: &str,
+    name: Option<&str>,
+    if_enrolled: bool,
+) -> grafhome_ca::Result<Vec<&'a grafhome_ca::policy::X509Cert>> {
+    if let Some(name) = name {
+        if if_enrolled && !x509_enrolled(model, host, name) {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![grafhome_ca::x509::active_cert(
+            &model.policy,
+            host,
+            name,
+        )?]);
+    }
+    let certs = model
+        .policy
+        .x509_certs_for_host(host)
+        .into_iter()
+        .filter(|cert| cert.status.is_active())
+        .filter(|cert| !if_enrolled || x509_enrolled(model, host, &cert.name))
+        .collect::<Vec<_>>();
+    if certs.is_empty() && !if_enrolled {
+        return Err(grafhome_ca::Error::Validation {
+            field: "x509 certificate".to_owned(),
+            message: format!("host {host} declares no active X.509 certificates"),
+        });
+    }
+    Ok(certs)
+}
+
+/// Whether this host holds anything for a certificate, which need not be approved
+/// or complete.
+fn x509_enrolled(model: &SiteModel, host: &str, name: &str) -> bool {
+    x509_paths(model, host, name).has_material()
+}
+
+fn x509_paths(model: &SiteModel, host: &str, name: &str) -> X509Paths {
+    X509Paths::new(
+        &host_material_dir(model, host),
+        &model.deployment.x509_dir(),
+        name,
+    )
+}
+
+fn local_x509_certificate<'a>(
+    model: &SiteModel,
+    cert: &'a grafhome_ca::policy::X509Cert,
+    step_bin: &str,
+) -> grafhome_ca::Result<LocalCertificate<'a>> {
+    Ok(LocalCertificate {
+        cert,
+        paths: x509_paths(model, &cert.host, &cert.name),
+        step_bin: PathBuf::from(step_bin),
+        steppath: PathBuf::from(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
+        root: server_root_cert_path(model),
+        ca_url: required_endpoint(model, &cert.ca_endpoint)?.url(),
+    })
+}
+
+/// Keep `after_renew` inside the sandbox of a non-root test run.
+///
+/// These programs are privileged executables that `require_root_or_isolated_test`
+/// cannot inventory, because it runs before policy is loaded.
+fn confine_after_renew(
+    model: &SiteModel,
+    certs: &[&grafhome_ca::policy::X509Cert],
+) -> grafhome_ca::Result<()> {
+    #[cfg(unix)]
+    {
+        if rustix::process::geteuid().is_root() || TermuxHostRuntime::detect()?.is_some() {
+            return Ok(());
+        }
+        let command = "x509 renew";
+        let sandbox = model
+            .config_root
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .ok_or_else(|| root_required(command))?;
+        for program in certs.iter().filter_map(|cert| cert.after_renew.first()) {
+            let resolved =
+                resolve_location(Path::new(program)).map_err(|_| root_required(command))?;
+            if !resolved.starts_with(&sandbox) {
+                return Err(root_required(command));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (model, certs);
+    Ok(())
+}
+
+/// Renew this host's certificates, returning whether the run succeeded.
+///
+/// One certificate's failure does not stop the next. The exit status and what gets
+/// printed follow the certificate's own state: see [`RenewalFailure`].
+///
+/// [`RenewalFailure`]: grafhome_ca::x509::RenewalFailure
+fn renew_x509(
+    model: &SiteModel,
+    host: &str,
+    name: Option<&str>,
+    flags: X509RenewFlags,
+) -> grafhome_ca::Result<bool> {
+    let certs = x509_targets(model, host, name, flags.if_enrolled)?;
+    if certs.is_empty() {
+        return Ok(true);
+    }
+    confine_after_renew(model, &certs)?;
+    let step_bin = root_step_bin(model)?;
+    let mut succeeded = true;
+    for cert in certs {
+        let identity = x509_identity(&cert.host, &cert.name);
+        if !x509_enrolled(model, host, &cert.name) {
+            eprintln!(
+                "grafhome-ca: {identity}: not enrolled; run `grafhome-ca x509 enroll {}`",
+                cert.name
+            );
+            succeeded = false;
+            continue;
+        }
+        let local = local_x509_certificate(model, cert, &step_bin)?;
+        let endpoint = required_endpoint(model, &cert.ca_endpoint)?;
+        let probe = || endpoint_reachable(endpoint);
+        let probe: Option<&dyn Fn() -> grafhome_ca::Result<bool>> =
+            flags.if_reachable.then_some(&probe);
+        match local.renew(probe) {
+            Ok(Renewal::Current) => {}
+            Ok(Renewal::Busy) => {
+                if !flags.quiet {
+                    eprintln!("{identity}: another renewal is already running");
+                }
+            }
+            Ok(Renewal::Published { not_after }) => {
+                if !flags.quiet {
+                    outln!("{identity}: renewed, valid until {}", timestamp(not_after)?);
+                }
+            }
+            Err(failure) => {
+                if !(flags.if_reachable && flags.quiet && failure.hidden()) {
+                    eprintln!("grafhome-ca: {identity}: {}", failure.error);
+                }
+                succeeded &= flags.if_reachable && failure.tolerated();
+            }
+        }
+    }
+    Ok(succeeded)
+}
+
+/// Report on this host's certificates, returning whether all are healthy.
+///
+/// Alerts go to stdout under every flag, because cron mail depends on output. This
+/// never contacts the CA, so it still alerts during the outage it may be reporting.
+fn status_x509(
+    model: &SiteModel,
+    host: &str,
+    name: Option<&str>,
+    if_enrolled: bool,
+    quiet: bool,
+) -> grafhome_ca::Result<bool> {
+    let certs = x509_targets(model, host, name, if_enrolled)?;
+    if certs.is_empty() {
+        return Ok(true);
+    }
+    let step_bin = root_step_bin(model)?;
+    let now = time::OffsetDateTime::now_utc();
+    let mut healthy = true;
+    for cert in certs {
+        let local = local_x509_certificate(model, cert, &step_bin)?;
+        let identity = x509_identity(&cert.host, &cert.name);
+        let assessment = local.assess(now);
+        let alert = match &assessment {
+            Ok(assessment) => assessment.alert(local.ttl()?, now),
+            Err(_) => true,
+        };
+        healthy &= !alert;
+        match assessment {
+            Ok(assessment) if alert || !quiet => {
+                outln!("{identity}: {}", x509_status_text(&assessment, alert)?);
+            }
+            Ok(_) => {}
+            Err(error) => outln!("{identity}: cannot be assessed: {error}"),
+        }
+    }
+    Ok(healthy)
+}
+
+fn x509_status_text(assessment: &Assessment, alert: bool) -> grafhome_ca::Result<String> {
+    let end = assessment.not_after.map(timestamp).transpose()?;
+    let end = end.unwrap_or_default();
+    Ok(match assessment.condition {
+        Condition::Valid if alert => {
+            format!("expires {end}, with under one-third of its lifetime left")
+        }
+        Condition::Valid => format!("valid until {end}"),
+        Condition::Missing => "certificate is missing".to_owned(),
+        Condition::Unreadable => "certificate cannot be read".to_owned(),
+        Condition::NoIntermediate => "certificate lacks its intermediate".to_owned(),
+        Condition::KeyMismatch => "certificate does not match its key".to_owned(),
+        Condition::Expired => format!("certificate expired at {end}"),
+    })
+}
+
+fn timestamp(value: time::OffsetDateTime) -> grafhome_ca::Result<String> {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| grafhome_ca::Error::Validation {
+            field: "timestamp".to_owned(),
+            message: error.to_string(),
+        })
+}
+
+fn approve_x509(
+    model: &SiteModel,
+    request: &X509Request,
+    assume_yes: bool,
+) -> grafhome_ca::Result<()> {
+    request.validate()?;
+    let cert = grafhome_ca::x509::approved_cert(&model.policy, request)?;
+    let identity = x509_identity(&request.host, &request.name);
+    let key = CertificateKey::parse(&request.certificate_public_key)?;
+    if !assume_yes {
+        confirm_approval(
+            &format!(
+                "{identity} ({}) for {}",
+                key.fingerprint(),
+                cert.names.join(", ")
+            ),
+            "x509 approve",
+        )?;
+    }
+    let desired = x509_provisioner(
+        request.renewal_public_jwk.clone(),
+        cert,
+        &request.certificate_public_key,
+    )?;
+    let candidate = EnrollmentRecord::pending_x509(request, &now_utc()?)?;
+    let provisioner = x509_provisioner_name(&request.host, &request.name);
+    with_ca_lock(model, || {
+        let registry_path = enrollment_registry_path(model);
+        let mut registry = EnrollmentRegistry::load(&registry_path)?;
+        reserve_approval_record(
+            model,
+            &mut registry,
+            &registry_path,
+            &candidate,
+            &provisioner,
+        )?;
+        let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+        let text = grafhome_ca::runtime_provisioners::reconcile_x509(&ca_json, desired)?;
+        let live: serde_json::Value = read_json_file(&ca_json)?;
+        let proposed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|source| grafhome_ca::Error::Json {
+                path: ca_json.clone(),
+                source,
+            })?;
+        // A retry after success must not restart step-ca for nothing.
+        if live == proposed && registry.matching_status(&candidate) == Some(RecordStatus::Active) {
+            outln!("{identity} is already approved.");
+            return Ok(());
+        }
+        install_ca_json_with_rollback(
+            model,
+            &ca_json,
+            text.as_bytes(),
+            required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
+            || {
+                registry.activate(candidate.clone())?;
+                registry.save(&registry_path)
+            },
+        )?;
+        outln!("authorized provisioner: {provisioner}");
+        Ok(())
+    })?;
+    eprintln!("Approved {identity}.");
+    eprintln!(
+        "Run `grafhome-ca apply ca` now if these names are new to the CA allow-list; issuance is refused until it runs."
+    );
+    Ok(())
+}
+
 fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca::Result<()> {
     grant.validate()?;
     required_host(model, &grant.host)?;
@@ -3912,13 +4455,13 @@ fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> 
     let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
     if dry_run {
         let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
-        print_ca_policy_changes(result.authority_policy_updated, &result.updated, true)?;
+        print_ca_policy_changes(&result, true)?;
         return Ok(());
     }
 
     with_ca_lock(model, || {
         let result = grafhome_ca::runtime_provisioners::reconcile_claims(model, &ca_json)?;
-        if !result.authority_policy_updated && result.updated.is_empty() {
+        if ca_policy_current(&result) {
             outln!("CA policy already current.");
             return Ok(());
         }
@@ -3929,25 +4472,32 @@ fn apply_ca_policy(model: &SiteModel, dry_run: bool) -> grafhome_ca::Result<()> 
             required_endpoint(model, ENDPOINT_ROLE_CA_API)?.url(),
             || Ok(()),
         )?;
-        print_ca_policy_changes(result.authority_policy_updated, &result.updated, false)?;
+        print_ca_policy_changes(&result, false)?;
         Ok(())
     })
 }
 
+fn ca_policy_current(result: &ClaimsReconciliation) -> bool {
+    !result.authority_policy_updated && result.updated.is_empty() && result.removed.is_empty()
+}
+
 fn print_ca_policy_changes(
-    authority_policy_updated: bool,
-    updated: &[String],
+    result: &ClaimsReconciliation,
     dry_run: bool,
 ) -> grafhome_ca::Result<()> {
-    if !authority_policy_updated && updated.is_empty() {
+    if ca_policy_current(result) {
         outln!("CA policy already current.");
         return Ok(());
     }
+    let (authority_policy_updated, updated) = (result.authority_policy_updated, &result.updated);
     if authority_policy_updated {
         outln!("update\tauthority.policy");
     }
     for name in updated {
         outln!("update\t{name}");
+    }
+    for name in &result.removed {
+        outln!("remove\t{name}");
     }
     let action = if dry_run { "Would apply" } else { "Applied" };
     match (authority_policy_updated, updated.is_empty()) {
@@ -3956,7 +4506,12 @@ fn print_ca_policy_changes(
             "{action} CA authority policy and policy for {} provisioner(s).",
             updated.len()
         ),
-        (false, _) => outln!("{action} CA policy to {} provisioner(s).", updated.len()),
+        (false, false) => outln!("{action} CA policy to {} provisioner(s).", updated.len()),
+        (false, true) => {}
+    }
+    if !result.removed.is_empty() {
+        let action = if dry_run { "Would remove" } else { "Removed" };
+        outln!("{action} {} retired provisioner(s).", result.removed.len());
     }
     Ok(())
 }
@@ -5086,35 +5641,28 @@ fn revoke_user(
         let mut registry = EnrollmentRegistry::load(&registry_path)?;
         let selected = registry.records_for_user(user_name, host);
         let live_enrollments = live_user_enrollments(&ca_json, user_name, host)?;
-        require_registry_coverage(&selected, &live_enrollments)?;
-        let newly_revoked = selected
-            .iter()
-            .filter(|record| record.status() != RecordStatus::Revoked)
-            .count();
-        let timestamp = now_utc()?;
-        let policy_update = prepare_revocation_policy_update(model, &selected, &timestamp, reason)?;
-        let ledger_added = policy_update.added;
-        let (text, removed) = match host {
-            Some(host) => grafhome_ca::runtime_provisioners::remove_exact(
-                &ca_json,
-                &user_provisioner_name(user_name, host),
-            )?,
-            None => grafhome_ca::runtime_provisioners::remove_user(
-                &ca_json,
-                &user_provisioner_prefix(user_name),
-            )?,
-        };
-        policy_update.write()?;
-        activate_revocation_ca_update(
+        let outcome = commit_revocation(
             model,
             &ca_json,
-            &text,
-            !removed.is_empty() || newly_revoked != 0,
+            &registry_path,
+            &mut registry,
+            RevocationScope {
+                selected: &selected,
+                live_enrollments: &live_enrollments,
+                reason,
+            },
+            || match host {
+                Some(host) => grafhome_ca::runtime_provisioners::remove_exact(
+                    &ca_json,
+                    &user_provisioner_name(user_name, host),
+                ),
+                None => grafhome_ca::runtime_provisioners::remove_user(
+                    &ca_json,
+                    &user_provisioner_prefix(user_name),
+                ),
+            },
         )?;
-        if registry.mark_revoked(&selected, &timestamp) != 0 {
-            registry.save(&registry_path)?;
-        }
-        let mut templates = removed;
+        let mut templates = outcome.removed;
         match host {
             Some(host) => templates.push(user_provisioner_name(user_name, host)),
             None => templates.extend(matching_provisioner_templates(model, |name| {
@@ -5124,12 +5672,13 @@ fn revoke_user(
         remove_provisioner_templates(model, &templates)?;
         print_active_revocation_result(
             &format!("user {user_name}"),
-            newly_revoked,
-            ledger_added,
+            outcome.newly_revoked,
+            outcome.ledger_added,
             &model
                 .policy
                 .root
                 .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+            SSH_REVOCATION_NEXT_STEP,
         )
     })
 }
@@ -5153,30 +5702,26 @@ fn revoke_host(
         let mut registry = EnrollmentRegistry::load(&registry_path)?;
         let selected = registry.records_for_host(host_name);
         let live_enrollments = live_host_enrollments(&ca_json, host_name)?;
-        require_registry_coverage(&selected, &live_enrollments)?;
-        let newly_revoked = selected
-            .iter()
-            .filter(|record| record.status() != RecordStatus::Revoked)
-            .count();
-        let timestamp = now_utc()?;
-        let policy_update = prepare_revocation_policy_update(model, &selected, &timestamp, reason)?;
-        let ledger_added = policy_update.added;
-        let (text, removed) = grafhome_ca::runtime_provisioners::remove_host(
-            &ca_json,
-            &provisioner,
-            &user_provisioner_host_suffix(host_name),
-        )?;
-        policy_update.write()?;
-        activate_revocation_ca_update(
+        let outcome = commit_revocation(
             model,
             &ca_json,
-            &text,
-            !removed.is_empty() || newly_revoked != 0,
+            &registry_path,
+            &mut registry,
+            RevocationScope {
+                selected: &selected,
+                live_enrollments: &live_enrollments,
+                reason,
+            },
+            || {
+                grafhome_ca::runtime_provisioners::remove_host(
+                    &ca_json,
+                    host_name,
+                    &provisioner,
+                    &user_provisioner_host_suffix(host_name),
+                )
+            },
         )?;
-        if registry.mark_revoked(&selected, &timestamp) != 0 {
-            registry.save(&registry_path)?;
-        }
-        let mut templates = removed;
+        let mut templates = outcome.removed;
         templates.push(provisioner.clone());
         templates.extend(matching_provisioner_templates(model, |name| {
             parse_user_provisioner_name(name).is_some_and(|(_, host)| host == host_name)
@@ -5184,13 +5729,114 @@ fn revoke_host(
         remove_provisioner_templates(model, &templates)?;
         print_active_revocation_result(
             &format!("host {host_name}"),
-            newly_revoked,
-            ledger_added,
+            outcome.newly_revoked,
+            outcome.ledger_added,
             &model
                 .policy
                 .root
                 .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+            SSH_REVOCATION_NEXT_STEP,
         )
+    })
+}
+
+/// What an SSH revocation still needs: servers read keys from the distributed KRL.
+const SSH_REVOCATION_NEXT_STEP: &str = "run `grafhome-ca apply host` on managed SSH hosts";
+
+fn revoke_x509(
+    model: &SiteModel,
+    host: &str,
+    name: &str,
+    reason: Option<&str>,
+) -> grafhome_ca::Result<()> {
+    validate_explicit_host_identity("x509 revoke.host", host)?;
+    validate_explicit_host_identity("x509 revoke.name", name)?;
+    validate_revocation_reason(reason)?;
+    with_ca_lock(model, || {
+        let ca_json = PathBuf::from(model.deployment.ca_steppath()).join("config/ca.json");
+        let registry_path = enrollment_registry_path(model);
+        let mut registry = EnrollmentRegistry::load(&registry_path)?;
+        let selected = registry.records_for_x509(host, name);
+        let identity = x509_identity(host, name);
+        let provisioner = x509_provisioner_name(host, name);
+        let live_enrollments = live_enrollment_inventory(&ca_json, |item| {
+            (item == provisioner).then(|| identity.clone())
+        })?;
+        let outcome = commit_revocation(
+            model,
+            &ca_json,
+            &registry_path,
+            &mut registry,
+            RevocationScope {
+                selected: &selected,
+                live_enrollments: &live_enrollments,
+                reason,
+            },
+            || grafhome_ca::runtime_provisioners::remove_exact(&ca_json, &provisioner),
+        )?;
+        print_active_revocation_result(
+            &identity,
+            outcome.newly_revoked,
+            outcome.ledger_added,
+            &model
+                .policy
+                .root
+                .join(grafhome_ca::policy::REVOCATIONS_POLICY_PATH),
+            &format!("rerun `grafhome-ca x509 enroll {name}` on {host} to enroll a new key"),
+        )
+    })
+}
+
+/// What one revocation covers.
+struct RevocationScope<'a> {
+    selected: &'a [EnrollmentRecord],
+    live_enrollments: &'a [LiveEnrollment],
+    reason: Option<&'a str>,
+}
+
+struct RevocationOutcome {
+    newly_revoked: usize,
+    ledger_added: LedgerAdditions,
+    removed: Vec<String>,
+}
+
+/// Run the revocation transaction shared by every credential type.
+///
+/// The tracked ledger is written first: if the CA update then fails, a tombstone
+/// exists for a key still live, which fails safe and is repaired by a retry.
+fn commit_revocation(
+    model: &SiteModel,
+    ca_json: &Path,
+    registry_path: &Path,
+    registry: &mut EnrollmentRegistry,
+    scope: RevocationScope<'_>,
+    remove: impl FnOnce() -> grafhome_ca::Result<(String, Vec<String>)>,
+) -> grafhome_ca::Result<RevocationOutcome> {
+    require_registry_coverage(scope.selected, scope.live_enrollments)?;
+    let newly_revoked = scope
+        .selected
+        .iter()
+        .filter(|record| record.status() != RecordStatus::Revoked)
+        .count();
+    let timestamp = now_utc()?;
+    let policy_update =
+        prepare_revocation_policy_update(model, scope.selected, &timestamp, scope.reason)?;
+    let ledger_added = policy_update.added;
+    let (text, removed) = remove()?;
+    policy_update.write()?;
+    activate_revocation_ca_update(
+        model,
+        ca_json,
+        &text,
+        !removed.is_empty() || newly_revoked != 0,
+    )?;
+    if registry.mark_revoked(scope.selected, &timestamp) != 0 {
+        registry.save(registry_path)?;
+    }
+    Ok(RevocationOutcome {
+        newly_revoked,
+        ledger_added,
+        removed,
     })
 }
 
@@ -5220,7 +5866,8 @@ fn live_host_enrollments(ca_json: &Path, host: &str) -> grafhome_ca::Result<Vec<
         {
             return Some(format!("user {user}@{client_host}"));
         }
-        None
+        let (x509_host, name) = parse_x509_provisioner_name(name)?;
+        (x509_host == host).then(|| x509_identity(&x509_host, &name))
     })
 }
 
@@ -5296,17 +5943,40 @@ fn require_registry_coverage(
     Err(grafhome_ca::Error::Validation {
         field: "revoke enrollment".to_owned(),
         message: format!(
-            "live enrollment keys are absent from the CA registry: {}; export them on each target and run `grafhome-ca enrollment import` before revoking",
+            "live enrollment keys are absent from the CA registry: {}; before revoking, export SSH enrollments on each target and run `grafhome-ca enrollment import`, or restore X.509 enrollments from a registry backup",
             missing.join(", ")
         ),
     })
+}
+
+/// Keys newly recorded in the tracked revocation ledger, by credential type.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LedgerAdditions {
+    ssh: usize,
+    x509: usize,
+}
+
+impl LedgerAdditions {
+    fn is_empty(self) -> bool {
+        self.ssh == 0 && self.x509 == 0
+    }
+}
+
+impl std::fmt::Display for LedgerAdditions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.ssh, self.x509) {
+            (ssh, 0) => write!(formatter, "{ssh} SSH keys"),
+            (0, x509) => write!(formatter, "{x509} X.509 keys"),
+            (ssh, x509) => write!(formatter, "{ssh} SSH keys and {x509} X.509 keys"),
+        }
+    }
 }
 
 struct RevocationPolicyUpdate {
     target: PathBuf,
     mode: u32,
     content: Option<Vec<u8>>,
-    added: usize,
+    added: LedgerAdditions,
 }
 
 impl RevocationPolicyUpdate {
@@ -5331,6 +6001,10 @@ impl RevocationPolicyUpdate {
 struct RevocationsFile<'a> {
     format_version: u32,
     ssh_keys: &'a [grafhome_ca::policy::RevokedSshKey],
+    // Rewriting the ledger must carry X.509 tombstones forward, or an SSH revoke
+    // would silently erase them.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    x509_keys: &'a [grafhome_ca::policy::RevokedX509Key],
 }
 
 fn prepare_revocation_policy_update(
@@ -5366,26 +6040,44 @@ fn prepare_revocation_policy_update(
     // The command model is loaded before acquiring the CA lock. Reload the tracked ledger here so
     // serialized revocations cannot overwrite a change committed by an earlier lock holder.
     let mut policy = grafhome_ca::policy::Policy::load(&model.policy.root)?;
-    let mut seen = policy
+    let mut seen_ssh = policy
         .revoked_ssh_keys
         .iter()
         .map(|entry| (entry.is_user(), entry.fingerprint().to_owned()))
         .collect::<BTreeSet<_>>();
-    let original_len = policy.revoked_ssh_keys.len();
+    let mut seen_x509 = policy
+        .revoked_x509_keys
+        .iter()
+        .map(|entry| entry.public_key_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let original_ssh = policy.revoked_ssh_keys.len();
+    let original_x509 = policy.revoked_x509_keys.len();
     for record in records {
-        let entry = record.to_revocation(revoked_at, reason);
-        if seen.insert((entry.is_user(), entry.fingerprint().to_owned())) {
-            policy.revoked_ssh_keys.push(entry);
+        match record.to_revocation(revoked_at, reason) {
+            Revocation::Ssh(entry) => {
+                if seen_ssh.insert((entry.is_user(), entry.fingerprint().to_owned())) {
+                    policy.revoked_ssh_keys.push(entry);
+                }
+            }
+            Revocation::X509(entry) => {
+                if seen_x509.insert(entry.public_key_fingerprint.clone()) {
+                    policy.revoked_x509_keys.push(entry);
+                }
+            }
         }
     }
     policy.validate()?;
-    let added = policy.revoked_ssh_keys.len() - original_len;
-    let content = if added == 0 {
+    let added = LedgerAdditions {
+        ssh: policy.revoked_ssh_keys.len() - original_ssh,
+        x509: policy.revoked_x509_keys.len() - original_x509,
+    };
+    let content = if added.is_empty() {
         None
     } else {
         let text = toml::to_string_pretty(&RevocationsFile {
             format_version: 1,
             ssh_keys: &policy.revoked_ssh_keys,
+            x509_keys: &policy.revoked_x509_keys,
         })
         .map_err(|source| grafhome_ca::Error::Validation {
             field: target.display().to_string(),
@@ -5422,28 +6114,27 @@ fn activate_revocation_ca_update(
 fn print_active_revocation_result(
     identity: &str,
     newly_revoked: usize,
-    ledger_added: usize,
+    ledger_added: LedgerAdditions,
     policy_path: &Path,
+    next_step: &str,
 ) -> grafhome_ca::Result<()> {
-    if newly_revoked == 0 && ledger_added == 0 {
+    if newly_revoked == 0 && ledger_added.is_empty() {
         outln!("{identity} is already revoked or was never enrolled.");
         return Ok(());
     }
     if newly_revoked == 0 {
-        outln!(
-            "Restored active revocation tracking for {identity}: recorded {ledger_added} SSH keys."
-        );
-    } else if ledger_added == 0 {
+        outln!("Restored active revocation tracking for {identity}: recorded {ledger_added}.");
+    } else if ledger_added.is_empty() {
         outln!(
             "Revoked {identity}: future issuance and renewal are disabled; active revocation keys were already recorded."
         );
     } else {
         outln!(
-            "Revoked {identity}: future issuance and renewal are disabled; recorded {ledger_added} SSH keys for active revocation."
+            "Revoked {identity}: future issuance and renewal are disabled; recorded {ledger_added} for active revocation."
         );
     }
     outln!(
-        "Commit and distribute {}, then run `grafhome-ca apply host` on managed SSH hosts.",
+        "Commit and distribute {}, then {next_step}.",
         policy_path.display()
     );
     Ok(())
@@ -6873,6 +7564,55 @@ revoked_at = "2026-07-24T20:14:15Z"
         let content = String::from_utf8(update.content.unwrap()).unwrap();
 
         assert!(content.contains(KEY_ONE));
+        assert!(content.contains(KEY_TWO));
+    }
+
+    #[test]
+    fn revocation_policy_merge_keeps_x509_tombstones() {
+        const KEY_TWO: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw";
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("grafhome-ca");
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config"),
+            &root,
+        );
+        let ledger = root.join("policy/revocations.toml");
+        fs::write(&ledger, "format_version = 1\n").unwrap();
+        let model = grafhome_ca::model::SiteModel::load(&root).unwrap();
+        fs::write(
+            &ledger,
+            r#"format_version = 1
+
+[[x509_keys]]
+host = "edge-host"
+name = "nfs-client"
+public_key_fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+        )
+        .unwrap();
+        let request = grafhome_ca::enrollment::HostRequest::new(
+            "proxy-host",
+            KEY_TWO,
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256", "x": "second-x", "y": "second-y"
+            }),
+        );
+        let record = grafhome_ca::enrollment_registry::EnrollmentRecord::pending_host(
+            &request,
+            "2026-07-24T20:15:15Z",
+        )
+        .unwrap();
+
+        let update =
+            prepare_revocation_policy_update(&model, &[record], "2026-07-24T20:16:15Z", None)
+                .unwrap();
+        let content = String::from_utf8(update.content.unwrap()).unwrap();
+
+        assert!(content.contains("[[x509_keys]]"));
+        assert!(content.contains("nfs-client"));
         assert!(content.contains(KEY_TWO));
     }
 

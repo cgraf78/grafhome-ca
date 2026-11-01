@@ -6,3 +6,9 @@ enrollment = true
 
 [[user_access.alice.logins]]
 unix_account = "alice"
+
+[x509_certs.nfs-client]
+role = "client"
+names = ["edge-host.example.test"]
+ttl = "24h"
+ca_endpoint = "ca_origin"

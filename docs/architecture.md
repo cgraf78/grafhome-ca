@@ -83,6 +83,11 @@ finite renewal claims. The broad enrollment issuers compare the requested SSH
 key with a signed custom token claim, so initial issuance is key-bound too.
 Authority-wide SSH allow-lists provide a final policy check over all configured
 user and host principals.
+Each enrolled X.509 certificate has its own JWK provisioner. Its template emits
+only policy values and refuses any CSR key other than the enrolled one, so a
+stolen renewal JWK yields nothing without the certificate key. Renewal is off
+because `/renew` and `/rekey` would otherwise accept any unexpired certificate,
+bypassing the JWK and surviving revocation.
 Routine user enrollment grants retain document version 1. An exceptional
 effectively-infinite grant uses version 2, which makes pre-feature clients fail
 before issuance. A compatible client preserves that initial certificate and

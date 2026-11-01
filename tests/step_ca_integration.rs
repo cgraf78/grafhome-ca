@@ -1697,3 +1697,716 @@ fn run_fails(command: &mut Command) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Assert the CA itself refused `command`, in the words of `refusal`.
+///
+/// A bare non-zero exit also covers CLI usage errors that never reach the CA, so
+/// that alone cannot show a control works.
+fn run_refused_with(command: &mut Command, refusal: &str) {
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(refusal),
+        "expected a CA refusal containing {refusal:?}, status {:?}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
+/// Assert the CA refused `command` for lack of authorization.
+fn run_refused(command: &mut Command) {
+    run_refused_with(command, "lacked necessary authorization");
+}
+
+const X509_NAME: &str = "edge-host.example.test";
+const FOREIGN_NAME: &str = "other.example.test";
+
+/// One throwaway `step-ca` holding a single enrolled X.509 provisioner.
+struct X509Ca {
+    temp: tempfile::TempDir,
+    address: String,
+    provisioner: String,
+    child: StepCaChild,
+}
+
+/// Start a CA for `role`, or return `None` when the suite is not requested.
+fn x509_ca(role: grafhome_ca::policy::X509Role) -> Option<X509Ca> {
+    x509_ca_for(role, &[X509_NAME])
+}
+
+/// Start a CA whose provisioner pins `names`, or return `None` likewise.
+fn x509_ca_for(role: grafhome_ca::policy::X509Role, names: &[&str]) -> Option<X509Ca> {
+    if std::env::var("GRAFHOME_CA_RUN_STEP_CA_INTEGRATION").as_deref() != Ok("1") {
+        let message =
+            "skipping step-ca integration test; set GRAFHOME_CA_RUN_STEP_CA_INTEGRATION=1";
+        if std::env::var("GRAFHOME_CA_REQUIRE_STEP_CA_INTEGRATION").as_deref() == Ok("1") {
+            panic!("{message}");
+        }
+        eprintln!("{message}");
+        return None;
+    }
+    assert_command_available("step");
+    assert_command_available("step-ca");
+
+    let temp = tempdir().unwrap();
+    let password = temp.path().join("password");
+    std::fs::write(&password, ["test", "only", "passphrase"].join("-")).unwrap();
+    let steppath = temp.path().join("step");
+    run(Command::new("step")
+        .env("STEPPATH", &steppath)
+        .args(["ca", "init", "--ssh", "--deployment-type", "standalone"])
+        .args(["--name", "grafhome-ca-test", "--dns", "127.0.0.1"])
+        .args(["--dns", "localhost"])
+        .args(["--address", "127.0.0.1:0", "--provisioner", "bootstrap"])
+        .arg("--password-file")
+        .arg(&password)
+        .arg("--provisioner-password-file")
+        .arg(&password));
+    run(Command::new("step")
+        .args(["crypto", "keypair"])
+        .arg(temp.path().join("enrolled.pub"))
+        .arg(temp.path().join("enrolled.key"))
+        .args([
+            "--kty",
+            "EC",
+            "--crv",
+            "P-256",
+            "--no-password",
+            "--insecure",
+        ]));
+    run(Command::new("step")
+        .args(["crypto", "jwk", "create"])
+        .arg(temp.path().join("renewal.pub.json"))
+        .arg(temp.path().join("renewal.priv.json"))
+        .arg("--password-file")
+        .arg(&password));
+
+    let cert = grafhome_ca::policy::X509Cert {
+        host: "edge-host".to_owned(),
+        name: "nfs-client".to_owned(),
+        role,
+        names: names.iter().map(|name| (*name).to_owned()).collect(),
+        ttl: "24h".to_owned(),
+        ca_endpoint: "ca_origin".to_owned(),
+        after_renew: Vec::new(),
+        status: grafhome_ca::policy::Status::Active,
+    };
+    let key: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("renewal.pub.json")).unwrap())
+            .unwrap();
+    let public_key = std::fs::read_to_string(temp.path().join("enrolled.pub")).unwrap();
+    let desired = grafhome_ca::x509::x509_provisioner(key, &cert, &public_key).unwrap();
+    let config_path = steppath.join("config/ca.json");
+    let text = grafhome_ca::runtime_provisioners::reconcile_x509(&config_path, desired).unwrap();
+    let mut config: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let address = format!("127.0.0.1:{}", free_port());
+    config["address"] = serde_json::json!(address);
+    // These SSH templates resolve under `STEPPATH`, and `start_step_ca` runs without it.
+    config.as_object_mut().unwrap().remove("templates");
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let mut child = start_step_ca(&config_path, &password);
+    wait_for_health(child.as_mut(), &address, &steppath);
+    Some(X509Ca {
+        address,
+        provisioner: grafhome_ca::x509::x509_provisioner_name(&cert.host, &cert.name),
+        child,
+        temp,
+    })
+}
+
+impl X509Ca {
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.temp.path().join(name)
+    }
+
+    fn url(&self) -> String {
+        format!("https://{}", self.address)
+    }
+
+    /// Point `command` at this CA.
+    fn with_ca<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        command
+            .env("STEPPATH", self.path("step"))
+            .arg("--ca-url")
+            .arg(self.url())
+            .arg("--root")
+            .arg(self.path("step/certs/root_ca.crt"))
+    }
+
+    fn token(&self, subject: &str) -> String {
+        let mut command = Command::new("step");
+        command
+            .args(["ca", "token", subject, "--san", subject])
+            .arg("--issuer")
+            .arg(&self.provisioner)
+            .arg("--key")
+            .arg(self.path("renewal.priv.json"))
+            .arg("--password-file")
+            .arg(self.path("password"));
+        token(self.with_ca(&mut command)).trim().to_owned()
+    }
+
+    /// Create a CSR for `key` carrying `extra` as its step CSR template fields.
+    fn csr(&self, subject: &str, key: &str, extra: serde_json::Value) -> std::path::PathBuf {
+        let mut fields = serde_json::json!({
+            "subject": {"commonName": subject},
+            "sans": [{"type": "dns", "value": subject}],
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            fields[name] = value.clone();
+        }
+        let template = self.path("csr.tpl");
+        std::fs::write(&template, fields.to_string()).unwrap();
+        let csr = self.path("request.csr");
+        run(Command::new("step")
+            .args(["certificate", "create", subject])
+            .arg(&csr)
+            .arg("--csr")
+            .arg("--key")
+            .arg(self.path(key))
+            .arg("--template")
+            .arg(&template)
+            .args(["--no-password", "--insecure", "--force"]));
+        csr
+    }
+
+    fn sign_command(&self, csr: &std::path::Path, subject: &str) -> Command {
+        let mut command = Command::new("step");
+        command
+            .args(["ca", "sign"])
+            .arg(csr)
+            .arg(self.path("issued.crt"))
+            .arg("--token")
+            .arg(self.token(subject))
+            .arg("--force");
+        self.with_ca(&mut command);
+        command
+    }
+
+    /// Issue a certificate and return `step certificate inspect`'s description.
+    fn issue(&self, csr: &std::path::Path, subject: &str) -> serde_json::Value {
+        run(&mut self.sign_command(csr, subject));
+        serde_json::from_str(&stdout(
+            Command::new("step")
+                .args(["certificate", "inspect", "--format", "json"])
+                .arg(self.path("issued.crt")),
+        ))
+        .unwrap()
+    }
+}
+
+/// Assert the issued certificate says exactly what the template pins.
+fn assert_pinned(certificate: &serde_json::Value, usage: &str) {
+    assert_eq!(
+        certificate["subject"]["common_name"],
+        serde_json::json!([X509_NAME])
+    );
+    assert_eq!(certificate["names"], serde_json::json!([X509_NAME]));
+    let extended = certificate["extensions"]["extended_key_usage"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        extended.keys().collect::<Vec<_>>(),
+        [usage],
+        "expected a single EKU"
+    );
+    assert_eq!(
+        certificate["extensions"]["key_usage"]["digital_signature"],
+        true
+    );
+    assert!(certificate["extensions"].get("basic_constraints").is_none());
+}
+
+#[test]
+fn jwk_issues_only_pinned_names() {
+    use grafhome_ca::policy::X509Role;
+    let Some(ca) = x509_ca(X509Role::Client) else {
+        return;
+    };
+    let expected = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+    assert_pinned(&ca.issue(&expected, X509_NAME), "client_auth");
+
+    // A valid token for a foreign name still yields only the pinned one.
+    let foreign = ca.csr(FOREIGN_NAME, "enrolled.key", serde_json::json!({}));
+    let certificate = ca.issue(&foreign, FOREIGN_NAME);
+    assert_pinned(&certificate, "client_auth");
+    assert!(!certificate.to_string().contains(FOREIGN_NAME));
+}
+
+#[test]
+fn jwk_issues_only_declared_eku() {
+    use grafhome_ca::policy::X509Role;
+    for (role, usage) in [
+        (X509Role::Server, "server_auth"),
+        (X509Role::Client, "client_auth"),
+    ] {
+        let Some(ca) = x509_ca(role) else {
+            return;
+        };
+        let csr = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+        assert_pinned(&ca.issue(&csr, X509_NAME), usage);
+    }
+}
+
+#[test]
+fn jwk_refuses_unenrolled_public_key() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    // The guard names an EC key it rejects. An Ed25519 key has no curve for it to
+    // read, so the template fails in execution, which step-ca reports as a 500.
+    let mismatch = "certificate public key does not match enrollment";
+    for (kty, curve, refusal) in [
+        ("EC", "P-256", mismatch),
+        ("EC", "P-384", mismatch),
+        ("OKP", "Ed25519", "Internal Server Error"),
+    ] {
+        run(Command::new("step")
+            .args(["crypto", "keypair"])
+            .arg(ca.path("other.pub"))
+            .arg(ca.path("other.key"))
+            .args(["--kty", kty, "--crv", curve])
+            .args(["--no-password", "--insecure", "--force"]));
+        let csr = ca.csr(X509_NAME, "other.key", serde_json::json!({}));
+        run_refused_with(&mut ca.sign_command(&csr, X509_NAME), refusal);
+        assert!(!ca.path("issued.crt").exists(), "{curve} was issued");
+    }
+
+    // That 500 alone could mean a broken template, so show this one still issues.
+    let enrolled = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+    assert_pinned(&ca.issue(&enrolled, X509_NAME), "client_auth");
+}
+
+#[test]
+fn csr_extensions_are_ignored() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Server) else {
+        return;
+    };
+    let csr = ca.csr(
+        X509_NAME,
+        "enrolled.key",
+        serde_json::json!({
+            "extKeyUsage": ["serverAuth", "clientAuth", "codeSigning"],
+            "basicConstraints": {"isCA": true, "maxPathLen": 0},
+            "extensions": [{"id": "1.2.3.4", "value": "AQID"}],
+        }),
+    );
+
+    let certificate = ca.issue(&csr, X509_NAME);
+
+    assert_pinned(&certificate, "server_auth");
+    assert!(!certificate.to_string().contains("1.2.3.4"));
+}
+
+#[test]
+fn x509_provisioner_refuses_ssh_sign() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let mut command = Command::new("step");
+    command
+        .args(["ca", "token", "alice", "--ssh", "--principal", "alice"])
+        .args(["--not-after", "5m", "--cert-not-after", "1h"])
+        .arg("--issuer")
+        .arg(&ca.provisioner)
+        .arg("--key")
+        .arg(ca.path("renewal.priv.json"))
+        .arg("--password-file")
+        .arg(ca.path("password"));
+    let signing_token = token(ca.with_ca(&mut command));
+    let ssh_key = ca.path("ssh-key");
+    run(Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-f"])
+        .arg(&ssh_key));
+
+    let mut sign = Command::new("step");
+    sign.args(["ssh", "certificate", "alice"])
+        .arg(ssh_key.with_extension("pub"))
+        .args([
+            "--no-agent",
+            "--sign",
+            "--token",
+            signing_token.trim(),
+            "--force",
+        ]);
+    ca.with_ca(&mut sign);
+    run_refused(&mut sign);
+
+    assert!(!ca.path("ssh-key-cert.pub").exists());
+}
+
+#[test]
+fn renew_endpoint_refused() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let csr = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+    ca.issue(&csr, X509_NAME);
+    let issued = std::fs::read(ca.path("issued.crt")).unwrap();
+
+    let mut renew = Command::new("step");
+    renew.args(["ca", "renew", "--force", "--out"]);
+    renew.arg(ca.path("renewed.crt"));
+    ca.with_ca(&mut renew);
+    renew
+        .arg(ca.path("issued.crt"))
+        .arg(ca.path("enrolled.key"));
+    run_refused(&mut renew);
+
+    let mut rekey = Command::new("step");
+    rekey.args(["ca", "rekey", "--force", "--out-cert"]);
+    rekey.arg(ca.path("rekeyed.crt")).arg("--out-key");
+    rekey.arg(ca.path("rekeyed.key"));
+    ca.with_ca(&mut rekey);
+    rekey
+        .arg(ca.path("issued.crt"))
+        .arg(ca.path("enrolled.key"));
+    run_refused(&mut rekey);
+
+    assert_eq!(std::fs::read(ca.path("issued.crt")).unwrap(), issued);
+    assert!(!ca.path("renewed.crt").exists());
+    assert!(!ca.path("rekeyed.crt").exists());
+    assert!(!ca.path("rekeyed.key").exists());
+}
+
+/// The `grafhome-ca` CLI on a host enrolled with an [`X509Ca`].
+struct X509Host<'a> {
+    ca: &'a X509Ca,
+    config_root: std::path::PathBuf,
+    bin: std::path::PathBuf,
+    certificate: std::path::PathBuf,
+    key: std::path::PathBuf,
+}
+
+/// Lay the CA's enrolled material out as `x509 enroll` would, and point the
+/// policy's `ca_origin` at the throwaway CA. Everything stays in the CA's temp
+/// directory, which is also what lets the non-root CLI run at all.
+fn x509_host<'a>(ca: &'a X509Ca, names: &[&str]) -> X509Host<'a> {
+    let config_root = prepare_integration_config(ca.temp.path(), &ca.path("password"));
+    let port = ca.address.rsplit_once(':').unwrap().1;
+    let policy_path = config_root.join("policy/ca.toml");
+    let policy = std::fs::read_to_string(&policy_path)
+        .unwrap()
+        .replacen(
+            "dns_name = \"ca-origin.example.test\"",
+            "dns_name = \"localhost\"",
+            1,
+        )
+        .replacen("address = \"198.51.100.20\"", "address = \"127.0.0.1\"", 1)
+        .replacen("port = 8443", &format!("port = {port}"), 1);
+    std::fs::write(policy_path, policy).unwrap();
+    let edge_path = config_root.join("policy/hosts/edge-host.toml");
+    let edge = std::fs::read_to_string(&edge_path).unwrap().replacen(
+        &format!("names = [\"{X509_NAME}\"]"),
+        &format!("names = {names:?}"),
+        1,
+    );
+    std::fs::write(edge_path, edge).unwrap();
+
+    let x509_dir = ca.path("x509");
+    let deployment_path = config_root.join("config/deployment.env");
+    let mut deployment = std::fs::read_to_string(&deployment_path).unwrap();
+    deployment.push_str(&format!("GRAFHOME_CA_X509_DIR={}\n", x509_dir.display()));
+    std::fs::write(deployment_path, deployment).unwrap();
+
+    let server_step = ca.path("server-step");
+    let certificate_dir = x509_dir.join("nfs-client");
+    let credential_dir = server_step.join("secrets/hosts/edge-host/x509/nfs-client");
+    std::fs::create_dir_all(server_step.join("certs")).unwrap();
+    std::fs::create_dir_all(&certificate_dir).unwrap();
+    std::fs::create_dir_all(&credential_dir).unwrap();
+    std::fs::copy(
+        ca.path("step/certs/root_ca.crt"),
+        server_step.join("certs/root_ca.crt"),
+    )
+    .unwrap();
+    let key = certificate_dir.join("key.pem");
+    for (source, destination) in [
+        ("enrolled.key", key.clone()),
+        (
+            "renewal.pub.json",
+            credential_dir.join("provisioner.pub.json"),
+        ),
+        (
+            "renewal.priv.json",
+            credential_dir.join("provisioner.priv.json"),
+        ),
+        ("password", credential_dir.join("renewal-password")),
+    ] {
+        std::fs::copy(ca.path(source), destination).unwrap();
+    }
+    X509Host {
+        ca,
+        bin: ca.path("bin"),
+        config_root,
+        certificate: certificate_dir.join("cert.pem"),
+        key,
+    }
+}
+
+impl X509Host<'_> {
+    fn command(&self, verb: &str, flags: &[&str]) -> Command {
+        let path = std::env::var_os("PATH").unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(self.bin.clone()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_grafhome-ca"));
+        command
+            .args(["x509", verb, "nfs-client", "--host", "edge-host"])
+            .args(flags)
+            .arg("--config-root")
+            .arg(&self.config_root)
+            .env("PATH", path)
+            .env("HOME", self.ca.temp.path());
+        command
+    }
+
+    fn renew(&self) {
+        run(&mut self.command("renew", &[]));
+    }
+
+    /// The leaf as `step certificate inspect` describes it.
+    fn leaf(&self) -> serde_json::Value {
+        serde_json::from_str(&stdout(
+            Command::new("step")
+                .args(["certificate", "inspect", "--format", "json"])
+                .arg(&self.certificate),
+        ))
+        .unwrap()
+    }
+
+    /// Replace the live certificate with a real one from the same intermediate,
+    /// with the validity given. `step-ca` will not issue one that has expired, and
+    /// the renewal is what is under test here, not how this one was made.
+    fn seed_certificate(&self, not_before: &str, not_after: &str) {
+        run(Command::new("step")
+            .args(["certificate", "create", X509_NAME])
+            .arg(&self.certificate)
+            .args(["--profile", "leaf", "--san", X509_NAME])
+            .arg("--key")
+            .arg(&self.key)
+            .arg("--ca")
+            .arg(self.ca.path("step/certs/intermediate_ca.crt"))
+            .arg("--ca-key")
+            .arg(self.ca.path("step/secrets/intermediate_ca_key"))
+            .arg("--ca-password-file")
+            .arg(self.ca.path("password"))
+            .arg(format!("--not-before={not_before}"))
+            .arg(format!("--not-after={not_after}"))
+            .args(["--bundle", "--no-password", "--insecure", "--force"]));
+    }
+
+    /// Assert the live chain verifies against a truststore holding only the root.
+    fn assert_verifies_against_root(&self, name: &str) {
+        let root = self.ca.path("step/certs/root_ca.crt");
+        assert_eq!(
+            std::fs::read_to_string(&root)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count(),
+            1,
+            "the truststore must hold only the root"
+        );
+        run(Command::new("step")
+            .args(["certificate", "verify"])
+            .arg(&self.certificate)
+            .arg("--roots")
+            .arg(&root)
+            .args(["--host", name]));
+    }
+}
+
+/// Run `command`, expecting it to fail, and return what it printed.
+fn failure_output(command: &mut Command) -> (String, String) {
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+#[test]
+fn x509_renew_publishes_leaf_plus_intermediate() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let host = x509_host(&ca, &[X509_NAME]);
+    let key = std::fs::read(&host.key).unwrap();
+
+    host.renew();
+
+    let published = std::fs::read_to_string(&host.certificate).unwrap();
+    assert_eq!(published.matches("BEGIN CERTIFICATE").count(), 2);
+    assert_pinned(&host.leaf(), "client_auth");
+    assert_eq!(std::fs::read(&host.key).unwrap(), key);
+    host.assert_verifies_against_root(X509_NAME);
+
+    // The intermediate is what makes that work: the leaf alone does not verify.
+    let end = "-----END CERTIFICATE-----\n";
+    let leaf = &published[..published.find(end).unwrap() + end.len()];
+    let leaf_only = ca.path("leaf-only.pem");
+    std::fs::write(&leaf_only, leaf).unwrap();
+    run_fails(
+        Command::new("step")
+            .args(["certificate", "verify"])
+            .arg(&leaf_only)
+            .arg("--roots")
+            .arg(ca.path("step/certs/root_ca.crt")),
+    );
+
+    // A second run finds nothing to do.
+    host.renew();
+    assert_eq!(
+        std::fs::read_to_string(&host.certificate).unwrap(),
+        published
+    );
+}
+
+#[test]
+fn x509_renew_replaces_a_due_certificate_with_the_same_key() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Server) else {
+        return;
+    };
+    let host = x509_host(&ca, &[X509_NAME]);
+    let edge_path = host.config_root.join("policy/hosts/edge-host.toml");
+    let edge = std::fs::read_to_string(&edge_path).unwrap().replacen(
+        "role = \"client\"",
+        "role = \"server\"",
+        1,
+    );
+    std::fs::write(edge_path, edge).unwrap();
+    let key = std::fs::read(&host.key).unwrap();
+    host.seed_certificate("-1h", "4h");
+    let due = host.leaf();
+
+    host.renew();
+
+    let renewed = host.leaf();
+    assert_ne!(renewed["serial_number"], due["serial_number"]);
+    // `step-ca` backdates each certificate slightly, so this is the full lifetime.
+    assert!(renewed["validity"]["length"].as_u64().unwrap() >= 24 * 3600);
+    assert_pinned(&renewed, "server_auth");
+    assert_eq!(
+        renewed["subject_key_info"]["fingerprint_sha256"],
+        due["subject_key_info"]["fingerprint_sha256"]
+    );
+    assert_eq!(std::fs::read(&host.key).unwrap(), key);
+    host.assert_verifies_against_root(X509_NAME);
+}
+
+#[test]
+fn x509_renew_recovers_an_expired_certificate() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let host = x509_host(&ca, &[X509_NAME]);
+    host.seed_certificate("-2h", "-1h");
+    run_fails(
+        Command::new("step")
+            .args(["certificate", "verify"])
+            .arg(&host.certificate)
+            .arg("--roots")
+            .arg(ca.path("step/certs/root_ca.crt")),
+    );
+
+    host.renew();
+
+    assert_pinned(&host.leaf(), "client_auth");
+    host.assert_verifies_against_root(X509_NAME);
+}
+
+#[test]
+fn x509_status_reports_real_certificates() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let host = x509_host(&ca, &[X509_NAME]);
+
+    let (missing, _) = failure_output(&mut host.command("status", &["--quiet"]));
+    assert!(missing.contains("missing"), "{missing}");
+
+    host.seed_certificate("-2h", "-1h");
+    let (expired, _) = failure_output(&mut host.command("status", &["--quiet"]));
+    assert!(expired.contains("expired"), "{expired}");
+
+    host.seed_certificate("-1h", "7h");
+    let (expiring, _) = failure_output(&mut host.command("status", &["--quiet"]));
+    assert!(expiring.contains("expires"), "{expiring}");
+
+    host.renew();
+    assert_eq!(stdout(&mut host.command("status", &["--quiet"])), "");
+    assert!(stdout(&mut host.command("status", &[])).contains("valid until"));
+
+    // A certificate for some other key cannot complete a handshake.
+    run(Command::new("step")
+        .args(["crypto", "keypair"])
+        .arg(ca.path("other.pub"))
+        .arg(ca.path("other.key"))
+        .args(["--kty", "EC", "--curve", "P-256"])
+        .args(["--no-password", "--insecure"]));
+    std::fs::copy(ca.path("other.key"), &host.key).unwrap();
+    let (mismatched, _) = failure_output(&mut host.command("status", &["--quiet"]));
+    assert!(mismatched.contains("does not match"), "{mismatched}");
+}
+
+#[test]
+fn x509_renew_issues_every_declared_name() {
+    const SECOND_NAME: &str = "edge-alias.example.test";
+    let names = [X509_NAME, SECOND_NAME];
+    let Some(ca) = x509_ca_for(grafhome_ca::policy::X509Role::Client, &names) else {
+        return;
+    };
+    let host = x509_host(&ca, &names);
+
+    host.renew();
+
+    let leaf = host.leaf();
+    assert_eq!(
+        leaf["subject"]["common_name"],
+        serde_json::json!([X509_NAME])
+    );
+    let mut issued = leaf["extensions"]["subject_alt_name"]["dns_names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap())
+        .collect::<Vec<_>>();
+    issued.sort_unstable();
+    assert_eq!(issued, [SECOND_NAME, X509_NAME]);
+    host.assert_verifies_against_root(SECOND_NAME);
+}
+
+#[test]
+fn x509_if_reachable_splits_on_certificate_state_with_the_ca_down() {
+    let Some(mut ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    ca.child.as_mut().kill().unwrap();
+    ca.child.as_mut().wait().unwrap();
+    let host = x509_host(&ca, &[X509_NAME]);
+    let flags = ["--if-enrolled", "--if-reachable", "--quiet"];
+
+    // Missing, then expired: the boot unit must keep looping, and cron stay quiet.
+    assert_eq!(
+        failure_output(&mut host.command("renew", &flags)),
+        (String::new(), String::new())
+    );
+    host.seed_certificate("-2h", "-1h");
+    assert_eq!(
+        failure_output(&mut host.command("renew", &flags)),
+        (String::new(), String::new())
+    );
+
+    // Due but unexpired: a CA outage must not hold up mounts.
+    host.seed_certificate("-1h", "4h");
+    let seeded = std::fs::read(&host.certificate).unwrap();
+    assert_eq!(stdout(&mut host.command("renew", &flags)), "");
+    assert_eq!(std::fs::read(&host.certificate).unwrap(), seeded);
+}
