@@ -10743,22 +10743,35 @@ fn stalled_step_times_out() {
     // The whole process group goes, so nothing keeps talking to the CA.
     let stalled = fs::read_to_string(format!("{}.stalled", fixture.log.display())).unwrap();
     let deadline = std::time::Instant::now() + X509_TEST_DEADLINE;
-    loop {
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &stalled])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        if !alive {
-            break;
-        }
+    while process_running(&stalled) {
         assert!(
             std::time::Instant::now() < deadline,
-            "stalled child {stalled} survived"
+            "stalled child {stalled} survived: {}",
+            fs::read_to_string(format!("/proc/{}/stat", stalled.trim())).unwrap_or_default()
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// Whether `pid` is still executing.
+///
+/// A zombie counts as gone: it has exited, and CI's containers have no init to reap
+/// an orphan, so a signal probe alone would report it alive forever. This uses no
+/// `kill` or `ps` binary because those containers do not all have one.
+#[cfg(unix)]
+fn process_running(pid: &str) -> bool {
+    let id: i32 = pid.trim().parse().unwrap();
+    let pid = rustix::process::Pid::from_raw(id).unwrap();
+    if rustix::process::test_kill_process(pid).is_err() {
+        return false;
+    }
+    // The state follows the parenthesised command name, which may hold spaces. With
+    // no procfs, as on macOS, the signal probe above is the whole answer.
+    let stat = fs::read_to_string(format!("/proc/{id}/stat")).unwrap_or_default();
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.chars().next());
+    !matches!(state, Some('Z' | 'X'))
 }
 
 #[cfg(unix)]
