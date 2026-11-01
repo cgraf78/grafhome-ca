@@ -93,6 +93,18 @@ fn path_candidates_in(name: &str, path: Option<&OsStr>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Resolve a program named by policy for execution in a privileged context.
+///
+/// The bar is the one `step` itself must clear: the canonical file and every
+/// ancestor must be safe from other users. Run the returned path, not `path`,
+/// so a validated alias cannot be swapped.
+pub fn trusted_program(path: &Path) -> Result<PathBuf> {
+    trusted_executable(path)?.ok_or_else(|| Error::Validation {
+        field: path.display().to_string(),
+        message: "program is missing, or writable by another user".to_owned(),
+    })
+}
+
 #[cfg(unix)]
 fn trusted_executable(path: &Path) -> Result<Option<PathBuf>> {
     let boundary = android_executable_boundary();

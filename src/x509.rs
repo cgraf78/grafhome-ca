@@ -6,13 +6,23 @@
 //! Smallstep's `/renew` and `/rekey`, which would otherwise accept any unexpired
 //! certificate without the JWK. Smallstep stays the crypto boundary: this module
 //! only produces its configuration and checks a key's fixed-format encoding.
+//!
+//! Host-side renewal and status also live here. Every fact about a certificate
+//! comes from `step certificate inspect`, and each `step` call and lock wait is
+//! bounded, because boot units and cron wait on them.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
@@ -20,11 +30,14 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::enrollment::{VERSION, decode_identity, encode_identity, validate_header};
 use crate::enrollment_registry::canonical_jwk;
 use crate::error::{Error, Result};
-use crate::policy::{Policy, X509Cert, X509Role};
+use crate::executable::trusted_program;
+use crate::policy::{Policy, X509Cert, X509Role, step_duration};
 use crate::runtime_provisioners::validate_public_jwk;
 
 const PROVISIONER_PREFIX: &str = "grafhome-x509-";
@@ -48,6 +61,23 @@ const P256_SPKI_PREFIX: [u8; 27] = [
 ];
 const P256_COORDINATE_LEN: usize = 32;
 const P256_SPKI_LEN: usize = P256_SPKI_PREFIX.len() + 2 * P256_COORDINATE_LEN;
+
+/// Mode of a published `cert.pem`, which holds nothing secret.
+#[cfg(unix)]
+const CERTIFICATE_MODE: u32 = 0o644;
+const STEP_TIMEOUT_ENV: &str = "GRAFHOME_CA_X509_STEP_TIMEOUT_SECS";
+const LOCK_TIMEOUT_ENV: &str = "GRAFHOME_CA_X509_LOCK_TIMEOUT_SECS";
+/// One `step` call or `after_renew` hook. A signature is one CA round trip, so
+/// this only has to outlast a slow network, and a boot unit simply retries.
+const STEP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Long enough for a holder to finish a normal renewal.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a timed-out child gets to exit after `SIGTERM`.
+const TERMINATE_GRACE: Duration = Duration::from_secs(2);
+/// How long to wait for output after a child exits. A daemon the child left
+/// behind can hold its pipes open forever, and must not extend the bound.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// Return the collision-free provisioner name for one host's certificate.
 #[must_use]
@@ -144,6 +174,14 @@ impl CertificateKey {
             "SHA256:{}",
             STANDARD_NO_PAD.encode(Sha256::digest(&self.der))
         )
+    }
+
+    /// Lowercase hex SHA-256 of the DER key, as `step certificate inspect` prints it.
+    fn spki_hex(&self) -> String {
+        Sha256::digest(&self.der)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     fn coordinate(&self, index: usize) -> String {
@@ -428,6 +466,8 @@ pub struct X509Paths {
     pub private_jwk: PathBuf,
     /// Password protecting the renewal JWK.
     pub password: PathBuf,
+    /// Live certificate: the leaf followed by its intermediate.
+    pub cert: PathBuf,
     /// Live certificate private key.
     pub key: PathBuf,
     /// Enrolled replacement key, until a renewal signs it and renames it over `key`.
@@ -449,10 +489,18 @@ impl X509Paths {
             private_jwk: credential_dir.join("provisioner.priv.json"),
             password: credential_dir.join("renewal-password"),
             credential_dir,
+            cert: key_dir.join("cert.pem"),
             key: key_dir.join("key.pem"),
             pending_key: key_dir.join("key.pem.pending"),
             lock: credentials.join(format!("{name}.lock")),
         }
+    }
+
+    /// Whether a renewal credential exists, complete or not. A partial one counts,
+    /// so renewal reports it rather than skipping it as not enrolled.
+    #[must_use]
+    pub fn has_credential(&self) -> bool {
+        self.private_jwk.exists() || self.password.exists()
     }
 
     /// The key an enrollment covers: the pending key if one is staged, else the live key.
@@ -516,7 +564,8 @@ pub fn prepare_enrollment(
     Ok(request)
 }
 
-fn lock_material(path: &Path) -> Result<File> {
+/// Take the material lock if it is free. `None` means another run holds it.
+fn try_lock_material(path: &Path) -> Result<Option<File>> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -524,9 +573,48 @@ fn lock_material(path: &Path) -> Result<File> {
     let file = options
         .open(path)
         .map_err(|source| Error::io(path, source))?;
-    file.lock_exclusive()
-        .map_err(|source| Error::io(path, source))?;
-    Ok(file)
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(source) => Err(Error::io(path, source)),
+    }
+}
+
+/// Wait for the material lock, for no longer than the lock timeout.
+///
+/// `flock` has no timeout of its own, so this polls: a holder stuck in a kernel
+/// wait must not be able to hold a boot unit here with it.
+fn lock_material(path: &Path) -> Result<File> {
+    let timeout = timeout_from(LOCK_TIMEOUT_ENV, LOCK_TIMEOUT)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(file) = try_lock_material(path)? {
+            return Ok(file);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Validation {
+                field: path.display().to_string(),
+                message: format!("timed out after {timeout:?} waiting for the lock"),
+            });
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Read a timeout override, refusing a value that would not be a bound.
+fn timeout_from(variable: &str, default: Duration) -> Result<Duration> {
+    let Some(value) = std::env::var_os(variable) else {
+        return Ok(default);
+    };
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| Error::Validation {
+            field: variable.to_owned(),
+            message: "must be a positive whole number of seconds".to_owned(),
+        })
 }
 
 fn key_is_revoked(policy: &Policy, key: &CertificateKey) -> bool {
@@ -681,22 +769,118 @@ fn public_key_of(step_bin: &Path, private_key: &Path) -> Result<CertificateKey> 
 
 /// Run `step`, keeping its output out of ours except for a failure's stderr.
 fn run_step(command: &mut Command) -> Result<Vec<u8>> {
-    let program = command.get_program().to_owned();
-    let output = command
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| Error::io(Path::new(&program), source))?;
+    run_step_redacted(command, None)
+}
+
+/// [`run_step`], removing a secret from any failure text.
+fn run_step_redacted(command: &mut Command, secret: Option<&str>) -> Result<Vec<u8>> {
+    let output = run_bounded(command, timeout_from(STEP_TIMEOUT_ENV, STEP_TIMEOUT)?)?;
     if output.status.success() {
         return Ok(output.stdout);
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = match secret {
+        Some(secret) => stderr.replace(secret, "[redacted]"),
+        None => stderr.into_owned(),
+    };
     Err(Error::Validation {
         field: "step".to_owned(),
-        message: format!(
-            "{:?} failed: {}",
-            command.get_args().take(3).collect::<Vec<_>>(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
+        message: format!("{:?} failed: {}", leading_args(command), stderr.trim()),
     })
+}
+
+/// The arguments that name a `step` subcommand. Later ones can hold a token.
+fn leading_args(command: &Command) -> Vec<&std::ffi::OsStr> {
+    command.get_args().take(3).collect()
+}
+
+/// A child that exited within its bound.
+struct Finished {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run a command for at most `timeout`, in its own process group.
+///
+/// The group lets a timeout reach whatever the command started, which would
+/// otherwise keep running and hold the output pipes open. Only a timeout signals
+/// it: a daemon a hook started on purpose must outlive a successful hook.
+fn run_bounded(command: &mut Command, timeout: Duration) -> Result<Finished> {
+    #[cfg(unix)]
+    command.process_group(0);
+    let program = OsString::from(command.get_program());
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::io(Path::new(&program), source))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    loop {
+        let finished = child
+            .try_wait()
+            .map_err(|source| Error::io(Path::new(&program), source));
+        match finished {
+            Ok(Some(status)) => {
+                return Ok(Finished {
+                    status,
+                    stdout: stdout.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
+                    stderr: stderr.recv_timeout(DRAIN_GRACE).unwrap_or_default(),
+                });
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            Ok(None) => {
+                terminate(&mut child);
+                return Err(Error::Validation {
+                    field: "step".to_owned(),
+                    message: format!("{:?} timed out after {timeout:?}", leading_args(command)),
+                });
+            }
+            Err(error) => {
+                terminate(&mut child);
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Collect a pipe on its own thread, so a full pipe cannot stall the child.
+fn drain(source: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        if let Some(mut source) = source {
+            source.read_to_end(&mut output).ok();
+        }
+        sender.send(output).ok();
+    });
+    receiver
+}
+
+/// Stop a timed-out child and everything it started, then reap it.
+#[cfg(unix)]
+fn terminate(child: &mut Child) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    let group = Pid::from_child(child);
+    kill_process_group(group, Signal::TERM).ok();
+    let deadline = Instant::now() + TERMINATE_GRACE;
+    while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    // Descendants may ignore `SIGTERM`, and they keep the group alive even once
+    // the leader is gone.
+    kill_process_group(group, Signal::KILL).ok();
+    child.wait().ok();
+}
+
+#[cfg(not(unix))]
+fn terminate(child: &mut Child) {
+    child.kill().ok();
+    child.wait().ok();
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
@@ -740,14 +924,557 @@ fn require_private_file(path: &Path) -> Result<()> {
     set_private_mode(path)
 }
 
+/// `step certificate inspect --format json`, reduced to the facts used here.
+#[derive(Debug, Deserialize)]
+struct InspectedCertificate {
+    #[serde(default)]
+    names: Vec<String>,
+    validity: InspectedValidity,
+    subject_key_info: InspectedKey,
+    #[serde(default)]
+    extensions: InspectedExtensions,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectedValidity {
+    end: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectedKey {
+    fingerprint_sha256: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectedExtensions {
+    #[serde(default)]
+    extended_key_usage: BTreeMap<String, Value>,
+}
+
+/// With `--bundle`, `step` prints an array, or a bare object for one certificate.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InspectedBundle {
+    Chain(Vec<InspectedCertificate>),
+    Single(Box<InspectedCertificate>),
+}
+
+/// The leaf of a certificate file, and how many certificates came with it.
+#[derive(Debug)]
+struct Chain {
+    leaf: InspectedCertificate,
+    not_after: OffsetDateTime,
+    length: usize,
+}
+
+impl Chain {
+    /// Whether the file carries the intermediate. Truststores pin only the root,
+    /// so a leaf alone is refused in both directions.
+    fn is_complete(&self) -> bool {
+        self.length > 1
+    }
+}
+
+/// Whether a certificate is due for renewal: a third of its lifetime has elapsed.
+#[must_use]
+pub fn renewal_due(not_after: OffsetDateTime, ttl: time::Duration, now: OffsetDateTime) -> bool {
+    (not_after - now) * 3 <= ttl * 2
+}
+
+/// Whether a certificate needs a person: under one-third of its lifetime remains.
+#[must_use]
+pub fn alert_due(not_after: OffsetDateTime, ttl: time::Duration, now: OffsetDateTime) -> bool {
+    (not_after - now) * 3 < ttl
+}
+
+/// The state of a live certificate, as a TLS peer would find it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Condition {
+    /// Present, complete, unexpired, and matching the live key.
+    Valid,
+    /// No `cert.pem`.
+    Missing,
+    /// `step` cannot read `cert.pem`.
+    Unreadable,
+    /// `cert.pem` lacks its intermediate.
+    NoIntermediate,
+    /// `cert.pem` does not match `key.pem`.
+    KeyMismatch,
+    /// `cert.pem` has expired.
+    Expired,
+}
+
+/// What a certificate looks like now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Assessment {
+    /// The live certificate's state.
+    pub condition: Condition,
+    /// When it expires, if it can be read.
+    pub not_after: Option<OffsetDateTime>,
+    /// Whether an enrolled replacement key is waiting to be signed.
+    pub pending_key: bool,
+}
+
+impl Assessment {
+    /// Whether this host can complete a handshake with what it has.
+    #[must_use]
+    pub fn usable(&self) -> bool {
+        self.condition == Condition::Valid
+    }
+
+    fn renewal_needed(&self, ttl: time::Duration, now: OffsetDateTime) -> bool {
+        !self.usable()
+            || self.pending_key
+            || self.not_after.is_none_or(|end| renewal_due(end, ttl, now))
+    }
+
+    /// Whether `x509 status` must alert.
+    #[must_use]
+    pub fn alert(&self, ttl: time::Duration, now: OffsetDateTime) -> bool {
+        !self.usable() || self.not_after.is_none_or(|end| alert_due(end, ttl, now))
+    }
+}
+
+/// What a renewal run did, when it did not fail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Renewal {
+    /// The live certificate needs nothing.
+    Current,
+    /// Another run holds the lock, and the live certificate still works.
+    Busy,
+    /// A new certificate is live.
+    Published {
+        /// When the new certificate expires.
+        not_after: OffsetDateTime,
+    },
+}
+
+/// Why a renewal failed, which decides who hears about it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureKind {
+    /// The CA could not be used, or a concurrent run could not be waited out.
+    /// A TCP probe cannot see past a proxy, and `step`'s prose is not a contract,
+    /// so a failed token or signature counts as this too.
+    Unavailable,
+    /// Anything an outage cannot explain, such as a refused candidate.
+    Refused,
+    /// The certificate is published, but its `after_renew` hook failed.
+    AfterRenew,
+}
+
+/// A failed renewal.
+#[derive(Debug)]
+pub struct RenewalFailure {
+    /// What went wrong.
+    pub error: Error,
+    /// Which kind of failure this is.
+    pub kind: FailureKind,
+    /// Whether the live certificate still works.
+    pub usable: bool,
+}
+
+impl RenewalFailure {
+    /// Whether `--if-reachable` lets the run succeed anyway: only while the live
+    /// certificate works, so a boot unit never releases `nfs-server` or a mount
+    /// without one. A failed hook is about a certificate already published, and
+    /// its service still needs a person whatever the CA is doing.
+    #[must_use]
+    pub fn tolerated(&self) -> bool {
+        self.usable && self.kind != FailureKind::AfterRenew
+    }
+
+    /// Whether `--if-reachable --quiet` hides this. Only an outage is hidden: cron
+    /// runs every 5 minutes, and `x509 status` reports what the outage costs.
+    #[must_use]
+    pub fn hidden(&self) -> bool {
+        self.kind == FailureKind::Unavailable
+    }
+}
+
+/// One declared certificate on this host, and what it takes to reach its CA.
+#[derive(Clone, Debug)]
+pub struct LocalCertificate<'a> {
+    /// The policy declaration.
+    pub cert: &'a X509Cert,
+    /// Where its local material lives.
+    pub paths: X509Paths,
+    /// Trusted `step` executable.
+    pub step_bin: PathBuf,
+    /// `STEPPATH` for `step`.
+    pub steppath: PathBuf,
+    /// The pinned root certificate.
+    pub root: PathBuf,
+    /// URL of the certificate's own CA endpoint.
+    pub ca_url: String,
+}
+
+impl LocalCertificate<'_> {
+    /// The declared lifetime.
+    pub fn ttl(&self) -> Result<time::Duration> {
+        step_duration(&self.cert.ttl).ok_or_else(|| Error::Validation {
+            field: x509_identity(&self.cert.host, &self.cert.name),
+            message: format!("invalid ttl {}", self.cert.ttl),
+        })
+    }
+
+    fn step(&self) -> Command {
+        let mut command = Command::new(&self.step_bin);
+        command.env("STEPPATH", &self.steppath);
+        command
+    }
+
+    /// Read a certificate file. `None` means `step` cannot make sense of it.
+    fn read_chain(&self, file: &Path) -> Result<Option<Chain>> {
+        let output = run_bounded(
+            self.step()
+                .args(["certificate", "inspect", "--format", "json", "--bundle"])
+                .arg(file),
+            timeout_from(STEP_TIMEOUT_ENV, STEP_TIMEOUT)?,
+        )?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let (leaf, length) = match serde_json::from_slice(&output.stdout) {
+            Ok(InspectedBundle::Single(leaf)) => (*leaf, 1),
+            Ok(InspectedBundle::Chain(mut chain)) if !chain.is_empty() => {
+                let length = chain.len();
+                (chain.remove(0), length)
+            }
+            _ => return Ok(None),
+        };
+        let Ok(not_after) = OffsetDateTime::parse(&leaf.validity.end, &Rfc3339) else {
+            return Ok(None);
+        };
+        Ok(Some(Chain {
+            leaf,
+            not_after,
+            length,
+        }))
+    }
+
+    /// Assess the live certificate. This stays offline, so `x509 status` still
+    /// reports with the CA down.
+    pub fn assess(&self, now: OffsetDateTime) -> Result<Assessment> {
+        let pending_key = self.paths.pending_key.exists();
+        let assessment = |condition, not_after| Assessment {
+            condition,
+            not_after,
+            pending_key,
+        };
+        if !self.paths.cert.exists() {
+            return Ok(assessment(Condition::Missing, None));
+        }
+        let Some(chain) = self.read_chain(&self.paths.cert)? else {
+            return Ok(assessment(Condition::Unreadable, None));
+        };
+        let matches_key = self.paths.key.exists()
+            && public_key_of(&self.step_bin, &self.paths.key)?.spki_hex()
+                == chain.leaf.subject_key_info.fingerprint_sha256;
+        let condition = if !matches_key {
+            Condition::KeyMismatch
+        } else if !chain.is_complete() {
+            Condition::NoIntermediate
+        } else if chain.not_after <= now {
+            Condition::Expired
+        } else {
+            Condition::Valid
+        };
+        Ok(assessment(condition, Some(chain.not_after)))
+    }
+
+    /// Bring the live certificate up to date.
+    ///
+    /// `reachable`, set by `--if-reachable`, probes the CA before any attempt. Runs
+    /// on one certificate are serialized. A contended run skips while the live
+    /// certificate works and waits otherwise, because a boot needs the result, and
+    /// it assesses again once it holds the lock, because the holder may have just
+    /// done this work.
+    pub fn renew(
+        &self,
+        reachable: Option<&dyn Fn() -> Result<bool>>,
+    ) -> std::result::Result<Renewal, RenewalFailure> {
+        let ttl = self.ttl().map_err(refused(false))?;
+        let first = self
+            .assess(OffsetDateTime::now_utc())
+            .map_err(refused(false))?;
+        if !first.renewal_needed(ttl, OffsetDateTime::now_utc()) {
+            return Ok(Renewal::Current);
+        }
+        let held = try_lock_material(&self.paths.lock).map_err(refused(first.usable()))?;
+        let _lock = match held {
+            Some(lock) => lock,
+            None if first.usable() => return Ok(Renewal::Busy),
+            None => lock_material(&self.paths.lock).map_err(unavailable(false))?,
+        };
+
+        let current = self
+            .assess(OffsetDateTime::now_utc())
+            .map_err(refused(first.usable()))?;
+        if !current.renewal_needed(ttl, OffsetDateTime::now_utc()) {
+            return Ok(Renewal::Current);
+        }
+        let usable = current.usable();
+        if let Some(reachable) = reachable {
+            // A probe that errors has not shown the CA is up.
+            if !reachable().unwrap_or(false) {
+                return Err(unavailable(usable)(Error::Validation {
+                    field: x509_identity(&self.cert.host, &self.cert.name),
+                    message: format!("CA endpoint {} is unreachable", self.ca_url),
+                }));
+            }
+        }
+        let not_after = self.issue(usable)?;
+        self.run_after_renew().map_err(|error| RenewalFailure {
+            error,
+            kind: FailureKind::AfterRenew,
+            usable,
+        })?;
+        Ok(Renewal::Published { not_after })
+    }
+
+    /// Issue and publish, signing a pending key if one is staged.
+    ///
+    /// The candidate is built beside the live files, so publishing is a rename, and
+    /// `tlshd`, which reads them on each handshake, sees the old pair or the new
+    /// one. Signing and validation finish before any rename. With a pending key
+    /// the key moves first: a crash between the two renames leaves a pair that
+    /// [`Self::assess`] reports as mismatched, which the next run repairs.
+    fn issue(&self, usable: bool) -> std::result::Result<OffsetDateTime, RenewalFailure> {
+        let key = self.paths.enrolled_key().ok_or_else(|| {
+            refused(usable)(Error::Validation {
+                field: x509_identity(&self.cert.host, &self.cert.name),
+                message: "no certificate key; run `grafhome-ca x509 enroll`".to_owned(),
+            })
+        })?;
+        for secret in [key, &self.paths.private_jwk, &self.paths.password] {
+            require_private_file(secret).map_err(refused(usable))?;
+        }
+        let public_key = public_key_of(&self.step_bin, key).map_err(refused(usable))?;
+        let directory = self.paths.cert.parent().ok_or_else(|| {
+            refused(usable)(Error::Validation {
+                field: self.paths.cert.display().to_string(),
+                message: "certificate path must have a parent directory".to_owned(),
+            })
+        })?;
+        let staged = staging_dir(".grafhome-ca-x509-cert-")
+            .tempdir_in(directory)
+            .map_err(|source| refused(usable)(Error::io(directory, source)))?;
+        let csr = staged.path().join("request.csr");
+        let candidate = staged.path().join("cert.pem");
+
+        self.create_csr(key, &csr).map_err(refused(usable))?;
+        self.sign(&csr, &candidate).map_err(unavailable(usable))?;
+        let not_after = self
+            .validate(&candidate, &public_key)
+            .map_err(refused(usable))?;
+        // A failure here can land between the renames, so nothing vouches for the
+        // live pair any more.
+        self.publish(&candidate).map_err(refused(false))?;
+        Ok(not_after)
+    }
+
+    /// Create a CSR for `key`. `step-ca` refuses one whose common name is not the
+    /// first name, or whose names differ from the token's.
+    fn create_csr(&self, key: &Path, csr: &Path) -> Result<()> {
+        let mut command = self.step();
+        command
+            .args(["certificate", "create"])
+            .arg(self.common_name()?)
+            .arg(csr)
+            .arg("--csr")
+            .arg("--key")
+            .arg(key)
+            .args(["--no-password", "--insecure"]);
+        for name in &self.cert.names {
+            command.arg("--san").arg(name);
+        }
+        run_step(&mut command).map(drop)
+    }
+
+    /// Sign a CSR on the certificate's own CA endpoint. The renewal JWK is the
+    /// authority here, so this works just the same on an expired certificate.
+    fn sign(&self, csr: &Path, candidate: &Path) -> Result<()> {
+        let mut command = self.step();
+        command.args(["ca", "token"]).arg(self.common_name()?);
+        for name in &self.cert.names {
+            command.arg("--san").arg(name);
+        }
+        let token = run_step(
+            command
+                .arg("--issuer")
+                .arg(x509_provisioner_name(&self.cert.host, &self.cert.name))
+                .arg("--key")
+                .arg(&self.paths.private_jwk)
+                .arg("--password-file")
+                .arg(&self.paths.password)
+                .arg("--ca-url")
+                .arg(&self.ca_url)
+                .arg("--root")
+                .arg(&self.root),
+        )?;
+        let token = String::from_utf8_lossy(&token);
+        let token = token.trim();
+        run_step_redacted(
+            self.step()
+                .args(["ca", "sign"])
+                .arg(csr)
+                .arg(candidate)
+                .arg("--token")
+                .arg(token)
+                .arg("--ca-url")
+                .arg(&self.ca_url)
+                .arg("--root")
+                .arg(&self.root),
+            Some(token),
+        )
+        .map(drop)
+    }
+
+    /// Check a candidate against the declaration before it can replace anything.
+    ///
+    /// The CA template pins all of this already. Checking again here means a CA
+    /// that drifted costs a failed renewal rather than a broken live certificate.
+    fn validate(&self, candidate: &Path, key: &CertificateKey) -> Result<OffsetDateTime> {
+        let refuse = |message: String| Error::Validation {
+            field: x509_identity(&self.cert.host, &self.cert.name),
+            message,
+        };
+        let chain = self
+            .read_chain(candidate)?
+            .ok_or_else(|| refuse("step cannot read the certificate the CA returned".to_owned()))?;
+        if !chain.is_complete() {
+            return Err(refuse("the CA returned no intermediate".to_owned()));
+        }
+        let mut names = chain.leaf.names.clone();
+        names.sort();
+        let mut declared = self.cert.names.clone();
+        declared.sort();
+        if names != declared {
+            return Err(refuse(format!(
+                "the CA issued names {names:?}, but policy declares {declared:?}"
+            )));
+        }
+        let usages = chain
+            .leaf
+            .extensions
+            .extended_key_usage
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let declared_usage = match self.cert.role {
+            X509Role::Server => "server_auth",
+            X509Role::Client => "client_auth",
+        };
+        if usages != [declared_usage] {
+            return Err(refuse(format!(
+                "the CA issued extended key usage {usages:?}, but policy declares {declared_usage}"
+            )));
+        }
+        if chain.leaf.subject_key_info.fingerprint_sha256 != key.spki_hex() {
+            return Err(refuse(
+                "the issued certificate does not match the signing key".to_owned(),
+            ));
+        }
+        if chain.not_after <= OffsetDateTime::now_utc() {
+            return Err(refuse("the CA returned an expired certificate".to_owned()));
+        }
+        // Against the root alone, as a peer's truststore is, so this also proves
+        // the file carries a working intermediate.
+        run_step(
+            self.step()
+                .args(["certificate", "verify"])
+                .arg(candidate)
+                .arg("--roots")
+                .arg(&self.root)
+                .arg("--host")
+                .arg(self.common_name()?),
+        )?;
+        Ok(chain.not_after)
+    }
+
+    /// Replace the live files with a validated candidate.
+    fn publish(&self, candidate: &Path) -> Result<()> {
+        #[cfg(unix)]
+        std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(CERTIFICATE_MODE))
+            .map_err(|source| Error::io(candidate, source))?;
+        if self.paths.pending_key.exists() {
+            std::fs::rename(&self.paths.pending_key, &self.paths.key)
+                .map_err(|source| Error::io(&self.paths.key, source))?;
+        }
+        std::fs::rename(candidate, &self.paths.cert)
+            .map_err(|source| Error::io(&self.paths.cert, source))
+    }
+
+    /// Run the declared hook, checking its program's provenance just before use.
+    ///
+    /// Publishing comes first: a host with a bad hook is better off with a fresh
+    /// certificate and a reported failure than an expiring one. It is not retried,
+    /// and the next renewal reruns it while the certificate it missed is still valid.
+    fn run_after_renew(&self) -> Result<()> {
+        let Some((program, arguments)) = self.cert.after_renew.split_first() else {
+            return Ok(());
+        };
+        let refuse = |message: String| Error::Validation {
+            field: format!(
+                "after_renew of {}",
+                x509_identity(&self.cert.host, &self.cert.name)
+            ),
+            message,
+        };
+        let program =
+            trusted_program(Path::new(program)).map_err(|error| refuse(error.to_string()))?;
+        let output = run_bounded(
+            Command::new(program).args(arguments),
+            timeout_from(STEP_TIMEOUT_ENV, STEP_TIMEOUT)?,
+        )
+        .map_err(|error| refuse(error.to_string()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(refuse(format!(
+            "exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+
+    fn common_name(&self) -> Result<&str> {
+        self.cert
+            .names
+            .first()
+            .map(String::as_str)
+            .ok_or_else(|| Error::Validation {
+                field: x509_identity(&self.cert.host, &self.cert.name),
+                message: "a certificate needs at least one name".to_owned(),
+            })
+    }
+}
+
+fn refused(usable: bool) -> impl Fn(Error) -> RenewalFailure {
+    failure(FailureKind::Refused, usable)
+}
+
+fn unavailable(usable: bool) -> impl Fn(Error) -> RenewalFailure {
+    failure(FailureKind::Unavailable, usable)
+}
+
+fn failure(kind: FailureKind, usable: bool) -> impl Fn(Error) -> RenewalFailure {
+    move |error| RenewalFailure {
+        error,
+        kind,
+        usable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
     use serde_json::{Value, json};
 
     use super::{
-        CertificateKey, X509Request, approved_cert, is_deny_template, parse_x509_provisioner_name,
-        reconcile_live, x509_provisioner, x509_provisioner_name,
+        CertificateKey, FailureKind, RenewalFailure, X509Request, alert_due, approved_cert,
+        is_deny_template, parse_x509_provisioner_name, reconcile_live, renewal_due,
+        x509_provisioner, x509_provisioner_name,
     };
     use crate::policy::{Status, X509Cert, X509Role};
 
@@ -781,6 +1508,57 @@ aVXF2GUB0FzWyZNJBGBdIwsLJSjUsFMF+216+CkBLucOD2YTRAkWruHHcQ==
     fn template_body(provisioner: &Value) -> Value {
         let template = provisioner["options"]["x509"]["template"].as_str().unwrap();
         serde_json::from_str(template.lines().last().unwrap()).unwrap()
+    }
+
+    fn at(seconds: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds)
+    }
+
+    #[test]
+    fn renewal_due_boundaries() {
+        const HOUR: i64 = 3600;
+        for (ttl_hours, remaining_hours) in [(24, 16), (720, 480)] {
+            let ttl = time::Duration::hours(ttl_hours);
+            let not_after = at(remaining_hours * HOUR);
+            assert!(!renewal_due(not_after, ttl, at(-1)), "{ttl_hours}h early");
+            assert!(renewal_due(not_after, ttl, at(0)), "{ttl_hours}h exact");
+            assert!(renewal_due(not_after, ttl, at(1)), "{ttl_hours}h late");
+            // Long past expiry is still due.
+            assert!(renewal_due(not_after, ttl, at(remaining_hours * 2 * HOUR)));
+        }
+    }
+
+    #[test]
+    fn alert_due_boundaries() {
+        const HOUR: i64 = 3600;
+        for (ttl_hours, remaining_hours) in [(24, 8), (720, 240)] {
+            let ttl = time::Duration::hours(ttl_hours);
+            let not_after = at(remaining_hours * HOUR);
+            assert!(!alert_due(not_after, ttl, at(-1)), "{ttl_hours}h early");
+            assert!(!alert_due(not_after, ttl, at(0)), "{ttl_hours}h exact");
+            assert!(alert_due(not_after, ttl, at(1)), "{ttl_hours}h late");
+            assert!(alert_due(not_after, ttl, at(remaining_hours * 2 * HOUR)));
+        }
+    }
+
+    #[test]
+    fn a_failure_is_tolerated_only_while_the_certificate_works() {
+        let failure = |kind, usable| RenewalFailure {
+            error: crate::error::Error::Validation {
+                field: "test".to_owned(),
+                message: "test".to_owned(),
+            },
+            kind,
+            usable,
+        };
+        assert!(failure(FailureKind::Unavailable, true).tolerated());
+        assert!(failure(FailureKind::Refused, true).tolerated());
+        assert!(!failure(FailureKind::Unavailable, false).tolerated());
+        assert!(!failure(FailureKind::Refused, false).tolerated());
+        assert!(!failure(FailureKind::AfterRenew, true).tolerated());
+        assert!(failure(FailureKind::Unavailable, false).hidden());
+        assert!(!failure(FailureKind::Refused, true).hidden());
+        assert!(!failure(FailureKind::AfterRenew, true).hidden());
     }
 
     #[test]

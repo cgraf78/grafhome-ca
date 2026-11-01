@@ -132,6 +132,13 @@ pub fn duration_at_most(duration: &str, maximum: &str) -> bool {
     }
 }
 
+/// Parse a Go-style duration, or `None` if it is invalid or out of range.
+#[must_use]
+pub fn step_duration(duration: &str) -> Option<time::Duration> {
+    let nanoseconds = i64::try_from(duration_nanoseconds(duration)?).ok()?;
+    Some(time::Duration::nanoseconds(nanoseconds))
+}
+
 /// Return whether a duration uses the Go-style grammar accepted by Smallstep.
 #[must_use]
 pub fn valid_step_duration_expression(duration: &str) -> bool {
