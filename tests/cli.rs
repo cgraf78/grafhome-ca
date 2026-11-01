@@ -8592,9 +8592,11 @@ fn apply_ca_stays_top_level() {
             .unwrap()
             .contains("\n  ca ")
     );
+    // Exit 1 rather than clap's 2 proves it parsed and reached the handler. Which
+    // check stops it depends on the caller: the root check, or for root in CI's
+    // containers, the provenance of a checkout owned by another uid.
     let (code, _, stderr) = run_isolated(&["apply", "ca", "--dry-run"]);
-    assert_eq!(code, Some(1));
-    assert!(stderr.contains("apply ca"), "{stderr}");
+    assert_eq!(code, Some(1), "{stderr}");
 }
 
 #[test]
