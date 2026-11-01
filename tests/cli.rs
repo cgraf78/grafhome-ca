@@ -1028,11 +1028,7 @@ fn help_exposes_only_supported_commands() {
         "materialize",
         "migrate",
         "apply",
-        "approve",
-        "enroll",
-        "renew",
-        "revoke",
-        "status",
+        "ssh",
     ] {
         assert!(
             text.contains(command),
@@ -1070,7 +1066,7 @@ fn help_exposes_only_supported_commands() {
     for verb in ["approve", "enroll", "renew", "revoke"] {
         let output = Command::cargo_bin("grafhome-ca")
             .unwrap()
-            .args([verb, "--help"])
+            .args(["ssh", verb, "--help"])
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -2333,8 +2329,14 @@ fn apply_exposes_only_supported_local_nouns() {
         .args(["apply", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ca"))
-        .stdout(predicate::str::contains("host"));
+        .stdout(predicate::str::contains("ca"));
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["ssh", "apply", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"));
 
     Command::cargo_bin("grafhome-ca")
         .unwrap()
@@ -8444,4 +8446,171 @@ fn user_enrollment_request_for(host: &str) -> String {
             }
         })
     )
+}
+
+/// Runs the binary in an empty HOME so every invocation fails at the same
+/// deterministic point: before any CA or host state is touched.
+fn run_isolated(args: &[&str]) -> (Option<i32>, String, String) {
+    run_in_home(&tempdir().unwrap(), args)
+}
+
+/// Like `run_isolated`, but on a caller-supplied HOME so two spellings can be
+/// compared without their temp paths leaking into the output.
+fn run_in_home(home: &tempfile::TempDir, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(args)
+        .arg("--config-root")
+        .arg(example_config_root())
+        .env("HOME", home.path())
+        .env("HOSTNAME", "proxy-host.example.test")
+        .env("GRAFHOME_CA_INSTALL_ROOT", home.path())
+        .env_remove("GRAFHOME_CA_LOCAL_HOST")
+        .env_remove("GRAFHOME_CA_LOCAL_USER")
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+/// Every legacy spelling paired with its credential-first replacement.
+const SSH_SPELLINGS: &[(&[&str], &[&str])] = &[
+    (
+        &["enroll", "host", "--request-only"],
+        &["ssh", "enroll", "host", "--request-only"],
+    ),
+    (
+        &["enroll", "user", "--request-only"],
+        &["ssh", "enroll", "user", "--request-only"],
+    ),
+    (&["approve", "host"], &["ssh", "approve", "host"]),
+    (&["approve", "user"], &["ssh", "approve", "user"]),
+    (
+        &["renew", "host", "--if-enrolled"],
+        &["ssh", "renew", "host", "--if-enrolled"],
+    ),
+    (
+        &["renew", "user", "--if-enrolled"],
+        &["ssh", "renew", "user", "--if-enrolled"],
+    ),
+    (
+        &["revoke", "host", "--host", "proxy-host.example.test"],
+        &["ssh", "revoke", "host", "--host", "proxy-host.example.test"],
+    ),
+    (
+        &["revoke", "user", "--user", "alice"],
+        &["ssh", "revoke", "user", "--user", "alice"],
+    ),
+    (
+        &["apply", "host", "--dry-run"],
+        &["ssh", "apply", "--dry-run"],
+    ),
+    (
+        &["enrollment", "export", "host"],
+        &["ssh", "enrollment", "export", "host"],
+    ),
+    (
+        &["enrollment", "export", "user"],
+        &["ssh", "enrollment", "export", "user"],
+    ),
+    (&["enrollment", "import"], &["ssh", "enrollment", "import"]),
+    (
+        &["status", "--host", "proxy-host.example.test"],
+        &["ssh", "status", "--host", "proxy-host.example.test"],
+    ),
+];
+
+#[test]
+fn ssh_group_matches_legacy_commands() {
+    for (legacy, grouped) in SSH_SPELLINGS {
+        let home = tempdir().unwrap();
+        let old = run_in_home(&home, legacy);
+        let new = run_in_home(&home, grouped);
+        assert_ne!(old.0, Some(2), "{legacy:?} was rejected by the parser");
+        assert_eq!(old, new, "{grouped:?} diverged from {legacy:?}");
+    }
+}
+
+#[test]
+fn legacy_spellings_stay_hidden() {
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .arg("--help")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    let listed: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    for hidden in [
+        "approve",
+        "enroll",
+        "renew",
+        "revoke",
+        "enrollment",
+        "status",
+    ] {
+        assert!(!listed.contains(&hidden), "legacy `{hidden}` is in --help");
+    }
+    assert!(listed.contains(&"ssh"));
+
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !text.contains("\n  host "),
+        "legacy `apply host` is in help"
+    );
+
+    // Hidden is not removed: the legacy spellings still reach their handlers.
+    for (legacy, _) in SSH_SPELLINGS {
+        assert_ne!(
+            run_isolated(legacy).0,
+            Some(2),
+            "{legacy:?} stopped parsing"
+        );
+    }
+}
+
+#[test]
+fn apply_ca_stays_top_level() {
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["apply", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("\n  ca ")
+    );
+    // Exit 1 rather than clap's 2 proves it parsed and reached the handler. Which
+    // check stops it depends on the caller: the root check, or for root in CI's
+    // containers, the provenance of a checkout owned by another uid.
+    let (code, _, stderr) = run_isolated(&["apply", "ca", "--dry-run"]);
+    assert_eq!(code, Some(1), "{stderr}");
+}
+
+#[test]
+fn ssh_apply_has_no_ca_form() {
+    let (code, _, stderr) = run_isolated(&["ssh", "apply", "ca"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["ssh", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("apply ca")
+    );
 }

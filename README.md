@@ -34,10 +34,14 @@ certificate lifecycle:
 2. `grafhome-ca render` writes non-secret deployment files (Smallstep,
    OpenSSH, systemd) into a staging directory you choose, for review and
    deployment.
-3. A host or user runs `grafhome-ca enroll`, and an operator on the CA origin
-   runs `grafhome-ca approve`; the two exchange one pasted request and grant.
-4. Scheduled `grafhome-ca renew` and `grafhome-ca apply host` jobs keep
+3. A host or user runs `grafhome-ca ssh enroll`, and an operator on the CA origin
+   runs `grafhome-ca ssh approve`; the two exchange one pasted request and grant.
+4. Scheduled `grafhome-ca ssh renew` and `grafhome-ca ssh apply` jobs keep
    certificates, trust files, and revocation lists current.
+
+The SSH commands live under `grafhome-ca ssh`. The older top-level spellings
+(`enroll`, `approve`, `renew`, `revoke`, `enrollment`, `status`, and
+`apply host`) still work as hidden aliases but are no longer listed in `--help`.
 
 Only explicit commands change live state: enrollment, approval, renewal,
 revocation, apply, and the one-time migrations. Distributing private site config is left to your
@@ -204,8 +208,8 @@ The first rollout of SSH key-bound enrollment templates intentionally
 invalidates any still-unconsumed grant minted by an older binary: that token
 does not contain the bound public-key claim. Finish or discard outstanding
 short-lived grants before `apply ca`. After rollout, rebuild the request with
-`enroll host --restart --request-only` or
-`enroll user --restart --request-only` and approve it again with the upgraded
+`ssh enroll host --restart --request-only` or
+`ssh enroll user --restart --request-only` and approve it again with the upgraded
 CA origin. If the earlier approval already created a live renewal provisioner
 that is absent from the registry, export and import its public enrollment
 material first, then re-approve the rebuilt request. Do not weaken the
@@ -262,16 +266,16 @@ binary.
 
 ```sh
 # Target host as root. Leave this running after copying its REQUEST line.
-grafhome-ca enroll host
+grafhome-ca ssh enroll host
 
 # CA origin as root. Paste the REQUEST, press Enter, approve it, and copy GRANT.
-grafhome-ca approve host
+grafhome-ca ssh approve host
 ```
 
 The target generates its device-bound renewal JWK locally; only its public half
-leaves the host. After the grant is pasted back, `enroll host` installs the SSH
+leaves the host. After the grant is pasted back, `ssh enroll host` installs the SSH
 host certificate and trust configuration, proves JWK renewal works, validates
-`sshd`, and reloads it. Scheduled renewal runs `grafhome-ca renew host`; site
+`sshd`, and reloads it. Scheduled renewal runs `grafhome-ca ssh renew host`; site
 policy retains each host's configured renewal owner.
 
 On Termux, run host lifecycle commands as the Termux app owner rather than
@@ -296,13 +300,13 @@ host's OpenSSH policy locally:
 
 ```sh
 # Affected system host as root, or Termux host as its app owner.
-grafhome-ca apply host --dry-run
-grafhome-ca apply host
+grafhome-ca ssh apply --dry-run
+grafhome-ca ssh apply
 # When OS inference is unsuitable, select the local policy identity explicitly.
-grafhome-ca apply host --host policy-host
+grafhome-ca ssh apply --host policy-host
 ```
 
-`apply host` uses the same validated site model and pinned CA trust as
+`ssh apply` uses the same validated site model and pinned CA trust as
 enrollment. It reconciles only Grafhome-managed OpenSSH files for the local
 host, including the dedicated authorized-principals directory and role-scoped
 key revocation lists (KRLs). Servers receive revoked user keys through
@@ -316,13 +320,13 @@ reloads that configuration.
 Removing an authorization row therefore removes its stale principals file on
 the affected host. This changes login authorization; it does not revoke an
 enrollment or an already-issued certificate, which remains the responsibility
-of `revoke host` or `revoke user`.
+of `ssh revoke host` or `ssh revoke user`.
 
 For unattended convergence after a private policy update, run the same command
 with scheduled-mode guards:
 
 ```sh
-grafhome-ca apply host --if-enrolled --quiet
+grafhome-ca ssh apply --if-enrolled --quiet
 ```
 
 An unenrolled host is skipped without output. Routine success and no-op output
@@ -361,14 +365,14 @@ login account, and explicit `--user` and `--host` flags take precedence:
 ```sh
 # Client host. Enter the renewal password once and leave this running.
 # Copy its REQUEST line to the CA, then paste the returned GRANT here.
-grafhome-ca enroll user
+grafhome-ca ssh enroll user
 
 # CA origin as root. Paste the REQUEST line, press Enter, and approve it.
-grafhome-ca approve user
+grafhome-ca ssh approve user
 
 # Rare allowlisted case: issue the initial certificate for roughly 292 years.
 # Upgrade grafhome-ca on the target client before approving this grant.
-grafhome-ca approve user --effectively-infinite
+grafhome-ca ssh approve user --effectively-infinite
 
 # Normal use after enrollment.
 ssh ca-host
@@ -379,9 +383,9 @@ to use it (the default), replace it, or cancel. Reuse verifies that the public
 key matches the private key before creating the Grafhome renewal credential.
 
 Scheduled renewal should run
-`grafhome-ca renew host --if-enrolled --if-reachable --quiet` as root on a
+`grafhome-ca ssh renew host --if-enrolled --if-reachable --quiet` as root on a
 system OpenSSH host or as the app owner on Termux, and
-`grafhome-ca renew user --if-enrolled --if-reachable --quiet` as the enrolled
+`grafhome-ca ssh renew user --if-enrolled --if-reachable --quiet` as the enrolled
 user. Both commands infer the local identity, skip fresh certificates, and
 return successfully without output when enrollment or local renewal material
 is absent. `--if-reachable` also skips while a short TCP connection to the
@@ -408,10 +412,10 @@ directory, which Android isolates from other apps and Termux excludes from
 Android backup. This Android credential is not separately
 application-encrypted; processes already running as the Termux app user can
 read it, just as they can use the unencrypted OpenSSH identity stored beside
-it. `renew user` reads the corresponding platform store for unattended renewal.
+it. `ssh renew user` reads the corresponding platform store for unattended renewal.
 Other deployments must provide equivalent scheduling.
 
-`enroll user` generates or reuses the SSH identity at OpenSSH's standard
+`ssh enroll user` generates or reuses the SSH identity at OpenSSH's standard
 `$HOME/.ssh/id_ed25519` paths, generates or reuses the renewal key (validating
 the password against an existing key), stores the renewal password unless it
 is already stored or supplied with `--password-file`, prints the public
@@ -423,16 +427,16 @@ offers the choice described above. When `id_ed25519` or `id_ed25519.pub` is
 missing or not a regular file, only replace or cancel (the default) is
 offered. Replace removes the complete key and certificate set;
 cancel leaves every file unchanged. A terminated process can resume from
-pending state by running `enroll user` again. If the pending request is lost
+pending state by running `ssh enroll user` again. If the pending request is lost
 or damaged, run
-`enroll user --restart` to rebuild and print it from the existing SSH and
+`ssh enroll user --restart` to rebuild and print it from the existing SSH and
 renewal public keys. Host enrollment supports the equivalent root-run
-`grafhome-ca enroll host --restart`. Restarting does not replace private keys;
+`grafhome-ca ssh enroll host --restart`. Restarting does not replace private keys;
 run ordinary enrollment from a fresh state when new keys are required.
 
 File overrides exist for automation:
 `--request-file`, `--grant-file`, and `--password-file`; `--request-only` emits
-the request without waiting. `approve user --yes` skips operator confirmation.
+the request without waiting. `ssh approve user --yes` skips operator confirmation.
 Pasted requests and grants may include or omit their `REQUEST:` or `GRANT:`
 label, and surrounding whitespace is ignored. At an interactive prompt, paste
 the REQUEST or GRANT document and press Enter; `Ctrl-D` is not required.
@@ -455,21 +459,21 @@ remain version 1 and retain their existing wire format.
 
 An effectively-infinite certificate is a long-lived bearer credential. Use a
 hardware-backed or otherwise non-exportable SSH key where the device supports
-one. `revoke user` records the underlying public key for `RevokedKeys`, but
+one. `ssh revoke user` records the underlying public key for `RevokedKeys`, but
 invalidation begins on each server only after the updated private policy has
-been distributed and `grafhome-ca apply host` has completed there.
+been distributed and `grafhome-ca ssh apply` has completed there.
 
 Active revocation does not require a certificate serial:
 
 ```sh
 # Disable the host identity and every user enrollment on that host.
-grafhome-ca revoke host --host ca-host
+grafhome-ca ssh revoke host --host ca-host
 
 # Disable every enrolled client host for a user, or only one client host.
-grafhome-ca revoke user --user alice
-grafhome-ca revoke user --user alice --host laptop-a
+grafhome-ca ssh revoke user --user alice
+grafhome-ca ssh revoke user --user alice --host laptop-a
 # Store an optional audit reason with newly recorded keys.
-grafhome-ca revoke host --host ca-host --reason "device retired"
+grafhome-ca ssh revoke host --host ca-host --reason "device retired"
 ```
 
 The canonical policy must contain a dedicated tracked file before the first
@@ -498,15 +502,15 @@ their policy rows have been disabled or removed:
 
 ```sh
 # System host as root, or a Termux host as its app owner.
-grafhome-ca enrollment export host --host policy-host > host-enrollment.txt
+grafhome-ca ssh enrollment export host --host policy-host > host-enrollment.txt
 
 # User account on its enrolled client host.
-grafhome-ca enrollment export user \
+grafhome-ca ssh enrollment export user \
   --user policy-user --host policy-host > user-enrollment.txt
 
 # CA origin as root.
-grafhome-ca enrollment import --request-file host-enrollment.txt
-grafhome-ca enrollment import --request-file user-enrollment.txt
+grafhome-ca ssh enrollment import --request-file host-enrollment.txt
+grafhome-ca ssh enrollment import --request-file user-enrollment.txt
 ```
 
 Import is a trusted migration assertion for legacy provisioners. Verify the
@@ -516,8 +520,8 @@ for a different key, but CA state cannot discover a different key that a legacy
 unbound provisioner may have signed historically.
 
 Revocation fails closed if any matching live provisioner is absent from the
-registry or has a different renewal key. `revoke host` selects the host key and
-all user keys enrolled on that client host; `revoke user` selects the requested
+registry or has a different renewal key. `ssh revoke host` selects the host key and
+all user keys enrolled on that client host; `ssh revoke user` selects the requested
 user scope. The tracked file stores canonical plain public keys, SSH
 fingerprints, renewal JWK fingerprints, UTC timestamps, and optional reasons.
 Tracking both fingerprints preserves the no-key-reuse rule even if the
@@ -528,7 +532,7 @@ key. Previously revoked keys remain permanent tombstones.
 The command writes the tracked key entries before changing live CA state. If CA
 activation fails, the conservative policy entries remain staged and rerunning
 the same command is safe. After success, commit and distribute the policy, then
-run `grafhome-ca apply host` on managed SSH hosts. A KRL entry for a plain key
+run `grafhome-ca ssh apply` on managed SSH hosts. A KRL entry for a plain key
 rejects the current certificate and later renewed certificates for that same
 key. Host apply updates files atomically and restores the previous validated SSH
 configuration if validation or reload fails.
@@ -543,9 +547,9 @@ queries the CA's public provisioner API through the locally pinned trust root;
 it does not read `ca.json` directly:
 
 ```sh
-grafhome-ca status --host ca-host
-grafhome-ca status --user alice
-grafhome-ca status --user alice --host laptop-a
+grafhome-ca ssh status --host ca-host
+grafhome-ca ssh status --user alice
+grafhome-ca ssh status --user alice --host laptop-a
 ```
 
 Add `--quiet` to suppress output and use the exit status as a predicate. It
@@ -576,10 +580,10 @@ invocation. On the
 documented root-run workflows, the invoking account is root, so the complete
 input chain must be root-owned.
 
-System host lifecycle commands (`enroll host`, `renew host`, `apply host`, and
+System host lifecycle commands (`ssh enroll host`, `ssh renew host`, `ssh apply`, and
 host enrollment export) and CA state commands (`materialize`,
-`migrate enrollment-provisioner-keys`, `apply ca`, `approve host`,
-`approve user`, `revoke host`, `revoke user`, and `enrollment import`) enforce
+`migrate enrollment-provisioner-keys`, `apply ca`, `ssh approve host`,
+`ssh approve user`, `ssh revoke host`, `ssh revoke user`, and `ssh enrollment import`) enforce
 an effective UID of root. CA state commands additionally compare the kernel
 hostname with the configured `ca_origin` target. A configured FQDN requires an
 exact match; a configured short name also matches that kernel name's short
@@ -668,7 +672,7 @@ useful during review. Canonical and legacy documents may not be mixed in one
 config root.
 
 Runtime firewall, Apache, systemd, and DNS changes remain owned by private
-configuration management. `enroll host` deliberately installs only the
+configuration management. `ssh enroll host` deliberately installs only the
 device-bound OpenSSH files required for certificate operation, validates
 `sshd`, and reloads it.
 
@@ -682,7 +686,7 @@ device-bound OpenSSH files required for certificate operation, validates
   placeholder with the exported host-CA known-hosts file before host
   certificates are expected to verify.
 - Rendered sshd fragments include `HostCertificate` for the certificate derived
-  from `GRAFHOME_CA_HOST_KEY_PATH`. `enroll host` issues the initial host
+  from `GRAFHOME_CA_HOST_KEY_PATH`. `ssh enroll host` issues the initial host
   certificate before activating that fragment.
 
 No private CA keys, SSH private keys, passwords, provisioner secrets, or tokens
