@@ -426,9 +426,10 @@ either rename, then the key moves and the certificate follows. A handshake or cr
 between the two renames fails, and the next run repairs the pair.
 
 `--if-enrolled` skips a certificate only when the host holds no material for it at
-all. A host that kept `cert.pem` but lost its JWK or root is enrolled and broken: it
-fails and alerts once the certificate stops working. `--if-reachable` decides by what
-the host still has:
+all. A host that kept `cert.pem` but lost its JWK or root is enrolled and broken: from
+the renewal point it reports the problem on every run, even under `--quiet`, and it
+fails once the certificate stops working. `--if-reachable` decides by what the host
+still has:
 
 | Live certificate | CA unreachable, or renewal fails | Output |
 | --- | --- | --- |

@@ -10457,6 +10457,10 @@ fn after_renew_refuses_an_untrusted_program() {
 #[cfg(unix)]
 #[test]
 fn after_renew_stays_inside_the_test_sandbox() {
+    // The sandbox applies only to non-root callers, and CI's container legs run as root.
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
     let (_dir, fixture, _cert_dir) = enrolled_x509();
     let path = fixture.config_root.join("policy/hosts/edge-host.toml");
     let text = fs::read_to_string(&path).unwrap().replacen(

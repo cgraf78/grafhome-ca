@@ -4036,8 +4036,9 @@ struct X509RenewFlags {
 /// With `--if-enrolled`, a certificate with no local material at all is left out,
 /// so a host-independent cron line or unit can run everywhere and such a host needs
 /// neither `step` nor a declaration. Any material keeps it in, however incomplete:
-/// a usable certificate stays quiet, an unusable one fails and alerts, and a name
-/// policy no longer declares is refused.
+/// a usable certificate stays quiet, an unusable one fails and alerts, and a `NAME`
+/// passed explicitly that policy no longer declares is refused. With no `NAME`, the
+/// list comes from policy, so a removed declaration is skipped.
 fn x509_targets<'a>(
     model: &'a SiteModel,
     host: &str,
