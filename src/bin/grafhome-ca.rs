@@ -31,8 +31,8 @@ use grafhome_ca::policy::{
 };
 use grafhome_ca::runtime_provisioners::ClaimsReconciliation;
 use grafhome_ca::x509::{
-    CertificateKey, X509Paths, X509Request, parse_x509_provisioner_name, x509_identity,
-    x509_provisioner, x509_provisioner_name,
+    Assessment, CertificateKey, Condition, LocalCertificate, Renewal, X509Paths, X509Request,
+    parse_x509_provisioner_name, x509_identity, x509_provisioner, x509_provisioner_name,
 };
 
 const USER_KEY_NAME: &str = "id_ed25519";
@@ -154,7 +154,7 @@ enum Command {
         #[command(subcommand)]
         command: SshCommand,
     },
-    /// Manage X.509 certificate enrollment and revocation.
+    /// Manage X.509 certificate enrollment, renewal, and revocation.
     X509 {
         #[command(subcommand)]
         command: X509Command,
@@ -273,6 +273,43 @@ enum X509Command {
         /// Approve without an interactive confirmation (for automation).
         #[arg(long)]
         yes: bool,
+    },
+    /// Issue or renew this host's certificates when they are due.
+    Renew {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Certificate name. Omit to cover every active certificate on this host.
+        name: Option<String>,
+        /// Exit successfully without output for a certificate this host has not enrolled.
+        #[arg(long)]
+        if_enrolled: bool,
+        /// Exit successfully when renewal is not possible but the live certificate still works.
+        #[arg(long)]
+        if_reachable: bool,
+        /// Suppress routine output. With --if-reachable, also suppress CA outages.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Report whether this host's certificates are healthy. Works offline.
+    Status {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Host policy name. Defaults to GRAFHOME_CA_LOCAL_HOST, then the short local hostname.
+        #[arg(long)]
+        host: Option<String>,
+        /// Certificate name. Omit to cover every active certificate on this host.
+        name: Option<String>,
+        /// Exit successfully without output for a certificate this host has not enrolled.
+        #[arg(long)]
+        if_enrolled: bool,
+        /// Print nothing for a healthy certificate. Alerts are always printed.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Remove a certificate's provisioner and tombstone its keys.
     Revoke {
@@ -977,6 +1014,46 @@ fn run() -> grafhome_ca::Result<()> {
             let request: X509Request =
                 parse_enrollment_document(&text, "public x509 enrollment request")?;
             approve_x509(&model, &request, yes)
+        }
+        Command::X509 {
+            command:
+                X509Command::Renew {
+                    config_root,
+                    host,
+                    name,
+                    if_enrolled,
+                    if_reachable,
+                    quiet,
+                },
+        } => {
+            let model = load_host_model(config_root, "x509 renew", false)?;
+            let host = resolve_host(host.as_deref())?;
+            let flags = X509RenewFlags {
+                if_enrolled,
+                if_reachable,
+                quiet,
+            };
+            if !renew_x509(&model, &host, name.as_deref(), flags)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::X509 {
+            command:
+                X509Command::Status {
+                    config_root,
+                    host,
+                    name,
+                    if_enrolled,
+                    quiet,
+                },
+        } => {
+            let model = load_host_model(config_root, "x509 status", false)?;
+            let host = resolve_host(host.as_deref())?;
+            if !status_x509(&model, &host, name.as_deref(), if_enrolled, quiet)? {
+                std::process::exit(1);
+            }
+            Ok(())
         }
         Command::X509 {
             command:
@@ -2184,10 +2261,13 @@ fn required_endpoint<'a>(model: &'a SiteModel, role: &str) -> grafhome_ca::Resul
 }
 
 fn ca_api_reachable(model: &SiteModel) -> grafhome_ca::Result<bool> {
-    endpoint_reachable_with(
-        required_endpoint(model, ENDPOINT_ROLE_CA_API)?,
-        |address, timeout| TcpStream::connect_timeout(address, timeout).map(drop),
-    )
+    endpoint_reachable(required_endpoint(model, ENDPOINT_ROLE_CA_API)?)
+}
+
+fn endpoint_reachable(endpoint: &Endpoint) -> grafhome_ca::Result<bool> {
+    endpoint_reachable_with(endpoint, |address, timeout| {
+        TcpStream::connect_timeout(address, timeout).map(drop)
+    })
 }
 
 fn endpoint_reachable_with(
@@ -3920,11 +4000,7 @@ fn enroll_x509(model: &SiteModel, host: Option<&str>, name: &str) -> grafhome_ca
             ),
         });
     }
-    let paths = X509Paths::new(
-        &host_material_dir(model, &host),
-        &model.deployment.x509_dir(),
-        name,
-    );
+    let paths = x509_paths(model, &host, name);
     let step_bin = root_step_bin(model)?;
     let request = grafhome_ca::x509::prepare_enrollment(
         &paths,
@@ -3945,6 +4021,232 @@ fn enroll_x509(model: &SiteModel, host: Option<&str>, name: &str) -> grafhome_ca
     std::io::stdout()
         .flush()
         .map_err(|source| grafhome_ca::Error::io("<stdout>", source))
+}
+
+/// Flags that decide how `x509 renew` treats each certificate.
+#[derive(Clone, Copy)]
+struct X509RenewFlags {
+    if_enrolled: bool,
+    if_reachable: bool,
+    quiet: bool,
+}
+
+/// The declarations a command covers on this host.
+///
+/// With `--if-enrolled`, a certificate with no local material is left out, so a
+/// host-independent cron line or unit can run everywhere and such a host needs
+/// neither `step` nor a declaration. Once material exists the name must be
+/// declared: a host holding credentials policy no longer lists should hear of it.
+fn x509_targets<'a>(
+    model: &'a SiteModel,
+    host: &str,
+    name: Option<&str>,
+    if_enrolled: bool,
+) -> grafhome_ca::Result<Vec<&'a grafhome_ca::policy::X509Cert>> {
+    if let Some(name) = name {
+        if if_enrolled && !x509_enrolled(model, host, name) {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![grafhome_ca::x509::active_cert(
+            &model.policy,
+            host,
+            name,
+        )?]);
+    }
+    let certs = model
+        .policy
+        .x509_certs_for_host(host)
+        .into_iter()
+        .filter(|cert| cert.status.is_active())
+        .filter(|cert| !if_enrolled || x509_enrolled(model, host, &cert.name))
+        .collect::<Vec<_>>();
+    if certs.is_empty() && !if_enrolled {
+        return Err(grafhome_ca::Error::Validation {
+            field: "x509 certificate".to_owned(),
+            message: format!("host {host} declares no active X.509 certificates"),
+        });
+    }
+    Ok(certs)
+}
+
+/// Whether this host enrolled a certificate. It need not be approved yet.
+fn x509_enrolled(model: &SiteModel, host: &str, name: &str) -> bool {
+    server_root_cert_path(model).is_file() && x509_paths(model, host, name).has_credential()
+}
+
+fn x509_paths(model: &SiteModel, host: &str, name: &str) -> X509Paths {
+    X509Paths::new(
+        &host_material_dir(model, host),
+        &model.deployment.x509_dir(),
+        name,
+    )
+}
+
+fn local_x509_certificate<'a>(
+    model: &SiteModel,
+    cert: &'a grafhome_ca::policy::X509Cert,
+    step_bin: &str,
+) -> grafhome_ca::Result<LocalCertificate<'a>> {
+    Ok(LocalCertificate {
+        cert,
+        paths: x509_paths(model, &cert.host, &cert.name),
+        step_bin: PathBuf::from(step_bin),
+        steppath: PathBuf::from(&model.deployment.values["GRAFHOME_CA_SERVER_STEPPATH"]),
+        root: server_root_cert_path(model),
+        ca_url: required_endpoint(model, &cert.ca_endpoint)?.url(),
+    })
+}
+
+/// Keep `after_renew` inside the sandbox of a non-root test run.
+///
+/// These programs are privileged executables that `require_root_or_isolated_test`
+/// cannot inventory, because it runs before policy is loaded.
+fn confine_after_renew(
+    model: &SiteModel,
+    certs: &[&grafhome_ca::policy::X509Cert],
+) -> grafhome_ca::Result<()> {
+    #[cfg(unix)]
+    {
+        if rustix::process::geteuid().is_root() || TermuxHostRuntime::detect()?.is_some() {
+            return Ok(());
+        }
+        let command = "x509 renew";
+        let sandbox = model
+            .config_root
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .ok_or_else(|| root_required(command))?;
+        for program in certs.iter().filter_map(|cert| cert.after_renew.first()) {
+            let resolved =
+                resolve_location(Path::new(program)).map_err(|_| root_required(command))?;
+            if !resolved.starts_with(&sandbox) {
+                return Err(root_required(command));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (model, certs);
+    Ok(())
+}
+
+/// Renew this host's certificates, returning whether the run succeeded.
+///
+/// One certificate's failure does not stop the next. The exit status and what gets
+/// printed follow the certificate's own state: see [`RenewalFailure`].
+///
+/// [`RenewalFailure`]: grafhome_ca::x509::RenewalFailure
+fn renew_x509(
+    model: &SiteModel,
+    host: &str,
+    name: Option<&str>,
+    flags: X509RenewFlags,
+) -> grafhome_ca::Result<bool> {
+    let certs = x509_targets(model, host, name, flags.if_enrolled)?;
+    if certs.is_empty() {
+        return Ok(true);
+    }
+    confine_after_renew(model, &certs)?;
+    let step_bin = root_step_bin(model)?;
+    let mut succeeded = true;
+    for cert in certs {
+        let identity = x509_identity(&cert.host, &cert.name);
+        if !x509_enrolled(model, host, &cert.name) {
+            eprintln!(
+                "grafhome-ca: {identity}: not enrolled; run `grafhome-ca x509 enroll {}`",
+                cert.name
+            );
+            succeeded = false;
+            continue;
+        }
+        let local = local_x509_certificate(model, cert, &step_bin)?;
+        let endpoint = required_endpoint(model, &cert.ca_endpoint)?;
+        let probe = || endpoint_reachable(endpoint);
+        let probe: Option<&dyn Fn() -> grafhome_ca::Result<bool>> =
+            flags.if_reachable.then_some(&probe);
+        match local.renew(probe) {
+            Ok(Renewal::Current) => {}
+            Ok(Renewal::Busy) => {
+                if !flags.quiet {
+                    eprintln!("{identity}: another renewal is already running");
+                }
+            }
+            Ok(Renewal::Published { not_after }) => {
+                if !flags.quiet {
+                    outln!("{identity}: renewed, valid until {}", timestamp(not_after)?);
+                }
+            }
+            Err(failure) => {
+                if !(flags.if_reachable && flags.quiet && failure.hidden()) {
+                    eprintln!("grafhome-ca: {identity}: {}", failure.error);
+                }
+                succeeded &= flags.if_reachable && failure.tolerated();
+            }
+        }
+    }
+    Ok(succeeded)
+}
+
+/// Report on this host's certificates, returning whether all are healthy.
+///
+/// Alerts go to stdout under every flag, because cron mail depends on output. This
+/// never contacts the CA, so it still alerts during the outage it may be reporting.
+fn status_x509(
+    model: &SiteModel,
+    host: &str,
+    name: Option<&str>,
+    if_enrolled: bool,
+    quiet: bool,
+) -> grafhome_ca::Result<bool> {
+    let certs = x509_targets(model, host, name, if_enrolled)?;
+    if certs.is_empty() {
+        return Ok(true);
+    }
+    let step_bin = root_step_bin(model)?;
+    let now = time::OffsetDateTime::now_utc();
+    let mut healthy = true;
+    for cert in certs {
+        let local = local_x509_certificate(model, cert, &step_bin)?;
+        let identity = x509_identity(&cert.host, &cert.name);
+        let assessment = local.assess(now);
+        let alert = match &assessment {
+            Ok(assessment) => assessment.alert(local.ttl()?, now),
+            Err(_) => true,
+        };
+        healthy &= !alert;
+        match assessment {
+            Ok(assessment) if alert || !quiet => {
+                outln!("{identity}: {}", x509_status_text(&assessment, alert)?);
+            }
+            Ok(_) => {}
+            Err(error) => outln!("{identity}: cannot be assessed: {error}"),
+        }
+    }
+    Ok(healthy)
+}
+
+fn x509_status_text(assessment: &Assessment, alert: bool) -> grafhome_ca::Result<String> {
+    let end = assessment.not_after.map(timestamp).transpose()?;
+    let end = end.unwrap_or_default();
+    Ok(match assessment.condition {
+        Condition::Valid if alert => {
+            format!("expires {end}, with under one-third of its lifetime left")
+        }
+        Condition::Valid => format!("valid until {end}"),
+        Condition::Missing => "certificate is missing".to_owned(),
+        Condition::Unreadable => "certificate cannot be read".to_owned(),
+        Condition::NoIntermediate => "certificate lacks its intermediate".to_owned(),
+        Condition::KeyMismatch => "certificate does not match its key".to_owned(),
+        Condition::Expired => format!("certificate expired at {end}"),
+    })
+}
+
+fn timestamp(value: time::OffsetDateTime) -> grafhome_ca::Result<String> {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| grafhome_ca::Error::Validation {
+            field: "timestamp".to_owned(),
+            message: error.to_string(),
+        })
 }
 
 fn approve_x509(

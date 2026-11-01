@@ -505,6 +505,78 @@ aVXF2GUB0FzWyZNJBGBdIwsLJSjUsFMF+216+CkBLucOD2YTRAkWruHHcQ=='
         ;;
     esac
     ;;
+  "certificate create")
+    if [ "${FAKE_STEP_FAIL:-}" = "certificate-create" ]; then
+      printf 'simulated CSR failure\n' >&2
+      exit 52
+    fi
+    key=""
+    previous=""
+    for argument in "$@"; do
+      if [ "$previous" = "--key" ]; then key="$argument"; fi
+      previous="$argument"
+    done
+    # A fake CSR is only the SPKI fingerprint of the key that signed it.
+    if grep -q 'pLa4TQ2I6fGx' "$key"; then
+      printf 'd3ba565a040504bc3a1f1a6dca6530dc6533bd2541c9d412e59edcfef77372b2' > "$4"
+    else
+      printf '495c27d9f097bbc7d9ec4a6661613f25005d7dd4c148d2b0a98f0c39153ec8a2' > "$4"
+    fi
+    ;;
+  "certificate inspect")
+    for file in "$@"; do :; done
+    if [ "$(sed -n 1p "$file" 2>/dev/null)" != "-----BEGIN CERTIFICATE-----" ]; then
+      printf 'file does not contain any valid CERTIFICATE\n' >&2
+      exit 1
+    fi
+    # Like the real tool, `--bundle` prints a bare object for a single certificate.
+    if [ -n "$(sed -n 5p "$file")" ]; then
+      printf '['
+      sed -n 2p "$file"
+      printf ','
+      sed -n 5p "$file"
+      printf ']\n'
+    else
+      sed -n 2p "$file"
+    fi
+    ;;
+  "certificate verify")
+    if [ -n "${FAKE_SNAPSHOT_FROM:-}" ]; then
+      cp -R "$FAKE_SNAPSHOT_FROM" "$FAKE_SNAPSHOT_TO"
+    fi
+    if [ "${FAKE_STEP_FAIL:-}" = "certificate-verify" ]; then
+      printf 'simulated chain failure\n' >&2
+      exit 53
+    fi
+    ;;
+  "ca sign")
+    if [ "${FAKE_STEP_FAIL:-}" = "ca-sign" ]; then
+      printf 'simulated signing failure\n' >&2
+      exit 54
+    fi
+    if [ "${FAKE_STEP_STALL:-}" = "ca-sign" ]; then
+      sleep 60 &
+      printf '%s' "$!" > "$FAKE_LOG.stalled"
+      wait
+    fi
+    count=$(($(cat "$FAKE_LOG.signed" 2>/dev/null || echo 0) + 1))
+    printf '%s' "$count" > "$FAKE_LOG.signed"
+    {
+      printf -- '-----BEGIN CERTIFICATE-----\n'
+      printf '{"serial_number":"%s","names":%s,"validity":{"end":"%s"},"subject_key_info":{"fingerprint_sha256":"%s"},"extensions":{"extended_key_usage":{"%s":true}}}\n' \
+        "$count" \
+        "${FAKE_SIGN_NAMES:-[\"edge-host.example.test\"]}" \
+        "${FAKE_SIGN_NOT_AFTER:-2999-01-01T00:00:00Z}" \
+        "${FAKE_SIGN_KEY:-$(cat "$3")}" \
+        "${FAKE_SIGN_EKU:-client_auth}"
+      printf -- '-----END CERTIFICATE-----\n'
+      if [ "${FAKE_SIGN_NO_CHAIN:-}" != "1" ]; then
+        printf -- '-----BEGIN CERTIFICATE-----\n'
+        printf '{"validity":{"end":"2999-01-01T00:00:00Z"},"subject_key_info":{"fingerprint_sha256":"intermediate"}}\n'
+        printf -- '-----END CERTIFICATE-----\n'
+      fi
+    } > "$4"
+    ;;
   "crypto rand")
     printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'
     ;;
@@ -8816,7 +8888,7 @@ fn x509_commands_are_visible() {
         .output()
         .unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
-    for command in ["enroll", "approve", "revoke"] {
+    for command in ["enroll", "approve", "renew", "status", "revoke"] {
         assert!(text.contains(command), "missing x509 {command}");
     }
 }
@@ -9825,4 +9897,1143 @@ fn apply_ca_refuses_jwk_without_x509_deny() {
         assert_eq!(fs::read(&ca_json).unwrap(), before);
     }
     assert_eq!(restart_count(&fixture), 0);
+}
+
+/// SPKI fingerprints of [`X509_KEY`] and [`X509_KEY_TWO`], as `step` prints them.
+#[cfg(unix)]
+const X509_SPKI: &str = "d3ba565a040504bc3a1f1a6dca6530dc6533bd2541c9d412e59edcfef77372b2";
+#[cfg(unix)]
+const X509_SPKI_TWO: &str = "495c27d9f097bbc7d9ec4a6661613f25005d7dd4c148d2b0a98f0c39153ec8a2";
+#[cfg(unix)]
+const X509_STEP_TIMEOUT: &str = "GRAFHOME_CA_X509_STEP_TIMEOUT_SECS";
+#[cfg(unix)]
+const X509_LOCK_TIMEOUT: &str = "GRAFHOME_CA_X509_LOCK_TIMEOUT_SECS";
+/// Bounds a test on the timeouts themselves, so a hang fails instead of stalling CI.
+#[cfg(unix)]
+const X509_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A host with an enrolled, unissued `nfs-client`, and that certificate's directory.
+#[cfg(unix)]
+fn enrolled_x509() -> (tempfile::TempDir, ExecFixture, PathBuf) {
+    let (dir, fixture) = exec_fixture();
+    let x509_dir = prepare_x509_enrollment(&fixture, dir.path());
+    enroll_x509(&fixture).assert().success();
+    (dir, fixture, x509_dir.join("nfs-client"))
+}
+
+/// A fake certificate chain for `key_spki`, expiring `remaining` from now.
+#[cfg(unix)]
+fn fake_chain(key_spki: &str, remaining: time::Duration) -> String {
+    let not_after = (time::OffsetDateTime::now_utc() + remaining)
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    format!(
+        "-----BEGIN CERTIFICATE-----\n\
+         {{\"names\":[\"edge-host.example.test\"],\"validity\":{{\"end\":\"{not_after}\"}},\
+         \"subject_key_info\":{{\"fingerprint_sha256\":\"{key_spki}\"}},\
+         \"extensions\":{{\"extended_key_usage\":{{\"client_auth\":true}}}}}}\n\
+         -----END CERTIFICATE-----\n\
+         -----BEGIN CERTIFICATE-----\n\
+         {{\"validity\":{{\"end\":\"2999-01-01T00:00:00Z\"}},\
+         \"subject_key_info\":{{\"fingerprint_sha256\":\"intermediate\"}}}}\n\
+         -----END CERTIFICATE-----\n"
+    )
+}
+
+/// Install a live certificate for the enrolled key, expiring `remaining` from now.
+#[cfg(unix)]
+fn seed_certificate(cert_dir: &Path, remaining: time::Duration) -> Vec<u8> {
+    let chain = fake_chain(X509_SPKI, remaining);
+    fs::write(cert_dir.join("cert.pem"), &chain).unwrap();
+    chain.into_bytes()
+}
+
+#[cfg(unix)]
+fn x509_cert_command(fixture: &ExecFixture, verb: &str, flags: &[&str]) -> Command {
+    let mut command = x509_command(fixture, &[verb, "nfs-client", "--host", "edge-host"]);
+    command.args(flags).timeout(X509_TEST_DEADLINE);
+    command
+}
+
+#[cfg(unix)]
+fn renew_x509(fixture: &ExecFixture, flags: &[&str]) -> Command {
+    x509_cert_command(fixture, "renew", flags)
+}
+
+#[cfg(unix)]
+fn status_x509(fixture: &ExecFixture, flags: &[&str]) -> Command {
+    x509_cert_command(fixture, "status", flags)
+}
+
+#[cfg(unix)]
+fn fake_log(fixture: &ExecFixture) -> String {
+    fs::read_to_string(&fixture.log).unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn sign_count(fixture: &ExecFixture) -> usize {
+    fake_log(fixture).matches("args=ca sign").count()
+}
+
+/// The certificate directory's entries, which also shows no staging file survived.
+#[cfg(unix)]
+fn cert_dir_entries(cert_dir: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(cert_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+fn x509_lock_path(fixture: &ExecFixture) -> PathBuf {
+    fixture
+        .config_root
+        .join("../server-step/secrets/hosts/edge-host/x509/nfs-client.lock")
+}
+
+/// Hold the material lock the way a concurrent run would.
+#[cfg(unix)]
+fn hold_x509_lock(fixture: &ExecFixture) -> fs::File {
+    use fs2::FileExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(x509_lock_path(fixture))
+        .unwrap();
+    file.lock_exclusive().unwrap();
+    file
+}
+
+/// Wait until a run has read the certificate and key, the last step before the lock.
+#[cfg(unix)]
+fn await_x509_assessment(fixture: &ExecFixture) {
+    let deadline = std::time::Instant::now() + X509_TEST_DEADLINE;
+    while !fake_log(fixture).contains("args=crypto key public") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "renewal never assessed the certificate:\n{}",
+            fake_log(fixture)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Point `ca_origin`, which `nfs-client` declares, at a closed loopback port.
+#[cfg(unix)]
+fn close_ca_origin(fixture: &ExecFixture) {
+    set_ca_origin_port(fixture, 1);
+}
+
+/// Point `ca_origin` at a live loopback listener, and return it.
+#[cfg(unix)]
+fn open_ca_origin(fixture: &ExecFixture) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    set_ca_origin_port(fixture, listener.local_addr().unwrap().port());
+    listener
+}
+
+#[cfg(unix)]
+fn set_ca_origin_port(fixture: &ExecFixture, port: u16) {
+    let path = fixture.config_root.join("policy/ca.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replacen("address = \"198.51.100.20\"", "address = \"127.0.0.1\"", 1)
+        .replacen("port = 8443", &format!("port = {port}"), 1);
+    fs::write(path, text).unwrap();
+}
+
+/// Declare `after_renew` on `nfs-client`, with the hook logging each run.
+#[cfg(unix)]
+fn add_after_renew(fixture: &ExecFixture, dir: &Path, body: &str) -> PathBuf {
+    let hook = dir.join("after-renew");
+    write_executable(&hook, &format!("#!/bin/sh\n{body}\n"));
+    let path = fixture.config_root.join("policy/hosts/edge-host.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text = text.replacen(
+        "[x509_certs.nfs-client]\n",
+        &format!(
+            "[x509_certs.nfs-client]\nafter_renew = [\"{}\", \"reload\"]\n",
+            hook.display()
+        ),
+        1,
+    );
+    fs::write(path, text).unwrap();
+    hook
+}
+
+#[cfg(unix)]
+fn hours(count: i64) -> time::Duration {
+    time::Duration::hours(count)
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_issues_when_missing() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+
+    renew_x509(&fixture, &[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("x509 nfs-client@edge-host"));
+
+    assert!(cert_dir.join("cert.pem").is_file());
+    let log = fake_log(&fixture);
+    assert!(log.contains("args=certificate create edge-host.example.test"));
+    assert!(log.contains("--csr"));
+    assert!(log.contains("args=ca token edge-host.example.test --san edge-host.example.test"));
+    assert!(log.contains("--ca-url https://ca-origin.example.test:8443"));
+    assert_eq!(
+        cert_dir_entries(&cert_dir),
+        ["cert.pem", "key.pem"],
+        "staging files must not survive"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_skips_when_fresh() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(17));
+
+    renew_x509(&fixture, &[])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert_eq!(sign_count(&fixture), 0);
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_renews_once_a_third_of_the_lifetime_has_passed() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(15));
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_eq!(sign_count(&fixture), 1);
+    assert_ne!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_quiet_prints_nothing_on_success() {
+    let (_dir, fixture, _cert_dir) = enrolled_x509();
+
+    renew_x509(&fixture, &["--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert_eq!(sign_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_without_a_name_covers_every_active_certificate() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+
+    x509_command(&fixture, &["renew", "--host", "edge-host"])
+        .assert()
+        .success();
+
+    assert!(cert_dir.join("cert.pem").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_keeps_private_key() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(1));
+    let key = fs::read(cert_dir.join("key.pem")).unwrap();
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_eq!(fs::read(cert_dir.join("key.pem")).unwrap(), key);
+    assert_eq!(file_mode(&cert_dir.join("key.pem")), 0o600);
+    assert_eq!(fake_log(&fixture).matches("args=crypto keypair").count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_replaces_cert_atomically() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+    let inode = fs::metadata(cert_dir.join("cert.pem")).unwrap().ino();
+    let snapshot = dir.path().join("during-validation");
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_SNAPSHOT_FROM", &cert_dir)
+        .env("FAKE_SNAPSHOT_TO", &snapshot)
+        .assert()
+        .success();
+
+    // The old certificate is still live while the candidate is being validated,
+    // and the candidate sits beside it, so the final step is a same-directory rename.
+    assert_eq!(fs::read(snapshot.join("cert.pem")).unwrap(), before);
+    let log = fake_log(&fixture);
+    let candidate = log
+        .lines()
+        .find_map(|line| line.split_once("args=certificate verify "))
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert!(
+        Path::new(candidate).starts_with(&cert_dir),
+        "candidate {candidate} is outside {}",
+        cert_dir.display()
+    );
+    assert_ne!(
+        fs::metadata(cert_dir.join("cert.pem")).unwrap().ino(),
+        inode
+    );
+    assert_eq!(file_mode(&cert_dir.join("cert.pem")), 0o644);
+}
+
+#[cfg(unix)]
+#[test]
+fn cert_pem_is_leaf_plus_intermediate() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+
+    renew_x509(&fixture, &[]).assert().success();
+    assert_eq!(
+        fs::read_to_string(cert_dir.join("cert.pem"))
+            .unwrap()
+            .matches("BEGIN CERTIFICATE")
+            .count(),
+        2
+    );
+
+    // A leaf alone is refused in both directions, so it must never be published.
+    let before = seed_certificate(&cert_dir, hours(1));
+    renew_x509(&fixture, &[])
+        .env("FAKE_SIGN_NO_CHAIN", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("intermediate"));
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn live_leaf_without_intermediate_is_replaced() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let chain = fake_chain(X509_SPKI, hours(20));
+    let leaf = chain.lines().take(3).collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(cert_dir.join("cert.pem"), leaf).unwrap();
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_eq!(sign_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_sign_leaves_cert_intact() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "ca-sign")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("simulated signing failure"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(cert_dir_entries(&cert_dir), ["cert.pem", "key.pem"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_token_leaves_cert_intact() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "ca-token")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("simulated token failure"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn chain_is_validated_before_publish() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "certificate-verify")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("simulated chain failure"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(cert_dir_entries(&cert_dir), ["cert.pem", "key.pem"]);
+    let log = fake_log(&fixture);
+    let verify = log
+        .lines()
+        .find(|line| line.contains("args=certificate verify"))
+        .unwrap();
+    assert!(verify.contains("--roots "), "{verify}");
+    assert!(verify.contains("server-step/certs/root_ca.crt"), "{verify}");
+    assert!(verify.contains("--host edge-host.example.test"), "{verify}");
+}
+
+#[cfg(unix)]
+#[test]
+fn san_and_eku_mismatch_refused() {
+    for (variable, value, refusal) in [
+        ("FAKE_SIGN_NAMES", r#"["other.example.test"]"#, "names"),
+        (
+            "FAKE_SIGN_NAMES",
+            r#"["edge-host.example.test","other.example.test"]"#,
+            "names",
+        ),
+        ("FAKE_SIGN_EKU", "server_auth", "usage"),
+    ] {
+        let (_dir, fixture, cert_dir) = enrolled_x509();
+        let before = seed_certificate(&cert_dir, hours(1));
+
+        renew_x509(&fixture, &[])
+            .env(variable, value)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(refusal));
+
+        assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cert_key_mismatch_refused() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_SIGN_KEY", X509_SPKI_TWO)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not match"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_expired_on_arrival_is_refused() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_SIGN_NOT_AFTER", "2000-01-01T00:00:00Z")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expired"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn expired_cert_still_renews() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(-1));
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_ne!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_cert_is_replaced() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    fs::write(cert_dir.join("cert.pem"), "garbage\n").unwrap();
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_eq!(sign_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn after_renew_runs_only_on_change() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    let runs = dir.path().join("hook-runs");
+    add_after_renew(
+        &fixture,
+        dir.path(),
+        &format!("printf '%s\\n' \"$*\" >> '{}'", runs.display()),
+    );
+
+    seed_certificate(&cert_dir, hours(17));
+    renew_x509(&fixture, &[]).assert().success();
+    assert!(!runs.exists(), "a fresh certificate changed nothing");
+
+    seed_certificate(&cert_dir, hours(1));
+    renew_x509(&fixture, &[]).assert().success();
+    assert_eq!(fs::read_to_string(&runs).unwrap(), "reload\n");
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "ca-sign")
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&runs).unwrap(), "reload\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn after_renew_does_not_run_on_a_failed_renewal() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    let runs = dir.path().join("hook-runs");
+    add_after_renew(&fixture, dir.path(), &format!("touch '{}'", runs.display()));
+    seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "certificate-verify")
+        .assert()
+        .failure();
+
+    assert!(!runs.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn after_renew_failure_is_reported() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    add_after_renew(&fixture, dir.path(), "echo hook-broke >&2\nexit 7");
+    seed_certificate(&cert_dir, hours(1));
+    let _ca = open_ca_origin(&fixture);
+
+    // Neither flag hides it: the certificate is published, and the service is not
+    // using it.
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("after_renew"))
+        .stderr(predicate::str::contains("hook-broke"));
+
+    assert_eq!(sign_count(&fixture), 1);
+    let published = fs::read_to_string(cert_dir.join("cert.pem")).unwrap();
+    assert!(published.contains("2999-01-01"), "{published}");
+}
+
+#[cfg(unix)]
+#[test]
+fn after_renew_refuses_an_untrusted_program() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    let runs = dir.path().join("hook-runs");
+    let hook = add_after_renew(&fixture, dir.path(), &format!("touch '{}'", runs.display()));
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o775)).unwrap();
+
+    renew_x509(&fixture, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("after_renew"));
+
+    assert!(!runs.exists());
+    assert!(cert_dir.join("cert.pem").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn after_renew_stays_inside_the_test_sandbox() {
+    let (_dir, fixture, _cert_dir) = enrolled_x509();
+    let path = fixture.config_root.join("policy/hosts/edge-host.toml");
+    let text = fs::read_to_string(&path).unwrap().replacen(
+        "[x509_certs.nfs-client]\n",
+        "[x509_certs.nfs-client]\nafter_renew = [\"/bin/true\"]\n",
+        1,
+    );
+    fs::write(&path, text).unwrap();
+
+    renew_x509(&fixture, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be run as root"));
+
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn if_reachable_uses_certificate_endpoint() {
+    // Only `ca_origin`, which this certificate declares, is up.
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(1));
+    configure_unreachable_ca(&fixture);
+    let origin = open_ca_origin(&fixture);
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .success();
+    assert_eq!(sign_count(&fixture), 1);
+    let port = origin.local_addr().unwrap().port();
+    assert!(fake_log(&fixture).contains(&format!("https://ca-origin.example.test:{port}")));
+
+    // Only `ca_api` is up, so this one must see its own endpoint as down.
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(1));
+    close_ca_origin(&fixture);
+    let api = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let path = fixture.config_root.join("policy/ca.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replacen("address = \"198.51.100.21\"", "address = \"127.0.0.1\"", 1)
+        .replacen(
+            "port = 443",
+            &format!("port = {}", api.local_addr().unwrap().port()),
+            1,
+        );
+    fs::write(path, text).unwrap();
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .success();
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn if_reachable_is_silent_when_ca_down() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+    close_ca_origin(&fixture);
+
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_renewal_exits_zero_while_unexpired_with_if_reachable() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+    let _ca = open_ca_origin(&fixture);
+
+    // A proxy can accept the connection while the CA behind it is down.
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .env("FAKE_STEP_FAIL", "ca-sign")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    // Boot units run without `--quiet`, so the journal still records it.
+    renew_x509(&fixture, &["--if-reachable"])
+        .env("FAKE_STEP_FAIL", "ca-sign")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("simulated signing failure"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_candidate_is_reported_even_when_quiet() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(1));
+    let _ca = open_ca_origin(&fixture);
+
+    // The CA answered with something wrong, which an outage cannot explain, while
+    // the live certificate keeps this host working.
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .env("FAKE_SIGN_EKU", "server_auth")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("usage"));
+}
+
+#[cfg(unix)]
+#[test]
+fn if_reachable_fails_silently_when_expired_and_ca_down() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    close_ca_origin(&fixture);
+
+    // Missing.
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("");
+
+    // Expired.
+    seed_certificate(&cert_dir, hours(-1));
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("");
+
+    // A mismatched pair cannot complete a handshake, however long it has left.
+    let chain = fake_chain(X509_SPKI_TWO, hours(20));
+    fs::write(cert_dir.join("cert.pem"), chain).unwrap();
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("");
+
+    // Boot units run without `--quiet`, and each failure must reach the journal.
+    renew_x509(&fixture, &["--if-reachable"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unreachable"));
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_renewal_fails_when_expired_with_if_reachable() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    let _ca = open_ca_origin(&fixture);
+
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .env("FAKE_STEP_FAIL", "ca-sign")
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("");
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_skips_concurrent_renewal() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+    let _lock = hold_x509_lock(&fixture);
+
+    renew_x509(&fixture, &["--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_waits_when_expired() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(-1));
+    let lock = hold_x509_lock(&fixture);
+
+    let mut command = renew_x509(&fixture, &["--quiet"]);
+    let run = std::thread::spawn(move || command.output().unwrap());
+    await_x509_assessment(&fixture);
+    // Waiting has no output to observe, so give a run that wrongly skipped time to
+    // exit. A correct run keeps waiting, so this margin can only miss a bug.
+    let margin = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < margin {
+        assert!(!run.is_finished(), "it skipped instead of waiting");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(sign_count(&fixture), 0, "it renewed without the lock");
+
+    drop(lock);
+    let output = run.join().unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_ne!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_wait_rechecks_the_certificate() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    let lock = hold_x509_lock(&fixture);
+
+    let mut command = renew_x509(&fixture, &[]);
+    let run = std::thread::spawn(move || command.output().unwrap());
+    await_x509_assessment(&fixture);
+    // The holder finishes the renewal this run was waiting for.
+    seed_certificate(&cert_dir, hours(20));
+    drop(lock);
+
+    assert!(run.join().unwrap().status.success());
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_wait_times_out() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    let _lock = hold_x509_lock(&fixture);
+
+    renew_x509(&fixture, &[])
+        .env(X509_LOCK_TIMEOUT, "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("timed out"));
+
+    renew_x509(&fixture, &["--if-reachable", "--quiet"])
+        .env(X509_LOCK_TIMEOUT, "1")
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr("");
+
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_timeout_is_refused() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(1));
+
+    for value in ["0", "soon", ""] {
+        renew_x509(&fixture, &[])
+            .env(X509_STEP_TIMEOUT, value)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(X509_STEP_TIMEOUT));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stalled_step_times_out() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(1));
+
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_STALL", "ca-sign")
+        .env(X509_STEP_TIMEOUT, "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("timed out"));
+
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(cert_dir_entries(&cert_dir), ["cert.pem", "key.pem"]);
+
+    // The whole process group goes, so nothing keeps talking to the CA.
+    let stalled = fs::read_to_string(format!("{}.stalled", fixture.log.display())).unwrap();
+    let deadline = std::time::Instant::now() + X509_TEST_DEADLINE;
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &stalled])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stalled child {stalled} survived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reenroll_rotates_key_without_mismatch() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(20));
+    let pending = stage_pending_key(&cert_dir);
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_eq!(
+        fs::read_to_string(cert_dir.join("key.pem")).unwrap(),
+        pending
+    );
+    assert_eq!(file_mode(&cert_dir.join("key.pem")), 0o600);
+    assert_eq!(cert_dir_entries(&cert_dir), ["cert.pem", "key.pem"]);
+    let published = fs::read_to_string(cert_dir.join("cert.pem")).unwrap();
+    assert!(published.contains(X509_SPKI_TWO), "{published}");
+
+    // The rotated pair is settled, so the next run has nothing to do.
+    renew_x509(&fixture, &[]).assert().success();
+    assert_eq!(sign_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+fn stage_pending_key(cert_dir: &Path) -> String {
+    let pending = format!("FAKE-PRIVATE\n{X509_KEY_TWO}");
+    let path = cert_dir.join("key.pem.pending");
+    fs::write(&path, &pending).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    pending
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_key_forces_renewal_when_fresh() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(23));
+    stage_pending_key(&cert_dir);
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    assert_eq!(sign_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_key_signs_before_rename() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    let before = seed_certificate(&cert_dir, hours(20));
+    let key = fs::read(cert_dir.join("key.pem")).unwrap();
+    let pending = stage_pending_key(&cert_dir);
+
+    // A failed signature changes nothing.
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "ca-sign")
+        .assert()
+        .failure();
+    assert_eq!(fs::read(cert_dir.join("cert.pem")).unwrap(), before);
+    assert_eq!(fs::read(cert_dir.join("key.pem")).unwrap(), key);
+    assert_eq!(
+        fs::read_to_string(cert_dir.join("key.pem.pending")).unwrap(),
+        pending
+    );
+
+    // Nor does a candidate that is refused after signing.
+    renew_x509(&fixture, &[])
+        .env("FAKE_STEP_FAIL", "certificate-verify")
+        .assert()
+        .failure();
+    assert_eq!(fs::read(cert_dir.join("key.pem")).unwrap(), key);
+
+    // By the time a good candidate is validated, neither live file has moved.
+    let snapshot = dir.path().join("during-validation");
+    renew_x509(&fixture, &[])
+        .env("FAKE_SNAPSHOT_FROM", &cert_dir)
+        .env("FAKE_SNAPSHOT_TO", &snapshot)
+        .assert()
+        .success();
+    assert_eq!(fs::read(snapshot.join("key.pem")).unwrap(), key);
+    assert_eq!(fs::read(snapshot.join("cert.pem")).unwrap(), before);
+    assert!(snapshot.join("key.pem.pending").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn crash_between_renames_recovers() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    // The key was renamed, and the crash came before the certificate followed.
+    seed_certificate(&cert_dir, hours(20));
+    fs::write(
+        cert_dir.join("key.pem"),
+        format!("FAKE-PRIVATE\n{X509_KEY_TWO}"),
+    )
+    .unwrap();
+
+    renew_x509(&fixture, &[]).assert().success();
+
+    let published = fs::read_to_string(cert_dir.join("cert.pem")).unwrap();
+    assert!(published.contains(X509_SPKI_TWO), "{published}");
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_if_enrolled_skips_unenrolled() {
+    let (dir, fixture) = exec_fixture();
+    prepare_x509_enrollment(&fixture, dir.path());
+    let silent = |command: &mut Command| {
+        command.assert().success().stdout("").stderr("");
+    };
+
+    silent(&mut renew_x509(&fixture, &["--if-enrolled"]));
+    silent(&mut renew_x509(
+        &fixture,
+        &["--if-enrolled", "--if-reachable", "--quiet"],
+    ));
+    silent(&mut x509_command(
+        &fixture,
+        &["renew", "--if-enrolled", "--host", "edge-host"],
+    ));
+    // A host with no declarations at all, as cron sees on most machines.
+    silent(&mut x509_command(
+        &fixture,
+        &["renew", "--if-enrolled", "--host", "laptop-a"],
+    ));
+    assert!(!fake_log(&fixture).contains("args=ca sign"));
+
+    renew_x509(&fixture, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("x509 enroll"));
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_refuses_an_undeclared_name() {
+    let (_dir, fixture, _cert_dir) = enrolled_x509();
+
+    x509_command(&fixture, &["renew", "../evil", "--host", "edge-host"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not declared"));
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_refuses_a_jwk_that_is_not_a_regular_file() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    let private = dir
+        .path()
+        .join("server-step/secrets/hosts/edge-host/x509/nfs-client/provisioner.priv.json");
+    fs::remove_file(&private).unwrap();
+    fs::create_dir(&private).unwrap();
+
+    renew_x509(&fixture, &[])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("regular file"));
+
+    assert!(!cert_dir.join("cert.pem").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn status_alerts_when_missing() {
+    let (_dir, fixture, _cert_dir) = enrolled_x509();
+
+    status_x509(&fixture, &["--quiet"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("x509 nfs-client@edge-host"))
+        .stdout(predicate::str::contains("missing"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_prints_under_threshold_with_quiet() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(7));
+
+    status_x509(&fixture, &["--quiet"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("x509 nfs-client@edge-host"))
+        .stdout(predicate::str::contains("expires"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_alerts_when_expired_or_mismatched() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+
+    seed_certificate(&cert_dir, hours(-1));
+    status_x509(&fixture, &[])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("expired"));
+
+    fs::write(
+        cert_dir.join("cert.pem"),
+        fake_chain(X509_SPKI_TWO, hours(20)),
+    )
+    .unwrap();
+    status_x509(&fixture, &[])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("does not match"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_quiet_is_silent_when_healthy() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(9));
+
+    status_x509(&fixture, &["--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    status_x509(&fixture, &[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("x509 nfs-client@edge-host"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_fails_even_when_ca_down() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(7));
+    close_ca_origin(&fixture);
+
+    status_x509(&fixture, &["--if-enrolled", "--quiet"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("expires"));
+
+    let log = fake_log(&fixture);
+    assert!(
+        !log.contains("args=ca "),
+        "status must stay offline:\n{log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn status_if_enrolled_skips_unenrolled() {
+    let (dir, fixture) = exec_fixture();
+    prepare_x509_enrollment(&fixture, dir.path());
+
+    status_x509(&fixture, &["--if-enrolled", "--quiet"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    x509_command(&fixture, &["status", "--if-enrolled", "--host", "laptop-a"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    // Without the flag, a declared certificate this host lacks is an alert.
+    status_x509(&fixture, &["--quiet"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("missing"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_without_a_name_covers_every_active_certificate() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(20));
+
+    x509_command(&fixture, &["status", "--host", "edge-host"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("x509 nfs-client@edge-host"));
 }

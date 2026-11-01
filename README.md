@@ -368,8 +368,9 @@ which keeps issuing until it is revoked.
 `tlshd` accepts any unexpired certificate chaining to the root, so who can
 obtain a certificate is the entire control. Each `[x509_certs.<name>]`
 declaration therefore gets its own JWK provisioner, whose template pins the subject, names, key usage, single
-extended key usage, and enrolled public key. Renewal and rekey are disabled on
-it, and it cannot issue SSH certificates.
+extended key usage, and enrolled public key. Smallstep's own `/renew` and `/rekey`
+are disabled on it, so `x509 renew` always goes through the JWK, and it cannot
+issue SSH certificates.
 
 ```sh
 # Target host as root, after `grafhome-ca ssh enroll host`.
@@ -380,6 +381,9 @@ grafhome-ca x509 enroll nfs-client
 # authority allow-list; approval does not change it, and issuance is refused
 # until it runs.
 grafhome-ca x509 approve
+
+# Target host as root. See "X.509 renewal and status".
+grafhome-ca x509 renew nfs-client
 
 # CA origin as root.
 grafhome-ca x509 revoke --host edge-host --reason "device retired" nfs-client
@@ -396,6 +400,54 @@ the same key cannot enroll again. Certificates already issued stay valid until
 they expire. To replace a revoked key, distribute the updated
 `policy/revocations.toml` to the host and rerun `x509 enroll`, which replaces
 only tombstoned material.
+
+### X.509 renewal and status
+
+```sh
+# Cron, as root. Renewal retries every 5 minutes; status alerts by mail on output.
+grafhome-ca x509 renew --if-enrolled --if-reachable --quiet
+grafhome-ca x509 status --if-enrolled --quiet
+
+# Boot unit, before anything needs the certificate.
+until grafhome-ca x509 renew nfs-client --if-enrolled --if-reachable; do sleep 15; done
+```
+
+`x509 renew` issues a missing certificate and renews once a third of its lifetime
+has passed, which is 16h remaining for a 24h certificate and 480h for a 720h one.
+With no name it covers every active certificate on the host. It re-signs the
+existing private key with a token from the renewal JWK, on the certificate's own
+`ca_endpoint`, so an expired certificate renews normally. The result is checked
+against the declared names, usage, and key and against the pinned root alone, then
+renamed over `cert.pem`, which holds the leaf and intermediate. A failure at any
+point leaves the live files untouched.
+
+A key staged by re-enrollment forces the next renewal. Signing finishes before
+either rename, then the key moves and the certificate follows. A handshake or crash
+between the two renames fails, and the next run repairs the pair.
+
+`--if-enrolled` skips a certificate the host has not enrolled, and `--if-reachable`
+decides by what the host still has:
+
+| Live certificate | CA unreachable, or renewal fails | Output |
+| --- | --- | --- |
+| Works | Exit 0 | Silent under `--quiet` |
+| Missing, expired, unreadable, or not matching its key | Exit nonzero | Silent under `--quiet` |
+
+A TCP probe cannot see past a proxy, so a failed token or signature counts as
+unreachable. A candidate the host refuses is reported even under `--quiet`, because
+an outage cannot explain it. Lock contention follows the same split: a run skips
+while the live certificate works and waits otherwise. Each `step` call has a 60s
+limit and each lock wait a 120s limit.
+
+`after_renew` runs only after a new certificate is published. Its program must pass
+the same ownership checks as `step`. A failure exits nonzero under every flag, and
+the certificate stays published. The hook is not retried; the next renewal runs it
+again.
+
+`x509 status` never contacts the CA, so it still reports during an outage. It prints
+and exits nonzero for a missing, unreadable, expired, or mismatched certificate, one
+missing its intermediate, or one with under a third of its lifetime left: 8h for a
+24h certificate and 240h for a 720h one. `--quiet` hides only healthy output.
 
 User enrollment requires one public request copied to the CA and one secret
 grant copied back. User and host default to `GRAFHOME_CA_LOCAL_USER` and

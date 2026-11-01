@@ -243,9 +243,20 @@ after_renew = ["/usr/sbin/service", "apache2", "reload"]
 - `ttl` uses the usual Go-style units and may not exceed `720h`.
 - `ca_endpoint` is `ca_api` or `ca_origin`.
 - `after_renew` is optional. When present it is a non-empty argv whose program
-  is an absolute path.
+  is an absolute path. `x509 renew` runs it only after publishing a new
+  certificate. The program must be owned by root or the caller and not writable
+  by anyone else, along with every directory above it.
 - `status` defaults to `active`. A `planned` or `disabled` declaration
   contributes nothing to the authority allow-list.
+
+`x509 renew` and `x509 status` take their limits from two optional environment
+variables, in positive whole seconds. These are not deployment keys, because older
+binaries reject unknown ones.
+
+| Variable | Default | Bounds |
+| --- | --- | --- |
+| `GRAFHOME_CA_X509_STEP_TIMEOUT_SECS` | `60` | Each `step` call and `after_renew` run |
+| `GRAFHOME_CA_X509_LOCK_TIMEOUT_SECS` | `120` | Waiting for the certificate's lock |
 
 The authority X.509 DNS allow-list is derived, not configured: the `ca_api` and
 `ca_origin` endpoint names plus every active declared name. Policy without
