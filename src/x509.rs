@@ -496,11 +496,24 @@ impl X509Paths {
         }
     }
 
-    /// Whether a renewal credential exists, complete or not. A partial one counts,
-    /// so renewal reports it rather than skipping it as not enrolled.
+    /// Whether this host holds anything for this certificate.
+    ///
+    /// Any one file counts, so only a host with nothing is "not enrolled". A
+    /// restored VM can keep `cert.pem` and lose its JWK, which stays out of backups,
+    /// and treating that as not enrolled would let `--if-enrolled` pass a boot gate
+    /// on an expired certificate and silence the alert about it.
     #[must_use]
-    pub fn has_credential(&self) -> bool {
-        self.private_jwk.exists() || self.password.exists()
+    pub fn has_material(&self) -> bool {
+        [
+            &self.private_jwk,
+            &self.public_jwk,
+            &self.password,
+            &self.cert,
+            &self.key,
+            &self.pending_key,
+        ]
+        .into_iter()
+        .any(|path| path.exists())
     }
 
     /// The key an enrollment covers: the pending key if one is staged, else the live key.
@@ -1249,6 +1262,13 @@ impl LocalCertificate<'_> {
         for secret in [key, &self.paths.private_jwk, &self.paths.password] {
             require_private_file(secret).map_err(refused(usable))?;
         }
+        // `step` would fail on this too, but as a CA call, which reads as an outage.
+        if !self.root.is_file() {
+            return Err(refused(usable)(Error::Validation {
+                field: self.root.display().to_string(),
+                message: "pinned root is missing; run `grafhome-ca ssh enroll host`".to_owned(),
+            }));
+        }
         let public_key = public_key_of(&self.step_bin, key).map_err(refused(usable))?;
         let directory = self.paths.cert.parent().ok_or_else(|| {
             refused(usable)(Error::Validation {
@@ -1393,16 +1413,29 @@ impl LocalCertificate<'_> {
     }
 
     /// Replace the live files with a validated candidate.
+    ///
+    /// `step` writes without syncing, so the candidate is synced first: a power cut
+    /// must not turn the rename into an empty `cert.pem`.
     fn publish(&self, candidate: &Path) -> Result<()> {
         #[cfg(unix)]
         std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(CERTIFICATE_MODE))
+            .map_err(|source| Error::io(candidate, source))?;
+        File::open(candidate)
+            .and_then(|file| file.sync_all())
             .map_err(|source| Error::io(candidate, source))?;
         if self.paths.pending_key.exists() {
             std::fs::rename(&self.paths.pending_key, &self.paths.key)
                 .map_err(|source| Error::io(&self.paths.key, source))?;
         }
         std::fs::rename(candidate, &self.paths.cert)
-            .map_err(|source| Error::io(&self.paths.cert, source))
+            .map_err(|source| Error::io(&self.paths.cert, source))?;
+        #[cfg(unix)]
+        if let Some(directory) = self.paths.cert.parent() {
+            File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| Error::io(directory, source))?;
+        }
+        Ok(())
     }
 
     /// Run the declared hook, checking its program's provenance just before use.

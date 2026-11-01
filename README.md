@@ -425,8 +425,10 @@ A key staged by re-enrollment forces the next renewal. Signing finishes before
 either rename, then the key moves and the certificate follows. A handshake or crash
 between the two renames fails, and the next run repairs the pair.
 
-`--if-enrolled` skips a certificate the host has not enrolled, and `--if-reachable`
-decides by what the host still has:
+`--if-enrolled` skips a certificate only when the host holds no material for it at
+all. A host that kept `cert.pem` but lost its JWK or root is enrolled and broken: it
+fails and alerts once the certificate stops working. `--if-reachable` decides by what
+the host still has:
 
 | Live certificate | CA unreachable, or renewal fails | Output |
 | --- | --- | --- |

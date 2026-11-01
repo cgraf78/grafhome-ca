@@ -4033,10 +4033,11 @@ struct X509RenewFlags {
 
 /// The declarations a command covers on this host.
 ///
-/// With `--if-enrolled`, a certificate with no local material is left out, so a
-/// host-independent cron line or unit can run everywhere and such a host needs
-/// neither `step` nor a declaration. Once material exists the name must be
-/// declared: a host holding credentials policy no longer lists should hear of it.
+/// With `--if-enrolled`, a certificate with no local material at all is left out,
+/// so a host-independent cron line or unit can run everywhere and such a host needs
+/// neither `step` nor a declaration. Any material keeps it in, however incomplete:
+/// a usable certificate stays quiet, an unusable one fails and alerts, and a name
+/// policy no longer declares is refused.
 fn x509_targets<'a>(
     model: &'a SiteModel,
     host: &str,
@@ -4069,9 +4070,10 @@ fn x509_targets<'a>(
     Ok(certs)
 }
 
-/// Whether this host enrolled a certificate. It need not be approved yet.
+/// Whether this host holds anything for a certificate, which need not be approved
+/// or complete.
 fn x509_enrolled(model: &SiteModel, host: &str, name: &str) -> bool {
-    server_root_cert_path(model).is_file() && x509_paths(model, host, name).has_credential()
+    x509_paths(model, host, name).has_material()
 }
 
 fn x509_paths(model: &SiteModel, host: &str, name: &str) -> X509Paths {

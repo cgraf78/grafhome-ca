@@ -11037,3 +11037,144 @@ fn status_without_a_name_covers_every_active_certificate() {
         .success()
         .stdout(predicate::str::contains("x509 nfs-client@edge-host"));
 }
+
+/// The renewal credential directory of the enrolled `nfs-client`.
+#[cfg(unix)]
+fn x509_credential_dir(fixture: &ExecFixture) -> PathBuf {
+    fixture
+        .config_root
+        .join("../server-step/secrets/hosts/edge-host/x509/nfs-client")
+}
+
+/// The flags boot units and cron pass, for each verb that takes them.
+#[cfg(unix)]
+const X509_RENEW_UNATTENDED: [&str; 3] = ["--if-enrolled", "--if-reachable", "--quiet"];
+#[cfg(unix)]
+const X509_STATUS_UNATTENDED: [&str; 2] = ["--if-enrolled", "--quiet"];
+
+/// Assert a host that holds some material cannot pass the boot gate or skip the alert.
+#[cfg(unix)]
+fn assert_broken_enrollment_fails(fixture: &ExecFixture) {
+    let _ca = open_ca_origin(fixture);
+    renew_x509(fixture, &X509_RENEW_UNATTENDED)
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::is_empty().not());
+    status_x509(fixture, &X509_STATUS_UNATTENDED)
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[cfg(unix)]
+#[test]
+fn renew_if_enrolled_fails_when_expired_without_credential() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    fs::remove_dir_all(x509_credential_dir(&fixture)).unwrap();
+    let _ca = open_ca_origin(&fixture);
+
+    renew_x509(&fixture, &X509_RENEW_UNATTENDED)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("provisioner.priv.json"));
+
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_if_enrolled_alerts_when_expired_without_credential() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    fs::remove_dir_all(x509_credential_dir(&fixture)).unwrap();
+
+    status_x509(&fixture, &X509_STATUS_UNATTENDED)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("expired"));
+}
+
+#[cfg(unix)]
+#[test]
+fn if_enrolled_fails_when_expired_without_root_certificate() {
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    fs::remove_file(dir.path().join("server-step/certs/root_ca.crt")).unwrap();
+    let _ca = open_ca_origin(&fixture);
+
+    // A lost root is no outage, so `--quiet` must not hide it as one.
+    renew_x509(&fixture, &X509_RENEW_UNATTENDED)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("root_ca.crt"));
+    status_x509(&fixture, &X509_STATUS_UNATTENDED)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("expired"));
+    assert_eq!(sign_count(&fixture), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn if_enrolled_fails_when_expired_with_the_whole_host_directory_gone() {
+    // A restored VM: the JWK stays out of backups, and `cert.pem` does not.
+    let (dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(-1));
+    fs::remove_dir_all(dir.path().join("server-step")).unwrap();
+
+    assert_broken_enrollment_fails(&fixture);
+}
+
+#[cfg(unix)]
+#[test]
+fn if_enrolled_counts_any_single_local_file_as_enrolled() {
+    for file in [
+        "provisioner.priv.json",
+        "provisioner.pub.json",
+        "renewal-password",
+        "cert.pem",
+        "key.pem",
+        "key.pem.pending",
+    ] {
+        let (_dir, fixture, cert_dir) = enrolled_x509();
+        let credential_dir = x509_credential_dir(&fixture);
+        let in_credential = credential_dir.join(file);
+        let keep = if in_credential.exists() {
+            let keep = fs::read(&in_credential).unwrap();
+            fs::remove_dir_all(&credential_dir).unwrap();
+            fs::create_dir(&credential_dir).unwrap();
+            fs::write(&in_credential, keep).unwrap();
+            None
+        } else {
+            fs::remove_dir_all(&credential_dir).unwrap();
+            Some(cert_dir.join(file))
+        };
+        fs::remove_file(cert_dir.join("key.pem")).unwrap();
+        if let Some(path) = keep {
+            fs::write(path, format!("FAKE-PRIVATE\n{X509_KEY}")).unwrap();
+        }
+
+        assert_broken_enrollment_fails(&fixture);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn if_enrolled_keeps_a_working_certificate_quiet_without_credential() {
+    let (_dir, fixture, cert_dir) = enrolled_x509();
+    seed_certificate(&cert_dir, hours(20));
+    fs::remove_dir_all(x509_credential_dir(&fixture)).unwrap();
+
+    renew_x509(&fixture, &X509_RENEW_UNATTENDED)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+    status_x509(&fixture, &X509_STATUS_UNATTENDED)
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}
