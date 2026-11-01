@@ -2493,6 +2493,21 @@ fn apply_ca_updates_authority_policy_only_and_removes_retired_principals() {
 
 #[cfg(unix)]
 #[test]
+fn apply_ca_accepts_disabled_proxy_x509() {
+    let (_dir, fixture) = exec_fixture();
+    prepare_apply_ca(&fixture);
+    let ca_policy = fixture.config_root.join("policy/ca.toml");
+    // proxy_x509 is the last table in the fixture, so appended keys belong to it.
+    let mut policy = fs::read_to_string(&ca_policy).unwrap();
+    assert!(policy.trim_end().ends_with("max_ttl = \"720h\""));
+    policy.push_str("status = \"disabled\"\n");
+    fs::write(ca_policy, policy).unwrap();
+
+    apply_ca_command(&fixture).assert().success();
+}
+
+#[cfg(unix)]
+#[test]
 fn apply_ca_restores_previous_policy_when_restart_fails() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = prepare_apply_ca(&fixture);

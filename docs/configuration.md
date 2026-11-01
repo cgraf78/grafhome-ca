@@ -142,7 +142,8 @@ database-style relations:
 - `ca.toml`: keyed CA endpoints and provisioner roles
 - `users.toml`: keyed, stable user identities and certificate defaults
 - `hosts/<host>.toml`: one complete manifest for each physical machine
-- `revocations.toml`: optional versioned inventory of explicitly revoked SSH keys
+- `revocations.toml`: optional versioned inventory of explicitly revoked SSH
+  keys and X.509 enrollments
 
 The host filename is its stable policy name. Endpoint and provisioner table
 keys are their roles, and user table keys are their policy identities, so those
@@ -193,6 +194,10 @@ itself. Treat both fingerprints as permanent tombstones: deleting them can
 permit key reuse or re-enable a compromised key on hosts that have not retained
 the older KRL.
 
+`[[x509_keys]]` entries tombstone a revoked X.509 enrollment with `host`,
+`name`, `public_key_fingerprint`, `renewal_fingerprint`, `revoked_at`, and an
+optional `reason`. Fingerprints are `SHA256:` values, and both are permanent.
+
 Each host's `user_access` tables colocate two independent capabilities without
 combining their meanings. `enrollment` authorizes that user to enroll and renew
 on the source host. Each `logins` row authorizes that certificate user to log
@@ -215,6 +220,37 @@ remain compatibility entry points backed by the schemas in
 `schemas/policy/legacy/`. Run `grafhome-ca check` after editing policy; commands
 that mutate CA or host state also validate policy and its filesystem provenance
 before proceeding.
+
+### X.509 certificates
+
+A host manifest declares the X.509 certificates that host holds under
+`[x509_certs.<name>]`:
+
+```toml
+# policy/hosts/server-a.toml
+[x509_certs.ca-proxy]
+role = "server"
+names = ["ca.example.test"]
+ttl = "720h"
+ca_endpoint = "ca_origin"
+after_renew = ["/usr/sbin/service", "apache2", "reload"]
+```
+
+- `role` is `server` (`serverAuth` only) or `client` (`clientAuth` only).
+- `names` are lowercase DNS names; wildcards are rejected. A name may belong to
+  only one host, even in a disabled declaration, while a policy `<name>` such
+  as `nfs-client` may repeat across hosts.
+- `ttl` uses the usual Go-style units and may not exceed `720h`.
+- `ca_endpoint` is `ca_api` or `ca_origin`.
+- `after_renew` is optional. When present it is a non-empty argv whose program
+  is an absolute path.
+- `status` defaults to `active`. A `planned` or `disabled` declaration
+  contributes nothing to the authority allow-list.
+
+The authority X.509 DNS allow-list is derived, not configured: the `ca_api` and
+`ca_origin` endpoint names plus every active declared name. Policy without
+`x509_certs` renders the same allow-list as before. The `proxy_x509`
+provisioner may be `disabled`; `apply ca` then skips its claims.
 
 ## Migrating Legacy Policy
 
@@ -282,9 +318,15 @@ user and host certificates.
 
 `GRAFHOME_CA_X509_ALLOWED_DNS_JSON`
 : Template variable derived from the `ca_api` and `ca_origin` endpoint
-  `dns_name` fields. It renders the authority-level X.509 DNS allow-list used
-  by step-ca so the client-facing proxy name and the private backend serving
-  name are both explicit issuance policy.
+  `dns_name` fields plus every active `x509_certs` name. It renders the
+  authority-level X.509 DNS allow-list used by step-ca so the client-facing
+  proxy name, the private backend serving name, and each declared certificate
+  name are explicit issuance policy.
+
+`GRAFHOME_CA_X509_DIR`
+: Optional absolute directory for host-held X.509 certificates and keys,
+  defaulting to `/etc/grafhome-ca/x509`. Sites leave it unset, because older
+  binaries reject unknown deployment keys.
 
 The renderer also derives authority-wide SSH allow-lists directly from active
 keyed-user `principal` values and every host manifest's `principals`. These are

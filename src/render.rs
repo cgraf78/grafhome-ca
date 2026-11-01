@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::error::{Error, Result};
 use crate::model::SiteModel;
 use crate::policy::{
-    CA_POLICY_PATH, ENDPOINT_ROLE_CA_API, ENDPOINT_ROLE_CA_ORIGIN, Endpoint, HOST_POLICY_DIR, Host,
+    CA_POLICY_PATH, ENDPOINT_ROLE_CA_API, ENDPOINT_ROLE_CA_ORIGIN, HOST_POLICY_DIR, Host,
     PROVISIONER_ROLE_HOST_BOOTSTRAP, PROVISIONER_ROLE_PROXY_X509, PROVISIONER_ROLE_USER_ENROLLMENT,
     Provisioner, SshRole, USERS_POLICY_PATH, ca_policy_field, host_policy_field, step_max_ttl,
 };
@@ -445,7 +445,7 @@ fn variables(model: &SiteModel) -> Result<BTreeMap<String, String>> {
     );
     variables.insert(
         "GRAFHOME_CA_X509_ALLOWED_DNS_JSON".to_owned(),
-        x509_allowed_dns_json(ca_api, ca_origin)?,
+        x509_allowed_dns_json(&model.policy)?,
     );
     variables.insert(
         "GRAFHOME_CA_SSH_USER_ALLOWED_PRINCIPALS_JSON".to_owned(),
@@ -496,11 +496,8 @@ fn ssh_host_allowed_principals_json(model: &SiteModel) -> Result<(String, String
     Ok((dns, ips))
 }
 
-fn x509_allowed_dns_json(ca_api: &Endpoint, ca_origin: &Endpoint) -> Result<String> {
-    let mut names = vec![ca_api.dns_name.as_str(), ca_origin.dns_name.as_str()];
-    names.sort_unstable();
-    names.dedup();
-    serde_json::to_string(&names).map_err(|source| Error::Json {
+fn x509_allowed_dns_json(policy: &crate::policy::Policy) -> Result<String> {
+    serde_json::to_string(&policy.x509_allowed_dns()).map_err(|source| Error::Json {
         path: PathBuf::from(CA_POLICY_PATH),
         source,
     })
@@ -1357,7 +1354,7 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
     }
 
     #[test]
-    fn rendered_x509_policy_allows_public_and_origin_ca_names() {
+    fn rendered_x509_policy_allows_ca_names_and_declared_certificates() {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
         let files = render(&model).unwrap();
         let ca_json = files
@@ -1371,7 +1368,11 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
 
         assert_eq!(
             value["authority"]["policy"]["x509"]["allow"]["dns"],
-            serde_json::json!(["ca-origin.example.test", "ca.example.test"])
+            serde_json::json!([
+                "ca-origin.example.test",
+                "ca.example.test",
+                "edge-host.example.test"
+            ])
         );
         assert_eq!(
             value["authority"]["policy"]["x509"]["allowWildcardNames"],

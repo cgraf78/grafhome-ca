@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     CA_POLICY_PATH, Endpoint, HOST_POLICY_DIR, Host, LEGACY_POLICY_PATHS,
     PROVISIONER_ROLE_USER_ENROLLMENT, Policy, Provisioner, REVOCATIONS_POLICY_PATH, RevokedSshKey,
-    SshRole, Status, USERS_POLICY_PATH, User, UserClient, UserRemote, expected_provisioner_type,
-    provisioner_role_rank, read_typed_document,
+    RevokedX509Key, SshRole, Status, USERS_POLICY_PATH, User, UserClient, UserRemote, X509Cert,
+    X509Role, expected_provisioner_type, provisioner_role_rank, read_typed_document,
 };
 use crate::error::{Error, Result};
 
@@ -92,6 +92,21 @@ struct HostDocument {
     principals: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     user_access: BTreeMap<String, HostUserAccess>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    x509_certs: BTreeMap<String, X509CertPolicy>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct X509CertPolicy {
+    role: X509Role,
+    names: Vec<String>,
+    ttl: String,
+    ca_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after_renew: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Status::is_active")]
+    status: Status,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -133,6 +148,8 @@ struct RevocationsDocument {
     format_version: u32,
     #[serde(default)]
     ssh_keys: Vec<RevokedSshKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    x509_keys: Vec<RevokedX509Key>,
 }
 
 /// Detect the policy layout while rejecting ambiguous mixed-format trees.
@@ -178,7 +195,7 @@ pub fn input_paths(root: &Path) -> Result<Vec<PathBuf>> {
 pub fn load(root: &Path) -> Result<Policy> {
     let ca: CaDocument = read_document(root.join(CA_POLICY_PATH))?;
     let users: UsersDocument = read_document(root.join(USERS_POLICY_PATH))?;
-    let revoked_ssh_keys = if root.join(REVOCATIONS_POLICY_PATH).exists() {
+    let (revoked_ssh_keys, revoked_x509_keys) = if root.join(REVOCATIONS_POLICY_PATH).exists() {
         let document: RevocationsDocument = read_document(root.join(REVOCATIONS_POLICY_PATH))?;
         if document.format_version != 1 {
             return Err(Error::Validation {
@@ -186,9 +203,9 @@ pub fn load(root: &Path) -> Result<Policy> {
                 message: "must be 1".to_owned(),
             });
         }
-        document.ssh_keys
+        (document.ssh_keys, document.x509_keys)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let endpoints = ca
@@ -247,6 +264,7 @@ pub fn load(root: &Path) -> Result<Policy> {
     let mut hosts = Vec::new();
     let mut user_clients = Vec::new();
     let mut user_remotes = Vec::new();
+    let mut x509_certs = Vec::new();
     for relative in host_paths(root)? {
         let host = host_name(&relative)?;
         let document: HostDocument = read_document(root.join(&relative))?;
@@ -255,6 +273,26 @@ pub fn load(root: &Path) -> Result<Policy> {
             ssh_roles: document.ssh_roles,
             principals: document.principals,
         });
+        for (name, cert) in document.x509_certs {
+            // An explicit empty argv would read as "no hook" after
+            // normalization; reject it so the typo is visible.
+            if cert.after_renew.as_ref().is_some_and(Vec::is_empty) {
+                return Err(Error::Validation {
+                    field: format!("{HOST_POLICY_DIR}/{host}.toml:x509_certs.{name}.after_renew"),
+                    message: "must not be empty; omit it for no hook".to_owned(),
+                });
+            }
+            x509_certs.push(X509Cert {
+                host: host.clone(),
+                name,
+                role: cert.role,
+                names: cert.names,
+                ttl: cert.ttl,
+                ca_endpoint: cert.ca_endpoint,
+                after_renew: cert.after_renew.unwrap_or_default(),
+                status: cert.status,
+            });
+        }
         for (user, access) in document.user_access {
             if let Some(enrollment) = access.enrollment {
                 let enrollment = match enrollment {
@@ -315,6 +353,8 @@ pub fn load(root: &Path) -> Result<Policy> {
         user_clients,
         user_remotes,
         revoked_ssh_keys,
+        x509_certs,
+        revoked_x509_keys,
     })
 }
 
@@ -387,12 +427,13 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
         canonical_file(policy_output_path(CA_POLICY_PATH), &ca)?,
         canonical_file(policy_output_path(USERS_POLICY_PATH), &users)?,
     ];
-    if !policy.revoked_ssh_keys.is_empty() {
+    if !policy.revoked_ssh_keys.is_empty() || !policy.revoked_x509_keys.is_empty() {
         files.push(canonical_file(
             policy_output_path(REVOCATIONS_POLICY_PATH),
             &RevocationsDocument {
                 format_version: 1,
                 ssh_keys: policy.revoked_ssh_keys.clone(),
+                x509_keys: policy.revoked_x509_keys.clone(),
             },
         )?);
     }
@@ -453,6 +494,24 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
             ssh_roles: host.ssh_roles.clone(),
             principals: host.principals.clone(),
             user_access,
+            x509_certs: policy
+                .x509_certs_for_host(&host.host)
+                .into_iter()
+                .map(|cert| {
+                    (
+                        cert.name.clone(),
+                        X509CertPolicy {
+                            role: cert.role,
+                            names: cert.names.clone(),
+                            ttl: cert.ttl.clone(),
+                            ca_endpoint: cert.ca_endpoint.clone(),
+                            after_renew: (!cert.after_renew.is_empty())
+                                .then(|| cert.after_renew.clone()),
+                            status: cert.status,
+                        },
+                    )
+                })
+                .collect(),
         };
         files.push(canonical_file(
             policy_output_path(HOST_POLICY_DIR).join(format!("{}.toml", host.host)),

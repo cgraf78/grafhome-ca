@@ -228,6 +228,53 @@ unexpected = true
     }
 
     #[test]
+    fn schema_rejects_bad_x509_declarations() {
+        for (from, to, needle) in [
+            ("role = \"client\"", "role = \"both\"", "both"),
+            (
+                "ca_endpoint = \"ca_origin\"\n",
+                "ca_endpoint = \"elsewhere\"\n",
+                "elsewhere",
+            ),
+            (
+                "names = [\"edge-host.example.test\"]",
+                "names = [\"*.example.test\"]",
+                "*.example.test",
+            ),
+            ("ttl = \"24h\"", "ttl = \"24\"", "24"),
+        ] {
+            let dir = tempdir().unwrap();
+            copy_dir(&example_config_root(), dir.path());
+            let host = dir.path().join("policy/hosts/edge-host.toml");
+            let text = fs::read_to_string(&host).unwrap().replace(from, to);
+            fs::write(host, text).unwrap();
+
+            let error = crate::schema::validate_config_root(dir.path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("policy/hosts/edge-host.toml"), "{error}");
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn canonical_schema_validates_x509_revocations() {
+        let dir = tempdir().unwrap();
+        copy_dir(&example_config_root(), dir.path());
+        let ledger = dir.path().join("policy/revocations.toml");
+        let entry = "[[x509_keys]]\nhost = \"edge-host\"\nname = \"nfs-client\"\npublic_key_fingerprint = \"SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI\"\nrenewal_fingerprint = \"SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg\"\nrevoked_at = \"2026-07-24T20:14:15Z\"\n";
+        fs::write(&ledger, format!("format_version = 1\n\n{entry}")).unwrap();
+        crate::schema::validate_config_root(dir.path()).unwrap();
+
+        fs::write(
+            &ledger,
+            format!("format_version = 1\n\n{entry}unexpected = true\n"),
+        )
+        .unwrap();
+        assert!(crate::schema::validate_config_root(dir.path()).is_err());
+    }
+
+    #[test]
     fn schema_rejects_unlimited_maximum_for_host_provisioner() {
         let dir = tempdir().unwrap();
         copy_dir(&example_config_root(), dir.path());

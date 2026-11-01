@@ -36,7 +36,8 @@
     "GRAFHOME_CA_HOST_KEY_PATH": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_PASSWORD_FILE": { "$ref": "#/definitions/absolutePath" },
     "GRAFHOME_CA_SERVICE_USER": { "$ref": "#/definitions/accountName" },
-    "GRAFHOME_CA_APACHE_CONF_AVAILABLE": { "$ref": "#/definitions/absolutePath" }
+    "GRAFHOME_CA_APACHE_CONF_AVAILABLE": { "$ref": "#/definitions/absolutePath" },
+    "GRAFHOME_CA_X509_DIR": { "$ref": "#/definitions/absolutePath" }
   },
   "definitions": {
     "absolutePath": {

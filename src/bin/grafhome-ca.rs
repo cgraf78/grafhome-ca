@@ -5331,6 +5331,10 @@ impl RevocationPolicyUpdate {
 struct RevocationsFile<'a> {
     format_version: u32,
     ssh_keys: &'a [grafhome_ca::policy::RevokedSshKey],
+    // Rewriting the ledger must carry X.509 tombstones forward, or an SSH revoke
+    // would silently erase them.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    x509_keys: &'a [grafhome_ca::policy::RevokedX509Key],
 }
 
 fn prepare_revocation_policy_update(
@@ -5386,6 +5390,7 @@ fn prepare_revocation_policy_update(
         let text = toml::to_string_pretty(&RevocationsFile {
             format_version: 1,
             ssh_keys: &policy.revoked_ssh_keys,
+            x509_keys: &policy.revoked_x509_keys,
         })
         .map_err(|source| grafhome_ca::Error::Validation {
             field: target.display().to_string(),
@@ -6873,6 +6878,55 @@ revoked_at = "2026-07-24T20:14:15Z"
         let content = String::from_utf8(update.content.unwrap()).unwrap();
 
         assert!(content.contains(KEY_ONE));
+        assert!(content.contains(KEY_TWO));
+    }
+
+    #[test]
+    fn revocation_policy_merge_keeps_x509_tombstones() {
+        const KEY_TWO: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII/YQ6c6N8hXDSaeqEQ1UvUgrymxo5vYQNy/1KO4HPpw";
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("grafhome-ca");
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config"),
+            &root,
+        );
+        let ledger = root.join("policy/revocations.toml");
+        fs::write(&ledger, "format_version = 1\n").unwrap();
+        let model = grafhome_ca::model::SiteModel::load(&root).unwrap();
+        fs::write(
+            &ledger,
+            r#"format_version = 1
+
+[[x509_keys]]
+host = "edge-host"
+name = "nfs-client"
+public_key_fingerprint = "SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI"
+renewal_fingerprint = "SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg"
+revoked_at = "2026-07-24T20:14:15Z"
+"#,
+        )
+        .unwrap();
+        let request = grafhome_ca::enrollment::HostRequest::new(
+            "proxy-host",
+            KEY_TWO,
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256", "x": "second-x", "y": "second-y"
+            }),
+        );
+        let record = grafhome_ca::enrollment_registry::EnrollmentRecord::pending_host(
+            &request,
+            "2026-07-24T20:15:15Z",
+        )
+        .unwrap();
+
+        let update =
+            prepare_revocation_policy_update(&model, &[record], "2026-07-24T20:16:15Z", None)
+                .unwrap();
+        let content = String::from_utf8(update.content.unwrap()).unwrap();
+
+        assert!(content.contains("[[x509_keys]]"));
+        assert!(content.contains("nfs-client"));
         assert!(content.contains(KEY_TWO));
     }
 

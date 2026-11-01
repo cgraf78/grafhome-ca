@@ -70,7 +70,9 @@ pub fn reconcile_claims(
     let mut config = read_json(ca_json)?;
     let user = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
     let host = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
-    let proxy = active_provisioner(model, PROVISIONER_ROLE_PROXY_X509)?;
+    // The ACME proxy provisioner is being retired, so a disabled or absent row
+    // is valid policy; only its live claims are skipped.
+    let proxy = optional_active_provisioner(model, PROVISIONER_ROLE_PROXY_X509);
     let authority_policy_updated = reconcile_authority_policy(model, &mut config, ca_json)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
     let mut updated = Vec::new();
@@ -87,7 +89,7 @@ pub fn reconcile_claims(
             host_claims(host)
         } else if parse_host_provisioner_name(&name).is_some() {
             host_renewal_claims(model, host)
-        } else if name == proxy.name {
+        } else if let Some(proxy) = proxy.filter(|proxy| name == proxy.name) {
             proxy_claims(proxy)
         } else {
             continue;
@@ -170,16 +172,19 @@ fn reconcile_managed_value(
     reconcile_managed_value(child, desired, rest, ca_json)
 }
 
-fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provisioner> {
+fn optional_active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Option<&'a Provisioner> {
     model
         .policy
         .provisioners
         .iter()
         .find(|provisioner| provisioner.role == role && provisioner.status.is_active())
-        .ok_or_else(|| Error::Validation {
-            field: ca_policy_field("provisioners", role, "role"),
-            message: "missing active provisioner".to_owned(),
-        })
+}
+
+fn active_provisioner<'a>(model: &'a SiteModel, role: &str) -> Result<&'a Provisioner> {
+    optional_active_provisioner(model, role).ok_or_else(|| Error::Validation {
+        field: ca_policy_field("provisioners", role, "role"),
+        message: "missing active provisioner".to_owned(),
+    })
 }
 
 fn user_claims(provisioner: &Provisioner) -> Map<String, Value> {

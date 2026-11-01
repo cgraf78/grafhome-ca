@@ -6,3 +6,10 @@ enrollment = true
 
 [[user_access.alice.logins]]
 unix_account = "alice"
+
+[x509_certs.ca-proxy]
+role = "server"
+names = ["ca.example.test"]
+ttl = "720h"
+ca_endpoint = "ca_origin"
+after_renew = ["/usr/sbin/service", "apache2", "reload"]

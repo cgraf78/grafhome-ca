@@ -77,6 +77,19 @@ pub enum SshRole {
     Client,
 }
 
+/// Longest lifetime a declared X.509 certificate may have.
+pub const X509_MAX_TTL: &str = "720h";
+
+/// Extended key usage granted to a declared X.509 certificate.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum X509Role {
+    /// `serverAuth` only.
+    Server,
+    /// `clientAuth` only.
+    Client,
+}
+
 pub(crate) const LEGACY_ENDPOINTS_PATH: &str = "policy/endpoints.toml";
 pub(crate) const LEGACY_HOSTS_PATH: &str = "policy/hosts.toml";
 pub(crate) const LEGACY_PROVISIONERS_PATH: &str = "policy/provisioners.toml";
@@ -174,6 +187,29 @@ impl Host {
     pub fn has_ssh_role(&self, role: SshRole) -> bool {
         self.ssh_roles.contains(&role)
     }
+}
+
+/// X.509 certificate declared in a host manifest.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct X509Cert {
+    /// Host that holds the certificate.
+    pub host: String,
+    /// Policy name; may repeat across hosts and names the on-host directory.
+    pub name: String,
+    /// Extended key usage.
+    pub role: X509Role,
+    /// DNS subject alternative names; each belongs to exactly one host.
+    pub names: Vec<String>,
+    /// Certificate lifetime, at most [`X509_MAX_TTL`].
+    pub ttl: String,
+    /// CA endpoint role (`ca_api` or `ca_origin`) used to issue and renew.
+    pub ca_endpoint: String,
+    /// Optional absolute-path argv run after a changed certificate is published.
+    #[serde(default)]
+    pub after_renew: Vec<String>,
+    /// Policy status.
+    pub status: Status,
 }
 
 /// User entry from `policy/users.toml`.
@@ -356,6 +392,25 @@ impl RevokedSshKey {
     }
 }
 
+/// One permanently revoked X.509 enrollment, kept as a tombstone.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokedX509Key {
+    /// Host that held the certificate.
+    pub host: String,
+    /// Policy certificate name.
+    pub name: String,
+    /// SHA-256 fingerprint of the revoked certificate public key.
+    pub public_key_fingerprint: String,
+    /// SHA-256 thumbprint of the revoked renewal JWK.
+    pub renewal_fingerprint: String,
+    /// UTC RFC 3339 revocation timestamp.
+    pub revoked_at: String,
+    /// Optional operator audit context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Parsed policy set.
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -377,9 +432,44 @@ pub struct Policy {
     pub user_remotes: Vec<UserRemote>,
     /// Permanently revoked SSH keys distributed to managed hosts.
     pub revoked_ssh_keys: Vec<RevokedSshKey>,
+    /// X.509 certificates declared across host manifests.
+    pub x509_certs: Vec<X509Cert>,
+    /// Permanently revoked X.509 enrollments.
+    pub revoked_x509_keys: Vec<RevokedX509Key>,
 }
 
 impl Policy {
+    /// X.509 certificates declared by one host, in declaration order.
+    #[must_use]
+    pub fn x509_certs_for_host(&self, host: &str) -> Vec<&X509Cert> {
+        self.x509_certs
+            .iter()
+            .filter(|cert| cert.host == host)
+            .collect()
+    }
+
+    /// Sorted DNS names the authority may issue X.509 certificates for.
+    ///
+    /// This is the union of both CA endpoints and every active declared name,
+    /// so disabled or planned declarations contribute nothing.
+    #[must_use]
+    pub fn x509_allowed_dns(&self) -> Vec<String> {
+        let mut names = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.dns_name.clone())
+            .chain(
+                self.x509_certs
+                    .iter()
+                    .filter(|cert| cert.status.is_active())
+                    .flat_map(|cert| cert.names.iter().cloned()),
+            )
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Maximum lifetime for certificates issued by a device-bound renewal provisioner.
     ///
     /// Legacy user policy could combine an unlimited enrollment maximum with a
@@ -526,7 +616,98 @@ impl Policy {
         }
 
         self.validate_relations(&hosts)?;
+        self.validate_x509(&hosts)?;
         self.validate_revocations()?;
+        Ok(())
+    }
+
+    fn validate_x509(&self, hosts: &BTreeSet<String>) -> Result<()> {
+        // Disabled rows still reserve their names: re-enabling one must never
+        // be able to put a SAN on a second host.
+        let mut san_owner = std::collections::BTreeMap::<&str, &str>::new();
+        let mut declared = BTreeSet::new();
+        for cert in &self.x509_certs {
+            let field = |key: &str| {
+                host_policy_field(&cert.host, &format!("x509_certs.{}.{key}", cert.name))
+            };
+            let invalid = |key: &str, message: String| Error::Validation {
+                field: field(key),
+                message,
+            };
+            if !hosts.contains(&cert.host) {
+                return Err(invalid("host", format!("unknown host {}", cert.host)));
+            }
+            if !valid_host_identity(&cert.name) {
+                return Err(invalid("name", "must match [A-Za-z0-9._-]+".to_owned()));
+            }
+            if !declared.insert((cert.host.as_str(), cert.name.as_str())) {
+                return Err(invalid("name", "duplicate certificate name".to_owned()));
+            }
+            if cert.names.is_empty() {
+                return Err(invalid("names", "must list at least one name".to_owned()));
+            }
+            let mut own = BTreeSet::new();
+            for name in &cert.names {
+                if name.contains('*') {
+                    return Err(invalid(
+                        "names",
+                        format!("wildcard name {name} is not allowed"),
+                    ));
+                }
+                if !valid_dns_name(name) {
+                    return Err(invalid(
+                        "names",
+                        format!("{name} must be a lowercase DNS name"),
+                    ));
+                }
+                if !own.insert(name.as_str()) {
+                    return Err(invalid("names", format!("duplicate name {name}")));
+                }
+                if let Some(owner) = san_owner.insert(name, &cert.host)
+                    && owner != cert.host
+                {
+                    return Err(invalid(
+                        "names",
+                        format!(
+                            "{name} already belongs to host {owner}; a name may belong to only one host"
+                        ),
+                    ));
+                }
+            }
+            validate_step_duration(
+                &format!("{HOST_POLICY_DIR}/{}.toml", cert.host),
+                &format!("x509_certs.{}", cert.name),
+                "ttl",
+                &cert.ttl,
+            )?;
+            if !duration_at_most(&cert.ttl, X509_MAX_TTL) {
+                return Err(invalid("ttl", format!("must not exceed {X509_MAX_TTL}")));
+            }
+            if !matches!(
+                cert.ca_endpoint.as_str(),
+                ENDPOINT_ROLE_CA_API | ENDPOINT_ROLE_CA_ORIGIN
+            ) {
+                return Err(invalid(
+                    "ca_endpoint",
+                    "must be ca_api or ca_origin".to_owned(),
+                ));
+            }
+            // An empty argv would silently disable the hook; a relative program
+            // would resolve through PATH in a privileged context.
+            if !cert.after_renew.is_empty()
+                && (!cert.after_renew[0].starts_with('/')
+                    || cert
+                        .after_renew
+                        .iter()
+                        .any(|arg| arg.is_empty() || arg.contains('\0')))
+            {
+                return Err(invalid(
+                    "after_renew",
+                    "must be an argv whose program is an absolute path with no empty arguments"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -600,6 +781,61 @@ impl Policy {
                 });
             }
             if !seen_renewal.insert(revoked.renewal_fingerprint()) {
+                return Err(Error::Validation {
+                    field: format!("{field}.renewal_fingerprint"),
+                    message: "duplicate revoked renewal key".to_owned(),
+                });
+            }
+        }
+        self.validate_x509_revocations()
+    }
+
+    fn validate_x509_revocations(&self) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        let mut seen_renewal = BTreeSet::new();
+        for (index, revoked) in self.revoked_x509_keys.iter().enumerate() {
+            let field = format!("{REVOCATIONS_POLICY_PATH}:x509_keys[{index}]");
+            validate_revocation_host(&format!("{field}.host"), &revoked.host)?;
+            validate_revocation_host(&format!("{field}.name"), &revoked.name)?;
+            validate_fingerprint(
+                &format!("{field}.public_key_fingerprint"),
+                &revoked.public_key_fingerprint,
+            )?;
+            validate_renewal_fingerprint(
+                &format!("{field}.renewal_fingerprint"),
+                &revoked.renewal_fingerprint,
+            )?;
+            let revoked_at = time::OffsetDateTime::parse(
+                &revoked.revoked_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_err(|_| Error::Validation {
+                field: format!("{field}.revoked_at"),
+                message: "must be an RFC 3339 timestamp".to_owned(),
+            })?;
+            if revoked_at.offset() != time::UtcOffset::UTC || !revoked.revoked_at.ends_with('Z') {
+                return Err(Error::Validation {
+                    field: format!("{field}.revoked_at"),
+                    message: "must be a UTC RFC 3339 timestamp ending in Z".to_owned(),
+                });
+            }
+            if revoked
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.trim().is_empty())
+            {
+                return Err(Error::Validation {
+                    field: format!("{field}.reason"),
+                    message: "must not be empty".to_owned(),
+                });
+            }
+            if !seen.insert(revoked.public_key_fingerprint.as_str()) {
+                return Err(Error::Validation {
+                    field: format!("{field}.public_key_fingerprint"),
+                    message: "duplicate revoked x509 key".to_owned(),
+                });
+            }
+            if !seen_renewal.insert(revoked.renewal_fingerprint.as_str()) {
                 return Err(Error::Validation {
                     field: format!("{field}.renewal_fingerprint"),
                     message: "duplicate revoked renewal key".to_owned(),
@@ -959,6 +1195,36 @@ fn validate_revocation_user(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a value is a lowercase DNS name made of valid labels.
+fn valid_dns_name(value: &str) -> bool {
+    value.len() <= 253
+        && value.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn validate_fingerprint(field: &str, value: &str) -> Result<()> {
+    let valid = value.strip_prefix("SHA256:").is_some_and(|encoded| {
+        encoded.len() == 43
+            && encoded
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+/".contains(character))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Validation {
+            field: field.to_owned(),
+            message: "must be a SHA-256 fingerprint".to_owned(),
+        })
+    }
+}
+
 fn validate_renewal_fingerprint(field: &str, value: &str) -> Result<()> {
     let Some(encoded) = value.strip_prefix("SHA256:") else {
         return Err(Error::Validation {
@@ -1296,7 +1562,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Policy, SshRole, Status, User, UserClient, UserRemote, canonical_ssh_public_key,
+        Policy, SshRole, Status, User, UserClient, UserRemote, X509Role, canonical_ssh_public_key,
         duration_at_most,
     };
 
@@ -2381,6 +2647,217 @@ revoked_at = "2026-07-24T20:14:15-07:00"
             fs::copy(entry.path(), policy_dir.join(entry.file_name())).unwrap();
         }
         (dir, policy_dir)
+    }
+
+    fn append_host(root: &std::path::Path, host: &str, body: &str) {
+        let path = root.join(format!("policy/hosts/{host}.toml"));
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push('\n');
+        text.push_str(body);
+        fs::write(path, text).unwrap();
+    }
+
+    fn x509_block(name: &str, extra: &str) -> String {
+        format!(
+            "[x509_certs.{name}]\nrole = \"server\"\nnames = [\"nas.example.test\"]\nttl = \"24h\"\nca_endpoint = \"ca_origin\"\n{extra}"
+        )
+    }
+
+    fn x509_error(host: &str, body: &str) -> String {
+        let (_dir, root) = copy_canonical_policy();
+        append_host(&root, host, body);
+        Policy::load(&root).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn old_policy_without_x509_certs_loads() {
+        let (_dir, root) = copy_canonical_policy();
+        for host in ["edge-host", "proxy-host"] {
+            let path = root.join(format!("policy/hosts/{host}.toml"));
+            let text = fs::read_to_string(&path).unwrap();
+            let end = text.find("\n[x509_certs.").unwrap();
+            fs::write(&path, &text[..end + 1]).unwrap();
+        }
+        let policy = Policy::load(&root).unwrap();
+        assert!(policy.x509_certs.is_empty());
+        assert!(policy.revoked_x509_keys.is_empty());
+    }
+
+    #[test]
+    fn x509_loads_declared_certificates_per_host() {
+        let (_dir, root) = copy_canonical_policy();
+        append_host(
+            &root,
+            "ca-host",
+            &x509_block(
+                "nfs",
+                "after_renew = [\"/usr/sbin/service\", \"apache2\", \"reload\"]\n",
+            ),
+        );
+        let policy = Policy::load(&root).unwrap();
+        let certs = policy.x509_certs_for_host("ca-host");
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].name, "nfs");
+        assert_eq!(certs[0].role, X509Role::Server);
+        assert_eq!(certs[0].after_renew[0], "/usr/sbin/service");
+        assert_eq!(certs[0].status, Status::Active);
+        assert!(policy.x509_certs_for_host("laptop-a").is_empty());
+    }
+
+    #[test]
+    fn x509_allow_list_is_endpoints_plus_declared() {
+        let (_dir, root) = copy_canonical_policy();
+        append_host(&root, "ca-host", &x509_block("nfs", ""));
+        append_host(
+            &root,
+            "laptop-a",
+            "[x509_certs.old]\nrole = \"client\"\nnames = [\"old.example.test\"]\nttl = \"24h\"\nca_endpoint = \"ca_api\"\nstatus = \"disabled\"\n",
+        );
+        let policy = Policy::load(&root).unwrap();
+        assert_eq!(
+            policy.x509_allowed_dns(),
+            [
+                "ca-origin.example.test",
+                "ca.example.test",
+                "edge-host.example.test",
+                "nas.example.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn x509_rejects_wildcard_name() {
+        let body = x509_block("nfs", "").replace("nas.example.test", "*.example.test");
+        assert!(x509_error("ca-host", &body).contains("wildcard"));
+    }
+
+    #[test]
+    fn x509_rejects_malformed_name() {
+        let body = x509_block("nfs", "").replace("nas.example.test", "bad name");
+        assert!(x509_error("ca-host", &body).contains("x509_certs.nfs.names"));
+    }
+
+    #[test]
+    fn x509_rejects_san_on_two_hosts() {
+        let (_dir, root) = copy_canonical_policy();
+        append_host(&root, "ca-host", &x509_block("nfs", ""));
+        append_host(&root, "laptop-a", &x509_block("nfs-other", ""));
+        let error = Policy::load(&root).unwrap_err().to_string();
+        assert!(error.contains("nas.example.test") && error.contains("one host"));
+    }
+
+    #[test]
+    fn x509_allows_policy_name_on_two_hosts() {
+        let (_dir, root) = copy_canonical_policy();
+        append_host(&root, "ca-host", &x509_block("nfs-client", ""));
+        append_host(
+            &root,
+            "laptop-a",
+            &x509_block("nfs-client", "").replace("nas.example.test", "other.example.test"),
+        );
+        let policy = Policy::load(&root).unwrap();
+        assert_eq!(policy.x509_certs_for_host("ca-host").len(), 1);
+        assert_eq!(policy.x509_certs_for_host("laptop-a").len(), 1);
+    }
+
+    #[test]
+    fn x509_rejects_unknown_ca_endpoint() {
+        let body = x509_block("nfs", "").replace("ca_origin", "elsewhere");
+        assert!(x509_error("ca-host", &body).contains("ca_endpoint"));
+    }
+
+    #[test]
+    fn x509_rejects_relative_after_renew() {
+        let body = x509_block("nfs", "after_renew = [\"service\", \"reload\"]\n");
+        assert!(x509_error("ca-host", &body).contains("after_renew"));
+    }
+
+    #[test]
+    fn x509_rejects_empty_after_renew() {
+        let body = x509_block("nfs", "after_renew = []\n");
+        assert!(x509_error("ca-host", &body).contains("after_renew"));
+    }
+
+    #[test]
+    fn x509_rejects_ttl_over_720h() {
+        let body = x509_block("nfs", "").replace("24h", "721h");
+        assert!(x509_error("ca-host", &body).contains("720h"));
+    }
+
+    #[test]
+    fn x509_accepts_ttl_of_exactly_720h() {
+        let (_dir, root) = copy_canonical_policy();
+        append_host(
+            &root,
+            "ca-host",
+            &x509_block("nfs", "").replace("24h", "720h"),
+        );
+        Policy::load(&root).unwrap();
+    }
+
+    #[test]
+    fn x509_rejects_unsafe_policy_name() {
+        let body = x509_block("nfs", "").replace("[x509_certs.nfs]", "[x509_certs.\"a/b\"]");
+        assert!(x509_error("ca-host", &body).contains("a/b"));
+    }
+
+    #[test]
+    fn x509_rejects_empty_names() {
+        let body = x509_block("nfs", "").replace("[\"nas.example.test\"]", "[]");
+        assert!(x509_error("ca-host", &body).contains("names"));
+    }
+
+    #[test]
+    fn x509_rejects_unknown_role() {
+        let body = x509_block("nfs", "").replace("\"server\"", "\"both\"");
+        assert!(x509_error("ca-host", &body).contains("both"));
+    }
+
+    #[test]
+    fn x509_loads_revocation_tombstones() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/revocations.toml"),
+            "format_version = 1\n\n[[x509_keys]]\nhost = \"edge-host\"\nname = \"nfs\"\npublic_key_fingerprint = \"SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI\"\nrenewal_fingerprint = \"SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg\"\nrevoked_at = \"2026-07-25T03:14:15Z\"\nreason = \"device replaced\"\n",
+        )
+        .unwrap();
+        let policy = Policy::load(&root).unwrap();
+        assert_eq!(policy.revoked_x509_keys.len(), 1);
+        assert_eq!(policy.revoked_x509_keys[0].host, "edge-host");
+    }
+
+    #[test]
+    fn x509_rejects_bad_revocation_fingerprint_and_duplicate() {
+        let (_dir, root) = copy_canonical_policy();
+        let entry = "[[x509_keys]]\nhost = \"edge-host\"\nname = \"nfs\"\npublic_key_fingerprint = \"SHA256:PwiHaeoThsUMMEFnpgXFZOaOM3GD6Jkn0rlVu+srKkI\"\nrenewal_fingerprint = \"SHA256:6nWqP5b7mBpArY0rPWTKT6lPhnZJYekV74X2Hdh8zCg\"\nrevoked_at = \"2026-07-25T03:14:15Z\"\n";
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!("format_version = 1\n\n{entry}\n{entry}"),
+        )
+        .unwrap();
+        assert!(
+            Policy::load(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        fs::write(
+            root.join("policy/revocations.toml"),
+            format!(
+                "format_version = 1\n\n{}",
+                entry.replace(
+                    "public_key_fingerprint = \"SHA256:",
+                    "public_key_fingerprint = \"SHA256:x"
+                )
+            ),
+        )
+        .unwrap();
+        assert!(
+            Policy::load(&root)
+                .unwrap_err()
+                .to_string()
+                .contains("public_key_fingerprint")
+        );
     }
 
     fn copy_canonical_policy() -> (tempfile::TempDir, std::path::PathBuf) {

@@ -28,6 +28,13 @@ const REQUIRED_KEYS: &[&str] = &[
     "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
 ];
 
+/// Keys a deployment may omit. Sites leave them unset so older binaries, which
+/// reject unknown keys, keep loading the same file.
+const OPTIONAL_KEYS: &[&str] = &["GRAFHOME_CA_X509_DIR"];
+
+/// Default root for host-held X.509 certificates and keys.
+const DEFAULT_X509_DIR: &str = "/etc/grafhome-ca/x509";
+
 /// Parsed deployment environment.
 #[derive(Debug, Clone, Serialize)]
 pub struct Deployment {
@@ -100,6 +107,16 @@ impl Deployment {
         )
     }
 
+    /// Directory holding `<name>/{cert.pem,key.pem}` for declared X.509 certificates.
+    ///
+    /// Reads the optional key without indexing so an absent override never panics.
+    #[must_use]
+    pub fn x509_dir(&self) -> PathBuf {
+        self.values
+            .get("GRAFHOME_CA_X509_DIR")
+            .map_or_else(|| PathBuf::from(DEFAULT_X509_DIR), PathBuf::from)
+    }
+
     fn validate(&self) -> Result<()> {
         let expected = REQUIRED_KEYS.iter().copied().collect::<BTreeSet<_>>();
         let actual = self
@@ -114,7 +131,10 @@ impl Deployment {
                 message: "missing required deployment key".to_owned(),
             });
         }
-        if let Some(key) = actual.difference(&expected).next() {
+        if let Some(key) = actual
+            .difference(&expected)
+            .find(|key| !OPTIONAL_KEYS.contains(key))
+        {
             return Err(Error::Validation {
                 field: format!("{}:{key}", self.path.display()),
                 message: "unknown deployment key".to_owned(),
@@ -311,5 +331,55 @@ mod tests {
 
         let error = Deployment::load(&path).unwrap_err().to_string();
         assert!(error.contains("state directory must not be the filesystem root"));
+    }
+
+    fn minimal_env(extra: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deployment.env");
+        let mut text = String::new();
+        for key in REQUIRED_KEYS {
+            let value = if *key == "GRAFHOME_CA_STATE_DIR" {
+                "/srv/example-ca"
+            } else if *key == "GRAFHOME_CA_PASSWORD_FILE" {
+                "/srv/example-ca/secrets/intermediate_ca_password"
+            } else if *key == "GRAFHOME_CA_USER_STEPPATH" {
+                ".config/grafhome/step"
+            } else if *key == "GRAFHOME_CA_SERVICE_USER" {
+                "step-ca"
+            } else {
+                "/tmp/grafhome-ca"
+            };
+            text.push_str(&format!("{key}={value}\n"));
+        }
+        text.push_str(extra);
+        fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn deployment_accepts_optional_x509_dir() {
+        let (_dir, path) = minimal_env("GRAFHOME_CA_X509_DIR=/srv/example-x509\n");
+        let deployment = Deployment::load(&path).unwrap();
+        assert_eq!(
+            deployment.x509_dir(),
+            std::path::PathBuf::from("/srv/example-x509")
+        );
+    }
+
+    #[test]
+    fn deployment_rejects_relative_x509_dir() {
+        let (_dir, path) = minimal_env("GRAFHOME_CA_X509_DIR=relative/x509\n");
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("system path must be absolute"));
+    }
+
+    #[test]
+    fn deployment_defaults_x509_dir() {
+        let (_dir, path) = minimal_env("");
+        let deployment = Deployment::load(&path).unwrap();
+        assert_eq!(
+            deployment.x509_dir(),
+            std::path::PathBuf::from("/etc/grafhome-ca/x509")
+        );
     }
 }
