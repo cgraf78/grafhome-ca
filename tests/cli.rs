@@ -453,11 +453,35 @@ case "$1 $2" in
   "crypto jwk")
     pub="$4"
     priv="$5"
-    printf '{"kty":"OKP","crv":"Ed25519","x":"public"}\n' > "$pub"
-    printf '{"kty":"OKP","crv":"Ed25519","x":"public","d":"private"}\n' > "$priv"
+    x=public
+    if [ "${FAKE_JWK_UNIQUE:-}" = "1" ]; then
+      count=$(($(cat "$FAKE_LOG.jwks" 2>/dev/null || echo 0) + 1))
+      printf '%s' "$count" > "$FAKE_LOG.jwks"
+      x="public-$count"
+    fi
+    printf '{"kty":"OKP","crv":"Ed25519","x":"%s"}\n' "$x" > "$pub"
+    printf '{"kty":"OKP","crv":"Ed25519","x":"%s","d":"private"}\n' "$x" > "$priv"
     printf 'jwk\n'
     ;;
+  "crypto keypair")
+    count=$(($(cat "$FAKE_LOG.keypairs" 2>/dev/null || echo 0) + 1))
+    printf '%s' "$count" > "$FAKE_LOG.keypairs"
+    if [ "$count" = "1" ]; then
+      body='MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpLa4TQ2I6fGxrpsTXIjkONnFqp7+
+aVXF2GUB0FzWyZNJBGBdIwsLJSjUsFMF+216+CkBLucOD2YTRAkWruHHcQ=='
+    else
+      body='MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE73fnTG0+dIVc6rYompVn1sa8O2+L
+5rW09KuHOpbkZ2TDLVemT/xp2ibhgqZsKwZ1q7NjLFocpQDCHIgPJU9KGQ=='
+    fi
+    printf -- '-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' "$body" > "$3"
+    { printf 'FAKE-PRIVATE\n'; cat "$3"; } > "$4"
+    printf 'keypair\n'
+    ;;
   "crypto key")
+    if [ "$3" = "public" ]; then
+      sed 1d "$4"
+      exit 0
+    fi
     source="$4"
     out=""
     previous=""
@@ -599,6 +623,10 @@ if [ "${FAKE_SYSTEMCTL_RELOAD_FAIL_PAIR:-}" = "1" ] && [ "$1" = "reload" ]; then
   count=$((count + 1))
   printf '%s\n' "$count" > "$count_file"
   if [ "$count" -le 2 ]; then exit 44; fi
+fi
+if [ "${FAKE_SYSTEMCTL_IS_ACTIVE_FAIL_ONCE:-}" = "1" ] && [ "$1" = "is-active" ] && [ ! -e "$FAKE_LOG.is_active_failed" ]; then
+  touch "$FAKE_LOG.is_active_failed"
+  exit 3
 fi
 if [ "$1" = "restart" ]; then touch "$FAKE_LOG.restarted"; fi
 if [ "$1" = "is-active" ]; then printf 'active\n'; fi
@@ -918,12 +946,14 @@ fn prepare_apply_ca(fixture: &ExecFixture) -> PathBuf {
                         "type": "JWK",
                         "name": "grafhome-user-616c696365-63612d686f7374",
                         "key": {"kid": "client"},
-                        "claims": {"maxUserSSHCertDuration": "168h"}
+                        "claims": {"maxUserSSHCertDuration": "168h"},
+                        "options": {"x509": {"template": X509_DENY}}
                     },
                     {
                         "type": "JWK",
                         "name": "operator-owned",
-                        "claims": {"maxUserSSHCertDuration": "1h"}
+                        "claims": {"maxUserSSHCertDuration": "1h"},
+                        "options": {"x509": {"template": X509_DENY}}
                     }
                 ]
             }
@@ -8628,4 +8658,1042 @@ fn ssh_apply_has_no_ca_form() {
             .unwrap()
             .contains("apply ca")
     );
+}
+
+#[cfg(unix)]
+const X509_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpLa4TQ2I6fGxrpsTXIjkONnFqp7+
+aVXF2GUB0FzWyZNJBGBdIwsLJSjUsFMF+216+CkBLucOD2YTRAkWruHHcQ==
+-----END PUBLIC KEY-----
+";
+#[cfg(unix)]
+const X509_KEY_TWO: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE73fnTG0+dIVc6rYompVn1sa8O2+L
+5rW09KuHOpbkZ2TDLVemT/xp2ibhgqZsKwZ1q7NjLFocpQDCHIgPJU9KGQ==
+-----END PUBLIC KEY-----
+";
+#[cfg(unix)]
+const X509_DENY: &str = r#"{{ fail "x509 disabled" }}"#;
+/// `x509_provisioner_name("edge-host", "nfs-client")`.
+#[cfg(unix)]
+const EDGE_X509_PROVISIONER: &str = "grafhome-x509-656467652d686f7374-6e66732d636c69656e74";
+
+#[cfg(unix)]
+fn x509_jwk(x: &str) -> serde_json::Value {
+    serde_json::json!({"kid": format!("kid-{x}"), "kty": "EC", "crv": "P-256", "x": x, "y": "y"})
+}
+
+#[cfg(unix)]
+fn edge_x509_cert(fixture: &ExecFixture) -> grafhome_ca::policy::X509Cert {
+    let policy = grafhome_ca::policy::Policy::load(&fixture.config_root).unwrap();
+    policy
+        .x509_certs
+        .into_iter()
+        .find(|cert| cert.host == "edge-host")
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn edge_x509_provisioner(fixture: &ExecFixture, key: &str, x: &str) -> serde_json::Value {
+    grafhome_ca::x509::x509_provisioner(x509_jwk(x), &edge_x509_cert(fixture), key).unwrap()
+}
+
+#[cfg(unix)]
+fn write_x509_request(
+    fixture: &ExecFixture,
+    names: &[&str],
+    key: &str,
+    x: &str,
+) -> (PathBuf, grafhome_ca::x509::X509Request) {
+    let request = grafhome_ca::x509::X509Request::new(
+        "edge-host",
+        "nfs-client",
+        names.iter().map(|name| (*name).to_owned()).collect(),
+        key,
+        x509_jwk(x),
+    );
+    let path = fixture.config_root.join("../x509-request.json");
+    fs::write(
+        &path,
+        format!("REQUEST:{}\n", serde_json::to_string(&request).unwrap()),
+    )
+    .unwrap();
+    (path, request)
+}
+
+#[cfg(unix)]
+fn prepare_x509_ca(fixture: &ExecFixture) -> PathBuf {
+    let ca_json = fixture.config_root.join("../state/step/config/ca.json");
+    fs::create_dir_all(ca_json.parent().unwrap()).unwrap();
+    fs::write(&ca_json, r#"{"authority":{"provisioners":[]}}"#).unwrap();
+    ca_json
+}
+
+#[cfg(unix)]
+fn x509_command(fixture: &ExecFixture, args: &[&str]) -> Command {
+    let mut command = Command::cargo_bin("grafhome-ca").unwrap();
+    command
+        .arg("x509")
+        .args(args)
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log);
+    command
+}
+
+#[cfg(unix)]
+fn approve_x509_command(fixture: &ExecFixture, request: &Path) -> Command {
+    let mut command = x509_command(fixture, &["approve", "--yes"]);
+    command.arg("--request-file").arg(request);
+    command
+}
+
+#[cfg(unix)]
+fn restart_count(fixture: &ExecFixture) -> usize {
+    fs::read_to_string(&fixture.log)
+        .unwrap_or_default()
+        .matches("systemctl args=restart step-ca.service")
+        .count()
+}
+
+#[cfg(unix)]
+fn seed_x509_registry(fixture: &ExecFixture) -> grafhome_ca::x509::X509Request {
+    let (_, request) = write_x509_request(fixture, &["edge-host.example.test"], X509_KEY, "first");
+    let mut registry = grafhome_ca::enrollment_registry::EnrollmentRegistry::load(
+        &enrollment_registry_path(fixture),
+    )
+    .unwrap();
+    let record = grafhome_ca::enrollment_registry::EnrollmentRecord::pending_x509(
+        &request,
+        "2026-07-24T20:14:15Z",
+    )
+    .unwrap();
+    registry.activate(record).unwrap();
+    registry.save(&enrollment_registry_path(fixture)).unwrap();
+    request
+}
+
+#[cfg(unix)]
+fn live_provisioner_names(ca_json: &Path) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(ca_json).unwrap()).unwrap();
+    value["authority"]["provisioners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[cfg(unix)]
+fn registry_statuses(fixture: &ExecFixture) -> Vec<String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(enrollment_registry_path(fixture)).unwrap()).unwrap();
+    value["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["status"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn x509_commands_are_visible() {
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["--help"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line.trim_start().starts_with("x509"))
+    );
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["x509", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    for command in ["enroll", "approve", "revoke"] {
+        assert!(text.contains(command), "missing x509 {command}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_x509_adds_the_provisioner_and_activates_the_record() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+
+    approve_x509_command(&fixture, &request)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(EDGE_X509_PROVISIONER));
+
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+    assert_eq!(
+        value["authority"]["provisioners"][0],
+        edge_x509_provisioner(&fixture, X509_KEY, "first")
+    );
+    assert_eq!(registry_statuses(&fixture), ["active"]);
+    assert_eq!(restart_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_x509_requires_confirmation_without_yes() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let before = fs::read(&ca_json).unwrap();
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+
+    x509_command(&fixture, &["approve"])
+        .arg("--request-file")
+        .arg(&request)
+        .assert()
+        .failure();
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+    assert!(!enrollment_registry_path(&fixture).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_rejects_undeclared_cert() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let before = fs::read(&ca_json).unwrap();
+    let (path, mut request) =
+        write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+    request.name = "undeclared".to_owned();
+    fs::write(&path, serde_json::to_string(&request).unwrap()).unwrap();
+
+    approve_x509_command(&fixture, &path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not declared in policy"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+    assert!(!enrollment_registry_path(&fixture).exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_rejects_a_disabled_cert() {
+    let (_dir, fixture) = exec_fixture();
+    prepare_x509_ca(&fixture);
+    let manifest = fixture.config_root.join("policy/hosts/edge-host.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("status = \"disabled\"\n");
+    fs::write(manifest, text).unwrap();
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+
+    approve_x509_command(&fixture, &request)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not active in policy"));
+
+    assert!(!enrollment_registry_path(&fixture).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_rejects_names_differing_from_policy() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let before = fs::read(&ca_json).unwrap();
+    for names in [
+        vec!["other.example.test"],
+        vec!["edge-host.example.test", "other.example.test"],
+    ] {
+        let (request, _) = write_x509_request(&fixture, &names, X509_KEY, "first");
+        approve_x509_command(&fixture, &request)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("policy declares"));
+    }
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+    assert!(!enrollment_registry_path(&fixture).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_failed_health_rolls_back_and_keeps_pending() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let before = fs::read(&ca_json).unwrap();
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+
+    approve_x509_command(&fixture, &request)
+        .env("FAKE_SYSTEMCTL_IS_ACTIVE_FAIL_ONCE", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("restored previous ca.json"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+    assert_eq!(registry_statuses(&fixture), ["pending"]);
+
+    // The retry completes the same reservation instead of colliding with it.
+    approve_x509_command(&fixture, &request).assert().success();
+    assert_eq!(registry_statuses(&fixture), ["active"]);
+    assert_eq!(live_provisioner_names(&ca_json), [EDGE_X509_PROVISIONER]);
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_retry_is_idempotent() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+    approve_x509_command(&fixture, &request).assert().success();
+    let after_first = fs::read(&ca_json).unwrap();
+
+    approve_x509_command(&fixture, &request)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already approved"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), after_first);
+    assert_eq!(registry_statuses(&fixture), ["active"]);
+    assert_eq!(restart_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_refuses_new_keys_until_the_old_ones_are_revoked() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+    approve_x509_command(&fixture, &request).assert().success();
+    let approved = fs::read(&ca_json).unwrap();
+
+    let (replacement, _) = write_x509_request(
+        &fixture,
+        &["edge-host.example.test"],
+        X509_KEY_TWO,
+        "second",
+    );
+    approve_x509_command(&fixture, &replacement)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("revoke it before"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), approved);
+}
+
+#[cfg(unix)]
+#[test]
+fn approve_refuses_a_live_provisioner_missing_from_the_registry() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let live = serde_json::json!({"authority": {"provisioners": [
+        edge_x509_provisioner(&fixture, X509_KEY, "first")
+    ]}});
+    fs::write(&ca_json, serde_json::to_vec(&live).unwrap()).unwrap();
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+
+    approve_x509_command(&fixture, &request)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "absent from the enrollment registry",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_x509_removes_provisioner_and_writes_tombstone() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let live = serde_json::json!({"authority": {"provisioners": [
+        edge_x509_provisioner(&fixture, X509_KEY, "first"),
+        {"type": "JWK", "name": "keep-me", "key": {"kty": "EC", "crv": "P-256", "x": "k", "y": "k"}}
+    ]}});
+    fs::write(&ca_json, serde_json::to_vec(&live).unwrap()).unwrap();
+    seed_x509_registry(&fixture);
+
+    x509_command(
+        &fixture,
+        &[
+            "revoke",
+            "--host",
+            "edge-host",
+            "nfs-client",
+            "--reason",
+            "lost",
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("recorded 1 X.509 keys"));
+
+    assert_eq!(live_provisioner_names(&ca_json), ["keep-me"]);
+    assert_eq!(registry_statuses(&fixture), ["revoked"]);
+    assert_eq!(restart_count(&fixture), 1);
+    let policy = grafhome_ca::policy::Policy::load(&fixture.config_root).unwrap();
+    assert_eq!(policy.revoked_x509_keys.len(), 1);
+    let entry = &policy.revoked_x509_keys[0];
+    assert_eq!(entry.host, "edge-host");
+    assert_eq!(entry.name, "nfs-client");
+    assert_eq!(entry.reason.as_deref(), Some("lost"));
+    assert_eq!(
+        entry.public_key_fingerprint,
+        grafhome_ca::x509::CertificateKey::parse(X509_KEY)
+            .unwrap()
+            .fingerprint()
+    );
+
+    // A second revocation changes nothing and restarts nothing.
+    x509_command(&fixture, &["revoke", "--host", "edge-host", "nfs-client"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already revoked"));
+    assert_eq!(restart_count(&fixture), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_x509_rejects_an_empty_reason_before_changing_anything() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let before = fs::read(&ca_json).unwrap();
+
+    x509_command(
+        &fixture,
+        &[
+            "revoke",
+            "--host",
+            "edge-host",
+            "nfs-client",
+            "--reason",
+            " ",
+        ],
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("reason must not be empty"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn revoke_x509_refuses_a_live_provisioner_missing_from_the_registry() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let live = serde_json::json!({"authority": {"provisioners": [
+        edge_x509_provisioner(&fixture, X509_KEY, "first")
+    ]}});
+    fs::write(&ca_json, serde_json::to_vec(&live).unwrap()).unwrap();
+
+    x509_command(&fixture, &["revoke", "--host", "edge-host", "nfs-client"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("absent from the CA registry"));
+
+    assert_eq!(live_provisioner_names(&ca_json), [EDGE_X509_PROVISIONER]);
+}
+
+#[cfg(unix)]
+#[test]
+fn ssh_revoke_host_removes_x509_provisioners() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let other = grafhome_ca::x509::x509_provisioner_name("proxy-host", "nfs-client");
+    let mut unrelated = edge_x509_provisioner(&fixture, X509_KEY_TWO, "other");
+    unrelated["name"] = serde_json::json!(other);
+    let live = serde_json::json!({"authority": {"provisioners": [
+        edge_x509_provisioner(&fixture, X509_KEY, "first"),
+        unrelated,
+    ]}});
+    fs::write(&ca_json, serde_json::to_vec(&live).unwrap()).unwrap();
+    seed_x509_registry(&fixture);
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "ssh",
+            "revoke",
+            "host",
+            "--host",
+            "edge-host",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recorded 1 X.509 keys"));
+
+    assert_eq!(live_provisioner_names(&ca_json), [other]);
+    assert_eq!(registry_statuses(&fixture), ["revoked"]);
+    let policy = grafhome_ca::policy::Policy::load(&fixture.config_root).unwrap();
+    assert_eq!(policy.revoked_x509_keys.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn revoked_x509_keys_cannot_reenroll() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+    approve_x509_command(&fixture, &request).assert().success();
+    x509_command(&fixture, &["revoke", "--host", "edge-host", "nfs-client"])
+        .assert()
+        .success();
+
+    // Each half of the revoked pair is refused alone, and by the tracked ledger
+    // even when the registry has been lost.
+    fs::remove_file(enrollment_registry_path(&fixture)).unwrap();
+    let (same_key, _) =
+        write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "second");
+    approve_x509_command(&fixture, &same_key)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("revoked certificate key"));
+    let (same_renewal, _) =
+        write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY_TWO, "first");
+    approve_x509_command(&fixture, &same_renewal)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("revoked renewal key"));
+    assert_eq!(live_provisioner_names(&ca_json), Vec::<String>::new());
+
+    let (fresh, _) = write_x509_request(
+        &fixture,
+        &["edge-host.example.test"],
+        X509_KEY_TWO,
+        "second",
+    );
+    approve_x509_command(&fixture, &fresh).assert().success();
+    assert_eq!(live_provisioner_names(&ca_json), [EDGE_X509_PROVISIONER]);
+}
+
+#[cfg(unix)]
+#[test]
+fn revocation_rewrite_keeps_x509_keys() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_x509_ca(&fixture);
+    let (request, _) = write_x509_request(&fixture, &["edge-host.example.test"], X509_KEY, "first");
+    approve_x509_command(&fixture, &request).assert().success();
+    x509_command(&fixture, &["revoke", "--host", "edge-host", "nfs-client"])
+        .assert()
+        .success();
+
+    let live = serde_json::json!({"authority": {"provisioners": [
+        {"name": "grafhome-host-70726f78792d686f7374",
+         "key": {"kty": "EC", "crv": "P-256", "x": "proxy-host-host-x", "y": "host-y"}}
+    ]}});
+    fs::write(&ca_json, serde_json::to_vec(&live).unwrap()).unwrap();
+    seed_host_and_user_registry(&fixture, "proxy-host", "alice");
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "ssh",
+            "revoke",
+            "host",
+            "--host",
+            "proxy-host",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let policy = grafhome_ca::policy::Policy::load(&fixture.config_root).unwrap();
+    assert!(!policy.revoked_ssh_keys.is_empty());
+    assert_eq!(policy.revoked_x509_keys.len(), 1);
+}
+
+#[cfg(unix)]
+fn prepare_x509_enrollment(fixture: &ExecFixture, dir: &Path) -> PathBuf {
+    let server_step = dir.join("server-step");
+    let host_material = server_step.join("secrets/hosts/edge-host");
+    fs::create_dir_all(server_step.join("certs")).unwrap();
+    fs::create_dir_all(&host_material).unwrap();
+    fs::write(server_step.join("certs/root_ca.crt"), "root\n").unwrap();
+    fs::write(host_material.join("provisioner.priv.json"), "{}\n").unwrap();
+    let x509_dir = dir.join("x509");
+    let deployment = fixture.config_root.join("config/deployment.env");
+    let mut text = fs::read_to_string(&deployment).unwrap();
+    text.push_str(&format!("GRAFHOME_CA_X509_DIR={}\n", x509_dir.display()));
+    fs::write(deployment, text).unwrap();
+    x509_dir
+}
+
+#[cfg(unix)]
+fn enroll_x509(fixture: &ExecFixture) -> Command {
+    let mut command = x509_command(fixture, &["enroll", "nfs-client", "--host", "edge-host"]);
+    command.env("FAKE_JWK_UNIQUE", "1");
+    command
+}
+
+#[cfg(unix)]
+fn enrollment_request(output: &[u8]) -> grafhome_ca::x509::X509Request {
+    let text = std::str::from_utf8(output).unwrap();
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("REQUEST:"))
+        .unwrap();
+    serde_json::from_str(line).unwrap()
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_enroll_creates_private_material_and_a_public_request() {
+    let (dir, fixture) = exec_fixture();
+    let x509_dir = prepare_x509_enrollment(&fixture, dir.path());
+
+    let output = enroll_x509(&fixture)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let request = enrollment_request(&output.stdout);
+    request.validate().unwrap();
+    assert_eq!(request.host, "edge-host");
+    assert_eq!(request.name, "nfs-client");
+    assert_eq!(request.names, ["edge-host.example.test"]);
+    assert_eq!(request.certificate_public_key, X509_KEY);
+    let credentials = dir.path().join("server-step/secrets/hosts/edge-host/x509");
+    assert_eq!(file_mode(&credentials), 0o700);
+    assert_eq!(file_mode(&credentials.join("nfs-client")), 0o700);
+    for path in [
+        credentials.join("nfs-client/provisioner.priv.json"),
+        credentials.join("nfs-client/renewal-password"),
+        x509_dir.join("nfs-client/key.pem"),
+    ] {
+        assert_eq!(file_mode(&path), 0o600, "{}", path.display());
+    }
+    assert!(!x509_dir.join("nfs-client/key.pem.pending").exists());
+
+    let password = fs::read_to_string(credentials.join("nfs-client/renewal-password")).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for text in [&stdout, &stderr] {
+        assert!(!text.contains(&password));
+        assert!(!text.contains("FAKE-PRIVATE"));
+        assert!(!text.contains("\"d\""));
+    }
+    assert!(
+        !fs::read_dir(x509_dir.join("nfs-client"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.'))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_enroll_requires_the_host_to_be_enrolled_for_trust() {
+    let (dir, fixture) = exec_fixture();
+    let x509_dir = prepare_x509_enrollment(&fixture, dir.path());
+    fs::remove_file(dir.path().join("server-step/certs/root_ca.crt")).unwrap();
+
+    enroll_x509(&fixture)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ssh enroll host"));
+
+    assert!(!x509_dir.exists());
+    assert!(!fixture.log.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_enroll_rejects_an_undeclared_cert() {
+    let (dir, fixture) = exec_fixture();
+    let x509_dir = prepare_x509_enrollment(&fixture, dir.path());
+
+    x509_command(&fixture, &["enroll", "../evil", "--host", "edge-host"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not declared"));
+
+    assert!(!x509_dir.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_enroll_rerun_reuses_keys() {
+    let (dir, fixture) = exec_fixture();
+    let x509_dir = prepare_x509_enrollment(&fixture, dir.path());
+    let first = enroll_x509(&fixture)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let key = fs::read(x509_dir.join("nfs-client/key.pem")).unwrap();
+
+    let second = enroll_x509(&fixture)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert_eq!(
+        enrollment_request(&first.stdout),
+        enrollment_request(&second.stdout)
+    );
+    assert_eq!(fs::read(x509_dir.join("nfs-client/key.pem")).unwrap(), key);
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_enroll_refuses_a_partial_credential() {
+    let (dir, fixture) = exec_fixture();
+    prepare_x509_enrollment(&fixture, dir.path());
+    enroll_x509(&fixture).assert().success();
+    let password = dir
+        .path()
+        .join("server-step/secrets/hosts/edge-host/x509/nfs-client/renewal-password");
+    fs::remove_file(password).unwrap();
+
+    enroll_x509(&fixture)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("incomplete renewal credential"));
+}
+
+#[cfg(unix)]
+#[test]
+fn x509_enroll_after_revocation_stages_a_pending_key() {
+    let (dir, fixture) = exec_fixture();
+    let x509_dir = prepare_x509_enrollment(&fixture, dir.path());
+    let ca_json = prepare_x509_ca(&fixture);
+    let first = enroll_x509(&fixture)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let first = enrollment_request(&first.stdout);
+    let live_key = fs::read(x509_dir.join("nfs-client/key.pem")).unwrap();
+    let request_file = dir.path().join("request.json");
+    fs::write(&request_file, serde_json::to_string(&first).unwrap()).unwrap();
+    approve_x509_command(&fixture, &request_file)
+        .assert()
+        .success();
+    x509_command(&fixture, &["revoke", "--host", "edge-host", "nfs-client"])
+        .assert()
+        .success();
+
+    let second = enroll_x509(&fixture)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let second = enrollment_request(&second.stdout);
+
+    assert_eq!(second.certificate_public_key, X509_KEY_TWO);
+    assert_ne!(second.renewal_public_jwk, first.renewal_public_jwk);
+    assert_eq!(
+        fs::read(x509_dir.join("nfs-client/key.pem")).unwrap(),
+        live_key
+    );
+    assert_eq!(
+        file_mode(&x509_dir.join("nfs-client/key.pem.pending")),
+        0o600
+    );
+
+    // A rerun re-emits the staged request, and it now passes approval.
+    let again = enroll_x509(&fixture)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(enrollment_request(&again.stdout), second);
+    fs::write(&request_file, serde_json::to_string(&second).unwrap()).unwrap();
+    approve_x509_command(&fixture, &request_file)
+        .assert()
+        .success();
+    assert_eq!(live_provisioner_names(&ca_json), [EDGE_X509_PROVISIONER]);
+}
+
+#[cfg(unix)]
+fn materialize_with(
+    fixture: &ExecFixture,
+    dir: &Path,
+    extra: serde_json::Value,
+) -> assert_cmd::assert::Assert {
+    let staging = dir.join("staging");
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .arg("render")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--out-dir")
+        .arg(&staging)
+        .assert()
+        .success();
+    let origin_host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .split('.')
+        .next()
+        .unwrap()
+        .to_owned();
+    let staged_ca_json = staging.join(format!(
+        "hosts/{origin_host}{}/step/config/ca.json",
+        dir.join("state").display()
+    ));
+    let live_ca_json = dir.join("live-ca.json");
+    fs::write(
+        &live_ca_json,
+        serde_json::to_vec(&serde_json::json!({"authority": {"provisioners": [
+            {
+                "type": "JWK",
+                "name": "grafhome-host-bootstrap",
+                "key": {"kid": "bootstrap-kid", "kty": "EC", "crv": "P-256", "x": "bootstrap-x", "y": "bootstrap-y"},
+                "encryptedKey": "encrypted-bootstrap",
+                "claims": {"enableSSHCA": true}
+            },
+            extra,
+        ]}}))
+        .unwrap(),
+    )
+    .unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .arg("materialize")
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .arg("--live-ca-json")
+        .arg(&live_ca_json)
+        .arg("--staged-ca-json")
+        .arg(&staged_ca_json)
+        .arg("--jwk-dir")
+        .arg(dir.join("state/secrets/provisioners"))
+        .arg("--out-file")
+        .arg(dir.join("materialized-ca.json"))
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_preserves_active_x509_provisioners() {
+    let (dir, fixture) = exec_fixture();
+    let mut live = edge_x509_provisioner(&fixture, X509_KEY, "first");
+    let expected = live.clone();
+    live["encryptedKey"] = serde_json::json!("remove-accidental-secret");
+    live["claims"]["maxTLSCertDuration"] = serde_json::json!("1h");
+
+    materialize_with(&fixture, dir.path(), live).success();
+
+    let names = live_provisioner_names(&dir.path().join("materialized-ca.json"));
+    assert!(names.contains(&EDGE_X509_PROVISIONER.to_owned()));
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("materialized-ca.json")).unwrap())
+            .unwrap();
+    let materialized = value["authority"]["provisioners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == EDGE_X509_PROVISIONER)
+        .unwrap();
+    assert_eq!(materialized, &expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_drops_revoked_x509_provisioners() {
+    let (dir, fixture) = exec_fixture();
+    let live = edge_x509_provisioner(&fixture, X509_KEY, "first");
+    let (_, fingerprint) =
+        grafhome_ca::enrollment_registry::canonical_jwk(&x509_jwk("first")).unwrap();
+    fs::write(
+        fixture.config_root.join("policy/revocations.toml"),
+        format!(
+            "format_version = 1\n\n[[x509_keys]]\nhost = \"edge-host\"\nname = \"nfs-client\"\npublic_key_fingerprint = \"{}\"\nrenewal_fingerprint = \"{fingerprint}\"\nrevoked_at = \"2026-07-24T20:14:15Z\"\n",
+            grafhome_ca::x509::CertificateKey::parse(X509_KEY)
+                .unwrap()
+                .fingerprint()
+        ),
+    )
+    .unwrap();
+
+    materialize_with(&fixture, dir.path(), live).success();
+
+    let names = live_provisioner_names(&dir.path().join("materialized-ca.json"));
+    assert!(!names.contains(&EDGE_X509_PROVISIONER.to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_reconciles_x509_claims() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+    let expected = edge_x509_provisioner(&fixture, X509_KEY, "first");
+    let mut live = expected.clone();
+    live["claims"]["maxTLSCertDuration"] = serde_json::json!("1h");
+    live["claims"]["disableRenewal"] = serde_json::json!(false);
+    live["claims"]["enableSSHCA"] = serde_json::json!(true);
+    value["authority"]["provisioners"]
+        .as_array_mut()
+        .unwrap()
+        .push(live);
+    fs::write(&ca_json, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "update\t{EDGE_X509_PROVISIONER}"
+        )));
+
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+    assert_eq!(value["authority"]["provisioners"][3], expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_refuses_an_undeclared_x509_provisioner() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+    let mut live = edge_x509_provisioner(&fixture, X509_KEY, "first");
+    live["name"] = serde_json::json!(grafhome_ca::x509::x509_provisioner_name(
+        "edge-host",
+        "retired"
+    ));
+    value["authority"]["provisioners"]
+        .as_array_mut()
+        .unwrap()
+        .push(live);
+    let before = serde_json::to_vec(&value).unwrap();
+    fs::write(&ca_json, &before).unwrap();
+
+    apply_ca_command(&fixture)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no active policy declaration"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+}
+
+#[cfg(unix)]
+fn disable_proxy_x509(fixture: &ExecFixture) {
+    let ca_policy = fixture.config_root.join("policy/ca.toml");
+    let mut policy = fs::read_to_string(&ca_policy).unwrap();
+    assert!(policy.trim_end().ends_with("max_ttl = \"720h\""));
+    policy.push_str("status = \"disabled\"\n");
+    fs::write(ca_policy, policy).unwrap();
+}
+
+#[cfg(unix)]
+fn add_live_acme(ca_json: &Path, name: &str) {
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(ca_json).unwrap()).unwrap();
+    value["authority"]["provisioners"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"type": "ACME", "name": name}));
+    fs::write(ca_json, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_removes_disabled_acme() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
+    disable_proxy_x509(&fixture);
+
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remove\tgrafhome-x509-ca-proxy"));
+
+    assert!(!fs::read_to_string(&ca_json).unwrap().contains("ACME"));
+    apply_ca_command(&fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CA policy already current"));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_removes_only_disabled_acme_after_a_dry_run() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
+    disable_proxy_x509(&fixture);
+    let before = fs::read(&ca_json).unwrap();
+
+    apply_ca_command(&fixture)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remove\tgrafhome-x509-ca-proxy"));
+
+    assert_eq!(fs::read(&ca_json).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_keeps_active_acme_but_removes_a_stray_one() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
+    add_live_acme(&ca_json, "stray-acme");
+
+    apply_ca_command(&fixture).assert().success();
+
+    let names = live_provisioner_names(&ca_json);
+    assert!(names.contains(&"grafhome-x509-ca-proxy".to_owned()));
+    assert!(!names.contains(&"stray-acme".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_ca_refuses_jwk_without_x509_deny() {
+    let (_dir, fixture) = exec_fixture();
+    let ca_json = prepare_apply_ca(&fixture);
+    for template in [
+        None,
+        Some(r#"{"subject": {{ toJson .Subject }}}"#),
+        Some(r#"{{ if .Token.x }}{{ fail "no" }}{{ end }}"#),
+    ] {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
+        let provisioners = value["authority"]["provisioners"].as_array_mut().unwrap();
+        provisioners.retain(|item| item["name"] != "issues-x509");
+        let mut item =
+            serde_json::json!({"type": "JWK", "name": "issues-x509", "key": {"kid": "k"}});
+        if let Some(template) = template {
+            item["options"] = serde_json::json!({"x509": {"template": template}});
+        }
+        provisioners.push(item);
+        let before = serde_json::to_vec(&value).unwrap();
+        fs::write(&ca_json, &before).unwrap();
+
+        apply_ca_command(&fixture)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("issues-x509"))
+            .stderr(predicate::str::contains("X.509 deny template"));
+
+        assert_eq!(fs::read(&ca_json).unwrap(), before);
+    }
+    assert_eq!(restart_count(&fixture), 0);
 }

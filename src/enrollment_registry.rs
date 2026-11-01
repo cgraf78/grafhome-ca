@@ -1,4 +1,4 @@
-//! Protected CA-origin inventory for enrolled SSH and renewal public keys.
+//! Protected CA-origin inventory for enrolled SSH, X.509, and renewal public keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::enrollment::{HostRequest, UserRequest};
 use crate::error::{Error, Result};
-use crate::policy::{RevokedSshKey, canonical_ssh_public_key};
+use crate::policy::{RevokedSshKey, RevokedX509Key, canonical_ssh_public_key};
 use crate::policy::{valid_host_identity, valid_user_identity};
+use crate::x509::{CertificateKey, X509Request, x509_identity};
 
 /// On-disk enrollment registry format.
 pub const FORMAT_VERSION: u32 = 1;
@@ -32,7 +33,16 @@ pub enum RecordStatus {
     Revoked,
 }
 
-/// One host or user enrollment and its two public keys.
+/// The policy tombstone for one revoked enrollment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Revocation {
+    /// Tombstone for an SSH host or user key.
+    Ssh(RevokedSshKey),
+    /// Tombstone for an X.509 certificate key.
+    X509(RevokedX509Key),
+}
+
+/// One host, user, or certificate enrollment and its two public keys.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum EnrollmentRecord {
@@ -69,6 +79,28 @@ pub enum EnrollmentRecord {
         /// SHA-256 fingerprint of the SSH key.
         ssh_fingerprint: String,
         /// Canonical public half of the device renewal JWK.
+        renewal_public_jwk: Value,
+        /// SHA-256 thumbprint of the renewal JWK.
+        renewal_fingerprint: String,
+        /// UTC time when the key pair first entered the registry.
+        enrolled_at: String,
+        /// UTC time when the key pair became a permanent tombstone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revoked_at: Option<String>,
+    },
+    /// X.509 certificate enrollment on one host.
+    X509 {
+        /// Registry lifecycle state.
+        status: RecordStatus,
+        /// Stable policy host identity.
+        host: String,
+        /// Policy certificate name, unique within its host.
+        name: String,
+        /// Canonical PEM public key the provisioner pins.
+        certificate_public_key: String,
+        /// SHA-256 fingerprint of the certificate public key.
+        certificate_fingerprint: String,
+        /// Canonical public half of the renewal JWK.
         renewal_public_jwk: Value,
         /// SHA-256 thumbprint of the renewal JWK.
         renewal_fingerprint: String,
@@ -116,6 +148,24 @@ impl EnrollmentRecord {
         })
     }
 
+    /// Build a canonical pending X.509 record from a public enrollment request.
+    pub fn pending_x509(request: &X509Request, now: &str) -> Result<Self> {
+        request.validate()?;
+        let key = CertificateKey::parse(&request.certificate_public_key)?;
+        let (renewal_public_jwk, renewal_fingerprint) = canonical_jwk(&request.renewal_public_jwk)?;
+        Ok(Self::X509 {
+            status: RecordStatus::Pending,
+            host: request.host.clone(),
+            name: request.name.clone(),
+            certificate_public_key: key.pem(),
+            certificate_fingerprint: key.fingerprint(),
+            renewal_public_jwk,
+            renewal_fingerprint,
+            enrolled_at: now.to_owned(),
+            revoked_at: None,
+        })
+    }
+
     /// Human-readable logical identity.
     #[must_use]
     pub fn identity(&self) -> String {
@@ -124,6 +174,7 @@ impl EnrollmentRecord {
             Self::User {
                 user, client_host, ..
             } => format!("user {user}@{client_host}"),
+            Self::X509 { host, name, .. } => x509_identity(host, name),
         }
     }
 
@@ -131,21 +182,26 @@ impl EnrollmentRecord {
     #[must_use]
     pub const fn status(&self) -> RecordStatus {
         match self {
-            Self::Host { status, .. } | Self::User { status, .. } => *status,
+            Self::Host { status, .. } | Self::User { status, .. } | Self::X509 { status, .. } => {
+                *status
+            }
         }
     }
 
-    /// Canonical SSH public key.
+    /// Canonical SSH public key, which an X.509 enrollment does not have.
     #[must_use]
-    pub fn ssh_public_key(&self) -> &str {
+    pub fn ssh_public_key(&self) -> Option<&str> {
         match self {
-            Self::Host { ssh_public_key, .. } | Self::User { ssh_public_key, .. } => ssh_public_key,
+            Self::Host { ssh_public_key, .. } | Self::User { ssh_public_key, .. } => {
+                Some(ssh_public_key)
+            }
+            Self::X509 { .. } => None,
         }
     }
 
-    /// SSH key fingerprint.
+    /// Fingerprint of the key this enrollment certifies, SSH or X.509.
     #[must_use]
-    pub fn ssh_fingerprint(&self) -> &str {
+    pub fn key_fingerprint(&self) -> &str {
         match self {
             Self::Host {
                 ssh_fingerprint, ..
@@ -153,6 +209,19 @@ impl EnrollmentRecord {
             | Self::User {
                 ssh_fingerprint, ..
             } => ssh_fingerprint,
+            Self::X509 {
+                certificate_fingerprint,
+                ..
+            } => certificate_fingerprint,
+        }
+    }
+
+    /// Display name of the kind of key this enrollment certifies.
+    #[must_use]
+    pub const fn key_kind(&self) -> &'static str {
+        match self {
+            Self::Host { .. } | Self::User { .. } => "SSH",
+            Self::X509 { .. } => "certificate",
         }
     }
 
@@ -164,6 +233,9 @@ impl EnrollmentRecord {
                 renewal_public_jwk, ..
             }
             | Self::User {
+                renewal_public_jwk, ..
+            }
+            | Self::X509 {
                 renewal_public_jwk, ..
             } => renewal_public_jwk,
         }
@@ -180,6 +252,10 @@ impl EnrollmentRecord {
             | Self::User {
                 renewal_fingerprint,
                 ..
+            }
+            | Self::X509 {
+                renewal_fingerprint,
+                ..
             } => renewal_fingerprint,
         }
     }
@@ -188,7 +264,7 @@ impl EnrollmentRecord {
     #[must_use]
     pub fn belongs_to_host(&self, expected: &str) -> bool {
         match self {
-            Self::Host { host, .. } => host == expected,
+            Self::Host { host, .. } | Self::X509 { host, .. } => host == expected,
             Self::User { client_host, .. } => client_host == expected,
         }
     }
@@ -203,9 +279,18 @@ impl EnrollmentRecord {
         )
     }
 
-    /// Convert this record into the tracked plain-key revocation entry.
+    /// Whether this is the selected certificate enrollment.
     #[must_use]
-    pub fn to_revocation(&self, revoked_at: &str, reason: Option<&str>) -> RevokedSshKey {
+    pub fn matches_x509(&self, expected_host: &str, expected_name: &str) -> bool {
+        matches!(
+            self,
+            Self::X509 { host, name, .. } if host == expected_host && name == expected_name
+        )
+    }
+
+    /// Convert this record into its tracked revocation entry.
+    #[must_use]
+    pub fn to_revocation(&self, revoked_at: &str, reason: Option<&str>) -> Revocation {
         match self {
             Self::Host {
                 host,
@@ -213,14 +298,14 @@ impl EnrollmentRecord {
                 ssh_fingerprint,
                 renewal_fingerprint,
                 ..
-            } => RevokedSshKey::Host {
+            } => Revocation::Ssh(RevokedSshKey::Host {
                 host: host.clone(),
                 public_key: ssh_public_key.clone(),
                 fingerprint: ssh_fingerprint.clone(),
                 renewal_fingerprint: renewal_fingerprint.clone(),
                 revoked_at: revoked_at.to_owned(),
                 reason: reason.map(ToOwned::to_owned),
-            },
+            }),
             Self::User {
                 user,
                 client_host,
@@ -228,7 +313,7 @@ impl EnrollmentRecord {
                 ssh_fingerprint,
                 renewal_fingerprint,
                 ..
-            } => RevokedSshKey::User {
+            } => Revocation::Ssh(RevokedSshKey::User {
                 user: user.clone(),
                 client_host: client_host.clone(),
                 public_key: ssh_public_key.clone(),
@@ -236,7 +321,21 @@ impl EnrollmentRecord {
                 renewal_fingerprint: renewal_fingerprint.clone(),
                 revoked_at: revoked_at.to_owned(),
                 reason: reason.map(ToOwned::to_owned),
-            },
+            }),
+            Self::X509 {
+                host,
+                name,
+                certificate_fingerprint,
+                renewal_fingerprint,
+                ..
+            } => Revocation::X509(RevokedX509Key {
+                host: host.clone(),
+                name: name.clone(),
+                public_key_fingerprint: certificate_fingerprint.clone(),
+                renewal_fingerprint: renewal_fingerprint.clone(),
+                revoked_at: revoked_at.to_owned(),
+                reason: reason.map(ToOwned::to_owned),
+            }),
         }
     }
 
@@ -255,12 +354,24 @@ impl EnrollmentRecord {
                     ..
                 },
             ) => left_user == right_user && left_host == right_host,
+            (
+                Self::X509 {
+                    host: left_host,
+                    name: left_name,
+                    ..
+                },
+                Self::X509 {
+                    host: right_host,
+                    name: right_name,
+                    ..
+                },
+            ) => left_host == right_host && left_name == right_name,
             _ => false,
         }
     }
 
     fn same_keys(&self, other: &Self) -> bool {
-        self.ssh_fingerprint() == other.ssh_fingerprint()
+        self.key_fingerprint() == other.key_fingerprint()
             && self.renewal_fingerprint() == other.renewal_fingerprint()
     }
 
@@ -272,6 +383,11 @@ impl EnrollmentRecord {
                 ..
             }
             | Self::User {
+                status: current,
+                revoked_at: current_revoked_at,
+                ..
+            }
+            | Self::X509 {
                 status: current,
                 revoked_at: current_revoked_at,
                 ..
@@ -468,16 +584,26 @@ impl EnrollmentRegistry {
             .collect()
     }
 
+    /// Return every current or historical record for one certificate.
+    #[must_use]
+    pub fn records_for_x509(&self, host: &str, name: &str) -> Vec<EnrollmentRecord> {
+        self.records
+            .iter()
+            .filter(|record| record.matches_x509(host, name))
+            .cloned()
+            .collect()
+    }
+
     /// Permanently tombstone the exact selected key pairs.
     pub fn mark_revoked(&mut self, selected: &[EnrollmentRecord], revoked_at: &str) -> usize {
         let selected = selected
             .iter()
-            .map(|record| (record.ssh_fingerprint(), record.renewal_fingerprint()))
+            .map(|record| (record.key_fingerprint(), record.renewal_fingerprint()))
             .collect::<BTreeSet<_>>();
         let mut changed = 0;
         for record in &mut self.records {
             if record.status() != RecordStatus::Revoked
-                && selected.contains(&(record.ssh_fingerprint(), record.renewal_fingerprint()))
+                && selected.contains(&(record.key_fingerprint(), record.renewal_fingerprint()))
             {
                 record.set_status(RecordStatus::Revoked, Some(revoked_at));
                 changed += 1;
@@ -489,14 +615,15 @@ impl EnrollmentRegistry {
     fn check_candidate(&self, candidate: &EnrollmentRecord) -> Result<()> {
         for record in &self.records {
             if record.status() == RecordStatus::Revoked
-                && (record.ssh_fingerprint() == candidate.ssh_fingerprint()
+                && (record.key_fingerprint() == candidate.key_fingerprint()
                     || record.renewal_fingerprint() == candidate.renewal_fingerprint())
             {
                 return Err(Error::Validation {
                     field: "enrollment registry".to_owned(),
                     message: format!(
-                        "{} reuses a previously revoked SSH or renewal key",
-                        candidate.identity()
+                        "{} reuses a previously revoked {} or renewal key",
+                        candidate.identity(),
+                        candidate.key_kind()
                     ),
                 });
             }
@@ -513,14 +640,15 @@ impl EnrollmentRegistry {
                 });
             }
             if record.status() != RecordStatus::Revoked
-                && (record.ssh_fingerprint() == candidate.ssh_fingerprint()
+                && (record.key_fingerprint() == candidate.key_fingerprint()
                     || record.renewal_fingerprint() == candidate.renewal_fingerprint())
             {
                 return Err(Error::Validation {
                     field: "enrollment registry".to_owned(),
                     message: format!(
-                        "{} reuses an SSH or renewal key already assigned to {}",
+                        "{} reuses a {} or renewal key already assigned to {}",
                         candidate.identity(),
+                        candidate.key_kind(),
                         record.identity()
                     ),
                 });
@@ -537,7 +665,7 @@ impl EnrollmentRegistry {
             });
         }
         let mut live_identities = BTreeSet::new();
-        let mut ssh_keys = BTreeMap::new();
+        let mut certified_keys = BTreeMap::new();
         let mut renewal_keys = BTreeMap::new();
         for (index, record) in self.records.iter().enumerate() {
             validate_record(path, index, record)?;
@@ -549,9 +677,9 @@ impl EnrollmentRegistry {
                     message: "duplicate live logical identity".to_owned(),
                 });
             }
-            if let Some(previous) = ssh_keys.insert(record.ssh_fingerprint(), index) {
+            if let Some(previous) = certified_keys.insert(record.key_fingerprint(), index) {
                 return Err(Error::Validation {
-                    field: format!("{}:records[{index}].ssh_fingerprint", path.display()),
+                    field: format!("{}:records[{index}].key_fingerprint", path.display()),
                     message: format!("duplicates records[{previous}]"),
                 });
             }
@@ -604,14 +732,12 @@ fn validate_record(path: &Path, index: usize, record: &EnrollmentRecord) -> Resu
             validate_user_name(&format!("{prefix}.user"), user)?;
             validate_host_name(&format!("{prefix}.client_host"), client_host)?;
         }
+        EnrollmentRecord::X509 { host, name, .. } => {
+            validate_host_name(&format!("{prefix}.host"), host)?;
+            validate_host_name(&format!("{prefix}.name"), name)?;
+        }
     }
-    let (canonical_key, ssh_fingerprint) = canonical_key(record.ssh_public_key())?;
-    if canonical_key != record.ssh_public_key() || ssh_fingerprint != record.ssh_fingerprint() {
-        return Err(Error::Validation {
-            field: format!("{prefix}.ssh_public_key"),
-            message: "SSH public key or fingerprint is not canonical".to_owned(),
-        });
-    }
+    validate_certified_key(&prefix, record)?;
     let (canonical_jwk, renewal_fingerprint) = canonical_jwk(record.renewal_public_jwk())?;
     if canonical_jwk != *record.renewal_public_jwk()
         || renewal_fingerprint != record.renewal_fingerprint()
@@ -628,6 +754,11 @@ fn validate_record(path: &Path, index: usize, record: &EnrollmentRecord) -> Resu
             ..
         }
         | EnrollmentRecord::User {
+            enrolled_at,
+            revoked_at,
+            ..
+        }
+        | EnrollmentRecord::X509 {
             enrolled_at,
             revoked_at,
             ..
@@ -653,6 +784,37 @@ fn validate_record(path: &Path, index: usize, record: &EnrollmentRecord) -> Resu
         (_, None) => {}
     }
     Ok(())
+}
+
+fn validate_certified_key(prefix: &str, record: &EnrollmentRecord) -> Result<()> {
+    let (field, canonical) = match record {
+        EnrollmentRecord::Host { ssh_public_key, .. }
+        | EnrollmentRecord::User { ssh_public_key, .. } => {
+            let (key, fingerprint) = canonical_key(ssh_public_key)?;
+            (
+                "ssh_public_key",
+                key == *ssh_public_key && fingerprint == record.key_fingerprint(),
+            )
+        }
+        EnrollmentRecord::X509 {
+            certificate_public_key,
+            ..
+        } => {
+            let key = CertificateKey::parse(certificate_public_key)?;
+            (
+                "certificate_public_key",
+                key.pem() == *certificate_public_key
+                    && key.fingerprint() == record.key_fingerprint(),
+            )
+        }
+    };
+    if canonical {
+        return Ok(());
+    }
+    Err(Error::Validation {
+        field: format!("{prefix}.{field}"),
+        message: "public key or fingerprint is not canonical".to_owned(),
+    })
 }
 
 fn validate_host_name(field: &str, value: &str) -> Result<()> {
@@ -776,6 +938,168 @@ mod tests {
                 "y": "coordinate-y"
             }),
         )
+    }
+
+    const CERT_KEY: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpLa4TQ2I6fGxrpsTXIjkONnFqp7+
+aVXF2GUB0FzWyZNJBGBdIwsLJSjUsFMF+216+CkBLucOD2YTRAkWruHHcQ==
+-----END PUBLIC KEY-----
+";
+    const CERT_KEY_TWO: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE73fnTG0+dIVc6rYompVn1sa8O2+L
+5rW09KuHOpbkZ2TDLVemT/xp2ibhgqZsKwZ1q7NjLFocpQDCHIgPJU9KGQ==
+-----END PUBLIC KEY-----
+";
+
+    fn x509_record(key: &str, x: &str) -> EnrollmentRecord {
+        let request = crate::x509::X509Request::new(
+            "phone",
+            "nfs-client",
+            vec!["phone.example.test".to_owned()],
+            key,
+            json!({"kty": "EC", "crv": "P-256", "x": x, "y": "coordinate-y"}),
+        );
+        EnrollmentRecord::pending_x509(&request, NOW).unwrap()
+    }
+
+    #[test]
+    fn registry_accepts_old_records() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let host =
+            EnrollmentRecord::pending_host(&request("phone", KEY_ONE, "first-x"), NOW).unwrap();
+        let mut old = serde_json::to_value(&host).unwrap();
+        old["status"] = json!("active");
+        let text = json!({"format_version": 1, "records": [old]}).to_string();
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let registry = EnrollmentRegistry::load(&path).unwrap();
+
+        assert_eq!(registry.live_for_host("phone").len(), 1);
+        assert_eq!(
+            registry.live_for_host("phone")[0].ssh_public_key(),
+            Some(canonical_ssh(KEY_ONE).as_str())
+        );
+    }
+
+    fn canonical_ssh(key: &str) -> String {
+        super::canonical_key(key).unwrap().0
+    }
+
+    #[test]
+    fn registry_x509_record_has_no_ssh_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let record = x509_record(CERT_KEY, "first-x");
+        assert_eq!(record.ssh_public_key(), None);
+        assert_eq!(record.identity(), "x509 nfs-client@phone");
+        let mut registry = EnrollmentRegistry::default();
+        registry.activate(record.clone()).unwrap();
+
+        registry.save(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("ssh_public_key"));
+        assert!(!text.contains("ssh_fingerprint"));
+        assert!(text.contains("\"kind\": \"x509\""));
+        assert_eq!(EnrollmentRegistry::load(&path).unwrap(), registry);
+    }
+
+    #[test]
+    fn registry_rejects_a_tampered_x509_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let mut record = serde_json::to_value(x509_record(CERT_KEY, "first-x")).unwrap();
+        record["certificate_fingerprint"] = json!("SHA256:wrong");
+        let text = json!({"format_version": 1, "records": [record]}).to_string();
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(EnrollmentRegistry::load(&path).is_err());
+    }
+
+    #[test]
+    fn x509_retry_is_idempotent_and_replacement_requires_revocation() {
+        let mut registry = EnrollmentRegistry::default();
+        let first = x509_record(CERT_KEY, "first-x");
+        assert!(registry.reserve(first.clone()).unwrap());
+        assert!(!registry.reserve(first.clone()).unwrap());
+        assert_eq!(
+            registry.matching_status(&first),
+            Some(RecordStatus::Pending)
+        );
+        assert!(registry.activate(first.clone()).unwrap());
+        assert!(!registry.activate(first.clone()).unwrap());
+
+        let replacement = x509_record(CERT_KEY_TWO, "second-x");
+        assert!(
+            registry
+                .reserve(replacement.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("revoke it before")
+        );
+
+        let selected = registry.records_for_x509("phone", "nfs-client");
+        assert_eq!(registry.mark_revoked(&selected, NOW), 1);
+        assert!(registry.reserve(replacement).unwrap());
+    }
+
+    #[test]
+    fn revoked_x509_keys_stay_unusable_across_identities() {
+        let mut registry = EnrollmentRegistry::default();
+        let first = x509_record(CERT_KEY, "first-x");
+        registry.activate(first.clone()).unwrap();
+        registry.mark_revoked(&[first], NOW);
+
+        let same_key = x509_record(CERT_KEY, "second-x");
+        assert!(
+            registry
+                .reserve(same_key)
+                .unwrap_err()
+                .to_string()
+                .contains("revoked certificate")
+        );
+        let same_renewal = x509_record(CERT_KEY_TWO, "first-x");
+        assert!(registry.reserve(same_renewal).is_err());
+    }
+
+    #[test]
+    fn x509_record_cannot_share_a_renewal_key_with_ssh() {
+        let mut registry = EnrollmentRegistry::default();
+        let host =
+            EnrollmentRecord::pending_host(&request("phone", KEY_ONE, "first-x"), NOW).unwrap();
+        registry.activate(host).unwrap();
+
+        assert!(
+            registry
+                .reserve(x509_record(CERT_KEY, "first-x"))
+                .unwrap_err()
+                .to_string()
+                .contains("already assigned")
+        );
+    }
+
+    #[test]
+    fn x509_records_belong_to_their_host_and_become_tombstones() {
+        let mut registry = EnrollmentRegistry::default();
+        registry.activate(x509_record(CERT_KEY, "first-x")).unwrap();
+
+        let selected = registry.records_for_host("phone");
+        assert_eq!(selected.len(), 1);
+        match selected[0].to_revocation(NOW, Some("lost")) {
+            super::Revocation::X509(entry) => {
+                assert_eq!(entry.host, "phone");
+                assert_eq!(entry.name, "nfs-client");
+                assert_eq!(entry.public_key_fingerprint, selected[0].key_fingerprint());
+                assert_eq!(entry.renewal_fingerprint, selected[0].renewal_fingerprint());
+                assert_eq!(entry.reason.as_deref(), Some("lost"));
+            }
+            super::Revocation::Ssh(_) => panic!("expected an X.509 tombstone"),
+        }
     }
 
     #[test]

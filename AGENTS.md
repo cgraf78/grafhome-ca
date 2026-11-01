@@ -11,9 +11,10 @@ real site data.
 
 - `src/bin/grafhome-ca.rs`: the CLI and most command workflows. `src/` holds
   the library: `config`, `model`, `policy/`, `render`, `enrollment`,
-  `enrollment_registry`, `runtime_provisioners`, `provenance`,
+  `enrollment_registry`, `runtime_provisioners`, `x509`, `provenance`,
   `public_material`, and `executable` (trusted `step`/`step-cli` lookup).
-  `step` runs from the CLI, `public_material`, and `runtime_provisioners`;
+  `step` runs from the CLI, `public_material`, `runtime_provisioners`, and
+  `x509`;
   `smallstep` is only a placeholder type.
 - `schemas/` (canonical policy schemas versioned under
   `schemas/policy/canonical/`), `templates/` (non-secret SSH, Apache,

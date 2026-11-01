@@ -1697,3 +1697,352 @@ fn run_fails(command: &mut Command) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Assert the CA itself refused `command`.
+///
+/// A bare non-zero exit also covers CLI usage errors that never reach the CA, so
+/// that alone cannot show a control works.
+fn run_refused(command: &mut Command) {
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("lacked necessary authorization"),
+        "expected a CA refusal, status {:?}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
+const X509_NAME: &str = "edge-host.example.test";
+const FOREIGN_NAME: &str = "other.example.test";
+
+/// One throwaway `step-ca` holding a single enrolled X.509 provisioner.
+struct X509Ca {
+    temp: tempfile::TempDir,
+    address: String,
+    provisioner: String,
+    _child: StepCaChild,
+}
+
+/// Start a CA for `role`, or return `None` when the suite is not requested.
+fn x509_ca(role: grafhome_ca::policy::X509Role) -> Option<X509Ca> {
+    if std::env::var("GRAFHOME_CA_RUN_STEP_CA_INTEGRATION").as_deref() != Ok("1") {
+        let message =
+            "skipping step-ca integration test; set GRAFHOME_CA_RUN_STEP_CA_INTEGRATION=1";
+        if std::env::var("GRAFHOME_CA_REQUIRE_STEP_CA_INTEGRATION").as_deref() == Ok("1") {
+            panic!("{message}");
+        }
+        eprintln!("{message}");
+        return None;
+    }
+    assert_command_available("step");
+    assert_command_available("step-ca");
+
+    let temp = tempdir().unwrap();
+    let password = temp.path().join("password");
+    std::fs::write(&password, ["test", "only", "passphrase"].join("-")).unwrap();
+    let steppath = temp.path().join("step");
+    run(Command::new("step")
+        .env("STEPPATH", &steppath)
+        .args(["ca", "init", "--ssh", "--deployment-type", "standalone"])
+        .args(["--name", "grafhome-ca-test", "--dns", "127.0.0.1"])
+        .args(["--address", "127.0.0.1:0", "--provisioner", "bootstrap"])
+        .arg("--password-file")
+        .arg(&password)
+        .arg("--provisioner-password-file")
+        .arg(&password));
+    run(Command::new("step")
+        .args(["crypto", "keypair"])
+        .arg(temp.path().join("enrolled.pub"))
+        .arg(temp.path().join("enrolled.key"))
+        .args([
+            "--kty",
+            "EC",
+            "--crv",
+            "P-256",
+            "--no-password",
+            "--insecure",
+        ]));
+    run(Command::new("step")
+        .args(["crypto", "jwk", "create"])
+        .arg(temp.path().join("renewal.pub.json"))
+        .arg(temp.path().join("renewal.priv.json"))
+        .arg("--password-file")
+        .arg(&password));
+
+    let cert = grafhome_ca::policy::X509Cert {
+        host: "edge-host".to_owned(),
+        name: "nfs-client".to_owned(),
+        role,
+        names: vec![X509_NAME.to_owned()],
+        ttl: "24h".to_owned(),
+        ca_endpoint: "ca_origin".to_owned(),
+        after_renew: Vec::new(),
+        status: grafhome_ca::policy::Status::Active,
+    };
+    let key: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("renewal.pub.json")).unwrap())
+            .unwrap();
+    let public_key = std::fs::read_to_string(temp.path().join("enrolled.pub")).unwrap();
+    let desired = grafhome_ca::x509::x509_provisioner(key, &cert, &public_key).unwrap();
+    let config_path = steppath.join("config/ca.json");
+    let text = grafhome_ca::runtime_provisioners::reconcile_x509(&config_path, desired).unwrap();
+    let mut config: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let address = format!("127.0.0.1:{}", free_port());
+    config["address"] = serde_json::json!(address);
+    // These SSH templates resolve under `STEPPATH`, and `start_step_ca` runs without it.
+    config.as_object_mut().unwrap().remove("templates");
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+    let mut child = start_step_ca(&config_path, &password);
+    wait_for_health(child.as_mut(), &address, &steppath);
+    Some(X509Ca {
+        address,
+        provisioner: grafhome_ca::x509::x509_provisioner_name(&cert.host, &cert.name),
+        _child: child,
+        temp,
+    })
+}
+
+impl X509Ca {
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.temp.path().join(name)
+    }
+
+    fn url(&self) -> String {
+        format!("https://{}", self.address)
+    }
+
+    /// Point `command` at this CA.
+    fn with_ca<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        command
+            .env("STEPPATH", self.path("step"))
+            .arg("--ca-url")
+            .arg(self.url())
+            .arg("--root")
+            .arg(self.path("step/certs/root_ca.crt"))
+    }
+
+    fn token(&self, subject: &str) -> String {
+        let mut command = Command::new("step");
+        command
+            .args(["ca", "token", subject, "--san", subject])
+            .arg("--issuer")
+            .arg(&self.provisioner)
+            .arg("--key")
+            .arg(self.path("renewal.priv.json"))
+            .arg("--password-file")
+            .arg(self.path("password"));
+        token(self.with_ca(&mut command)).trim().to_owned()
+    }
+
+    /// Create a CSR for `key` carrying `extra` as its step CSR template fields.
+    fn csr(&self, subject: &str, key: &str, extra: serde_json::Value) -> std::path::PathBuf {
+        let mut fields = serde_json::json!({
+            "subject": {"commonName": subject},
+            "sans": [{"type": "dns", "value": subject}],
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            fields[name] = value.clone();
+        }
+        let template = self.path("csr.tpl");
+        std::fs::write(&template, fields.to_string()).unwrap();
+        let csr = self.path("request.csr");
+        run(Command::new("step")
+            .args(["certificate", "create", subject])
+            .arg(&csr)
+            .arg("--csr")
+            .arg("--key")
+            .arg(self.path(key))
+            .arg("--template")
+            .arg(&template)
+            .args(["--no-password", "--insecure", "--force"]));
+        csr
+    }
+
+    fn sign_command(&self, csr: &std::path::Path, subject: &str) -> Command {
+        let mut command = Command::new("step");
+        command
+            .args(["ca", "sign"])
+            .arg(csr)
+            .arg(self.path("issued.crt"))
+            .arg("--token")
+            .arg(self.token(subject))
+            .arg("--force");
+        self.with_ca(&mut command);
+        command
+    }
+
+    /// Issue a certificate and return `step certificate inspect`'s description.
+    fn issue(&self, csr: &std::path::Path, subject: &str) -> serde_json::Value {
+        run(&mut self.sign_command(csr, subject));
+        serde_json::from_str(&stdout(
+            Command::new("step")
+                .args(["certificate", "inspect", "--format", "json"])
+                .arg(self.path("issued.crt")),
+        ))
+        .unwrap()
+    }
+}
+
+/// Assert the issued certificate says exactly what the template pins.
+fn assert_pinned(certificate: &serde_json::Value, usage: &str) {
+    assert_eq!(
+        certificate["subject"]["common_name"],
+        serde_json::json!([X509_NAME])
+    );
+    assert_eq!(certificate["names"], serde_json::json!([X509_NAME]));
+    let extended = certificate["extensions"]["extended_key_usage"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        extended.keys().collect::<Vec<_>>(),
+        [usage],
+        "expected a single EKU"
+    );
+    assert_eq!(
+        certificate["extensions"]["key_usage"]["digital_signature"],
+        true
+    );
+    assert!(certificate["extensions"].get("basic_constraints").is_none());
+}
+
+#[test]
+fn jwk_issues_only_pinned_names() {
+    use grafhome_ca::policy::X509Role;
+    let Some(ca) = x509_ca(X509Role::Client) else {
+        return;
+    };
+    let expected = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+    assert_pinned(&ca.issue(&expected, X509_NAME), "client_auth");
+
+    // A valid token for a foreign name still yields only the pinned one.
+    let foreign = ca.csr(FOREIGN_NAME, "enrolled.key", serde_json::json!({}));
+    let certificate = ca.issue(&foreign, FOREIGN_NAME);
+    assert_pinned(&certificate, "client_auth");
+    assert!(!certificate.to_string().contains(FOREIGN_NAME));
+}
+
+#[test]
+fn jwk_issues_only_declared_eku() {
+    use grafhome_ca::policy::X509Role;
+    for (role, usage) in [
+        (X509Role::Server, "server_auth"),
+        (X509Role::Client, "client_auth"),
+    ] {
+        let Some(ca) = x509_ca(role) else {
+            return;
+        };
+        let csr = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+        assert_pinned(&ca.issue(&csr, X509_NAME), usage);
+    }
+}
+
+#[test]
+fn jwk_refuses_unenrolled_public_key() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    for (kty, curve) in [("EC", "P-256"), ("EC", "P-384"), ("OKP", "Ed25519")] {
+        run(Command::new("step")
+            .args(["crypto", "keypair"])
+            .arg(ca.path("other.pub"))
+            .arg(ca.path("other.key"))
+            .args(["--kty", kty, "--crv", curve])
+            .args(["--no-password", "--insecure", "--force"]));
+        let csr = ca.csr(X509_NAME, "other.key", serde_json::json!({}));
+        run_fails(&mut ca.sign_command(&csr, X509_NAME));
+        assert!(!ca.path("issued.crt").exists(), "{curve} was issued");
+    }
+}
+
+#[test]
+fn csr_extensions_are_ignored() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Server) else {
+        return;
+    };
+    let csr = ca.csr(
+        X509_NAME,
+        "enrolled.key",
+        serde_json::json!({
+            "extKeyUsage": ["serverAuth", "clientAuth", "codeSigning"],
+            "basicConstraints": {"isCA": true, "maxPathLen": 0},
+            "extensions": [{"id": "1.2.3.4", "value": "AQID"}],
+        }),
+    );
+
+    let certificate = ca.issue(&csr, X509_NAME);
+
+    assert_pinned(&certificate, "server_auth");
+    assert!(!certificate.to_string().contains("1.2.3.4"));
+}
+
+#[test]
+fn x509_provisioner_refuses_ssh_sign() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let mut command = Command::new("step");
+    command
+        .args(["ca", "token", "alice", "--ssh", "--principal", "alice"])
+        .args(["--not-after", "5m", "--cert-not-after", "1h"])
+        .arg("--issuer")
+        .arg(&ca.provisioner)
+        .arg("--key")
+        .arg(ca.path("renewal.priv.json"))
+        .arg("--password-file")
+        .arg(ca.path("password"));
+    let signing_token = token(ca.with_ca(&mut command));
+    let ssh_key = ca.path("ssh-key");
+    run(Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-f"])
+        .arg(&ssh_key));
+
+    let mut sign = Command::new("step");
+    sign.args(["ssh", "certificate", "alice"])
+        .arg(ssh_key.with_extension("pub"))
+        .args([
+            "--no-agent",
+            "--sign",
+            "--token",
+            signing_token.trim(),
+            "--force",
+        ]);
+    ca.with_ca(&mut sign);
+    run_refused(&mut sign);
+
+    assert!(!ca.path("ssh-key-cert.pub").exists());
+}
+
+#[test]
+fn renew_endpoint_refused() {
+    let Some(ca) = x509_ca(grafhome_ca::policy::X509Role::Client) else {
+        return;
+    };
+    let csr = ca.csr(X509_NAME, "enrolled.key", serde_json::json!({}));
+    ca.issue(&csr, X509_NAME);
+    let issued = std::fs::read(ca.path("issued.crt")).unwrap();
+
+    let mut renew = Command::new("step");
+    renew.args(["ca", "renew", "--force", "--out"]);
+    renew.arg(ca.path("renewed.crt"));
+    ca.with_ca(&mut renew);
+    renew
+        .arg(ca.path("issued.crt"))
+        .arg(ca.path("enrolled.key"));
+    run_refused(&mut renew);
+
+    let mut rekey = Command::new("step");
+    rekey.args(["ca", "rekey", "--force", "--out-cert"]);
+    rekey.arg(ca.path("rekeyed.crt")).arg("--out-key");
+    rekey.arg(ca.path("rekeyed.key"));
+    ca.with_ca(&mut rekey);
+    rekey
+        .arg(ca.path("issued.crt"))
+        .arg(ca.path("enrolled.key"));
+    run_refused(&mut rekey);
+
+    assert_eq!(std::fs::read(ca.path("issued.crt")).unwrap(), issued);
+    assert!(!ca.path("renewed.crt").exists());
+    assert!(!ca.path("rekeyed.crt").exists());
+    assert!(!ca.path("rekeyed.key").exists());
+}

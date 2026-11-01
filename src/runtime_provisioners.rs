@@ -22,6 +22,7 @@ use crate::policy::{
     PROVISIONER_ROLE_HOST_BOOTSTRAP, PROVISIONER_ROLE_PROXY_X509, PROVISIONER_ROLE_USER_ENROLLMENT,
     Provisioner, ca_policy_field, canonical_ssh_public_key, step_max_ttl,
 };
+use crate::x509::{self, is_deny_template, parse_x509_provisioner_name};
 
 const USER_CLIENT_X509_DENY_TEMPLATE: &str =
     r#"{{ fail "x509 issuance disabled for Grafhome user renewal provisioner" }}"#;
@@ -59,6 +60,8 @@ pub struct ClaimsReconciliation {
     pub authority_policy_updated: bool,
     /// Provisioner names whose managed claims changed.
     pub updated: Vec<String>,
+    /// Provisioner names removed because policy no longer permits them.
+    pub removed: Vec<String>,
 }
 
 /// Reconcile duration claims for every live Grafhome provisioner.
@@ -75,12 +78,21 @@ pub fn reconcile_claims(
     let proxy = optional_active_provisioner(model, PROVISIONER_ROLE_PROXY_X509);
     let authority_policy_updated = reconcile_authority_policy(model, &mut config, ca_json)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
+    let removed = remove_retired_provisioners(model, provisioners, proxy)?;
     let mut updated = Vec::new();
 
-    for item in provisioners {
+    for item in provisioners.iter_mut() {
         let Some(name) = item.get("name").and_then(Value::as_str).map(str::to_owned) else {
             continue;
         };
+        if is_x509_provisioner(item) {
+            let desired = x509::reconcile_live(&model.policy, item)?;
+            if *item != desired {
+                *item = desired;
+                updated.push(name);
+            }
+            continue;
+        }
         let desired = if name == user.name {
             user_claims(user)
         } else if parse_user_provisioner_name(&name).is_some() {
@@ -106,11 +118,85 @@ pub fn reconcile_claims(
             updated.push(name);
         }
     }
+    require_x509_deny(provisioners, ca_json)?;
 
     Ok(ClaimsReconciliation {
         config: serialize_config(config, ca_json)?,
         authority_policy_updated,
         updated,
+        removed,
+    })
+}
+
+fn is_x509_provisioner(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("JWK")
+        && item
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| parse_x509_provisioner_name(name).is_some())
+}
+
+/// Drop provisioners that policy no longer permits to exist.
+///
+/// Every ACME provisioner other than the active policy row goes, not only a
+/// disabled one: ACME has no name limit of its own, so any that survives keeps a
+/// rogue responder able to obtain a certificate `tlshd` would accept. Tombstoned
+/// X.509 provisioners go too, so restoring an old `ca.json` cannot revive them.
+fn remove_retired_provisioners(
+    model: &SiteModel,
+    provisioners: &mut Vec<Value>,
+    proxy: Option<&Provisioner>,
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let mut kept = Vec::with_capacity(provisioners.len());
+    for item in provisioners.drain(..) {
+        let name = item.get("name").and_then(Value::as_str);
+        let retired = if item.get("type").and_then(Value::as_str) == Some("ACME") {
+            proxy.is_none_or(|proxy| name != Some(proxy.name.as_str()))
+        } else {
+            is_x509_provisioner(&item) && x509::is_revoked(&model.policy, &item)?
+        };
+        if retired {
+            removed.push(name.unwrap_or("<unnamed>").to_owned());
+        } else {
+            kept.push(item);
+        }
+    }
+    *provisioners = kept;
+    Ok(removed)
+}
+
+/// Refuse any JWK that could issue X.509 outside the pinned provisioners.
+///
+/// Issuance authority is the whole control, and step-ca's default template would
+/// sign whatever a JWK token asks for. Each X.509 provisioner is rebuilt from
+/// policy before this runs, so only its exact name is exempt.
+fn require_x509_deny(provisioners: &[Value], ca_json: &Path) -> Result<()> {
+    let offenders = provisioners
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("JWK")
+                && !is_x509_provisioner(item)
+                && !item
+                    .pointer("/options/x509/template")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_deny_template)
+        })
+        .map(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unnamed>")
+        })
+        .collect::<Vec<_>>();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Validation {
+        field: format!("{}:authority.provisioners", ca_json.display()),
+        message: format!(
+            "JWK provisioners lack the X.509 deny template: {}",
+            offenders.join(", ")
+        ),
     })
 }
 
@@ -709,6 +795,19 @@ fn merge_materialized(
     let user_policy = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
     let host_policy = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
     for (name, mut item) in live_jwks {
+        if parse_x509_provisioner_name(&name).is_some() {
+            if x509::is_revoked(&model.policy, &item)? {
+                continue;
+            }
+            if !names.insert(name.clone()) {
+                return Err(Error::Validation {
+                    field: format!("{}:authority.provisioners", staged_ca_json.display()),
+                    message: format!("X.509 provisioner {name} collides with staged state"),
+                });
+            }
+            provisioners.push(x509::reconcile_live(&model.policy, &item)?);
+            continue;
+        }
         let desired = if parse_user_provisioner_name(&name).is_some() {
             user_renewal_claims(model, user_policy)
         } else if parse_host_provisioner_name(&name).is_some() {
@@ -839,6 +938,15 @@ pub fn reconcile_host(
     serialize_config(config, ca_json)
 }
 
+/// Install the exact provisioner for one approved X.509 enrollment.
+pub fn reconcile_x509(ca_json: impl AsRef<Path>, desired: Value) -> Result<String> {
+    let ca_json = ca_json.as_ref();
+    let mut config = read_json(ca_json)?;
+    let provisioners = provisioners_mut(&mut config, ca_json)?;
+    upsert_renewal_provisioner(provisioners, desired, ca_json)?;
+    serialize_config(config, ca_json)
+}
+
 /// Remove one exact renewal JWK provisioner from an existing CA config.
 pub fn remove_exact(ca_json: impl AsRef<Path>, name: &str) -> Result<(String, Vec<String>)> {
     remove_matching(ca_json, |item_name, _| item_name == Some(name))
@@ -851,16 +959,19 @@ pub fn remove_user(ca_json: impl AsRef<Path>, prefix: &str) -> Result<(String, V
     })
 }
 
-/// Remove a host issuer, all user issuers on that host, and legacy SSHPOP.
+/// Remove a host issuer, all user and X.509 issuers on that host, and legacy SSHPOP.
 pub fn remove_host(
     ca_json: impl AsRef<Path>,
+    host: &str,
     host_name: &str,
     user_host_suffix: &str,
 ) -> Result<(String, Vec<String>)> {
     remove_matching(ca_json, |item_name, item_type| {
         item_name == Some(host_name)
             || item_name.is_some_and(|name| {
-                name.starts_with("grafhome-user-") && name.ends_with(user_host_suffix)
+                (name.starts_with("grafhome-user-") && name.ends_with(user_host_suffix))
+                    || parse_x509_provisioner_name(name)
+                        .is_some_and(|(x509_host, _)| x509_host == host)
             })
             || item_type == Some("SSHPOP")
     })
@@ -1406,14 +1517,20 @@ mod tests {
                             "type": "JWK",
                             "name": crate::enrollment::user_provisioner_name("alice", "ca-host"),
                             "key": {"kid": "client"},
-                            "options": {"ssh": {"templateFile": "preserve.tpl"}},
+                            "options": {
+                                "x509": {"template": USER_CLIENT_X509_DENY_TEMPLATE},
+                                "ssh": {"templateFile": "preserve.tpl"}
+                            },
                             "claims": {"maxUserSSHCertDuration": "168h"}
                         },
                         {
                             "type": "JWK",
                             "name": crate::enrollment::host_provisioner_name("proxy-host"),
                             "key": {"kid": "host"},
-                            "options": {"ssh": {"template": bound_host_template.clone()}},
+                            "options": {
+                                "x509": {"template": HOST_X509_DENY_TEMPLATE},
+                                "ssh": {"template": bound_host_template.clone()}
+                            },
                             "claims": {"maxHostSSHCertDuration": "24h"}
                         },
                         {
@@ -1424,6 +1541,7 @@ mod tests {
                         {
                             "type": "JWK",
                             "name": "operator-owned",
+                            "options": {"x509": {"template": HOST_X509_DENY_TEMPLATE}},
                             "claims": {"maxUserSSHCertDuration": "1h"}
                         }
                     ]

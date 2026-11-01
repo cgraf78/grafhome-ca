@@ -355,6 +355,46 @@ enforces the enrollment provisioners' X.509-deny and fixed SSH user/host
 templates. A change is installed with the same backup, restart, health-check,
 and rollback path used by enrollment; a no-op does not restart the CA.
 
+`apply ca` is also where issuance authority is narrowed. It refuses to run
+while any JWK provisioner other than an enrolled X.509 one lacks the X.509 deny
+template, removes every ACME provisioner except the active `proxy_x509` row, and
+removes X.509 provisioners whose key is tombstoned. A live X.509 provisioner with
+no active policy declaration stops the command until the declaration is restored
+or the enrollment is revoked.
+
+### X.509 enrollment
+
+`tlshd` accepts any unexpired certificate chaining to the root, so who can
+obtain a certificate is the entire control. Each `[x509_certs.<name>]`
+declaration therefore gets its own JWK provisioner, whose template pins the subject, names, key usage, single
+extended key usage, and enrolled public key. Renewal and rekey are disabled on
+it, and it cannot issue SSH certificates.
+
+```sh
+# Target host as root, after `grafhome-ca ssh enroll host`.
+grafhome-ca x509 enroll nfs-client
+
+# CA origin as root. Paste the REQUEST line, or pass --request-file.
+# Run `grafhome-ca apply ca` first when the declared names are new to the
+# authority allow-list; approval does not change it.
+grafhome-ca x509 approve
+
+# CA origin as root.
+grafhome-ca x509 revoke --host edge-host --reason "device retired" nfs-client
+```
+
+Enrollment creates a P-256 certificate key and a renewal JWK on the host, each
+private part `0600`, and prints one public `REQUEST:` line. Rerunning it reprints
+the same request. Approval validates that request against policy, restarts
+`step-ca`, and rolls back on failed health while keeping the registry record
+`Pending`, so a retry resumes the same enrollment.
+
+Revocation removes the provisioner and records a `[[x509_keys]]` tombstone, so
+the same key cannot enroll again. Certificates already issued stay valid until
+they expire. To replace a revoked key, distribute the updated
+`policy/revocations.toml` to the host and rerun `x509 enroll`, which replaces
+only tombstoned material.
+
 User enrollment requires one public request copied to the CA and one secret
 grant copied back. User and host default to `GRAFHOME_CA_LOCAL_USER` and
 `GRAFHOME_CA_LOCAL_HOST` when set, then to the current account and short
