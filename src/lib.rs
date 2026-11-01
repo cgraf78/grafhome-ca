@@ -18,6 +18,7 @@ pub mod runtime_provisioners;
 pub mod schema;
 pub mod smallstep;
 pub mod version;
+pub mod x509;
 
 pub use error::{Error, Result};
 

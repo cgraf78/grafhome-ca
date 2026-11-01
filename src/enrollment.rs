@@ -49,7 +49,7 @@ pub fn parse_host_provisioner_name(name: &str) -> Option<String> {
     decode_identity(name.strip_prefix("grafhome-host-")?)
 }
 
-fn encode_identity(value: &str) -> String {
+pub(crate) fn encode_identity(value: &str) -> String {
     value
         .as_bytes()
         .iter()
@@ -57,7 +57,7 @@ fn encode_identity(value: &str) -> String {
         .collect()
 }
 
-fn decode_identity(value: &str) -> Option<String> {
+pub(crate) fn decode_identity(value: &str) -> Option<String> {
     if !value.len().is_multiple_of(2) {
         return None;
     }
@@ -331,7 +331,7 @@ impl HostGrant {
     }
 }
 
-fn validate_header(version: u32, kind: &str, expected_kind: &str) -> Result<()> {
+pub(crate) fn validate_header(version: u32, kind: &str, expected_kind: &str) -> Result<()> {
     if version != VERSION {
         return Err(validation(
             "enrollment document version",
