@@ -48,9 +48,9 @@ This file uses literal `KEY=value` lines. It is not shell-sourced; do not quote
 values.
 
 Most values are target-host runtime paths. Keys whose names include `ROOT` or
-refer to the `grafhome-ca` helper are command-runner paths for root/admin
-rollout steps, because live initialization, reconciliation, renewal, and export
-plans run with root privileges on the target host. On shdeps-managed hosts where
+refer to the `grafhome-ca` helper are command-runner paths for root-run
+commands, because CA reconciliation, host policy, renewal, and export run with
+root privileges on the target host. On shdeps-managed hosts where
 root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 
 `GRAFHOME_CA_STATE_DIR`
@@ -73,9 +73,17 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 : Directory used by `AuthorizedPrincipalsFile` snippets.
 
 `GRAFHOME_CA_PROXY_TLS_DIR`
-: Directory for proxy TLS files when rendered for Apache. Proxy certificate
-  plans install the exported `root_ca.crt` here so Apache can verify the HTTPS
-  CA origin before proxying.
+: Directory holding the `root_ca.crt` that the rendered Apache proxy
+  configuration trusts to verify the HTTPS CA origin before proxying.
+  `grafhome-ca` does not install it: copy the root there once when setting up
+  the proxy. The root does not change when leaf certificates renew.
+
+`GRAFHOME_CA_X509_DIR`
+: Optional absolute directory for host-held X.509 certificates and keys,
+  defaulting to `/etc/grafhome-ca/x509`. Each declared certificate lives in
+  `<name>/cert.pem` and `<name>/key.pem` beneath it. Releases before the
+  X.509 lifecycle reject the key as unknown, so set it only once every host
+  runs a newer binary.
 
 `GRAFHOME_CA_PROXY_ACME_WEBROOT`
 : Retired with ACME and ignored. Optional, and still accepted because releases
@@ -337,11 +345,6 @@ user and host certificates.
   authority-level X.509 DNS allow-list used by step-ca so the client-facing
   proxy name, the private backend serving name, and each declared certificate
   name are explicit issuance policy.
-
-`GRAFHOME_CA_X509_DIR`
-: Optional absolute directory for host-held X.509 certificates and keys,
-  defaulting to `/etc/grafhome-ca/x509`. Sites leave it unset, because older
-  binaries reject unknown deployment keys.
 
 The renderer also derives authority-wide SSH allow-lists directly from active
 keyed-user `principal` values and every host manifest's `principals`. These are
