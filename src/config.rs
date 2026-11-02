@@ -17,23 +17,34 @@ const REQUIRED_KEYS: &[&str] = &[
     "GRAFHOME_CA_USER_STEPPATH",
     "GRAFHOME_CA_SSH_TRUST_DIR",
     "GRAFHOME_CA_AUTH_PRINCIPALS_DIR",
-    "GRAFHOME_CA_PROXY_TLS_DIR",
     "GRAFHOME_CA_STEP_CA_BIN",
     "GRAFHOME_CA_ROOT_STEP_BIN",
-    "GRAFHOME_CA_HELPER_BIN",
     "GRAFHOME_CA_HOST_KEY_PATH",
     "GRAFHOME_CA_PASSWORD_FILE",
     "GRAFHOME_CA_SERVICE_USER",
-    "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
 ];
 
 /// Keys a deployment may omit. Binaries that predate a key reject it as
 /// unknown, so a site sets one only once every host runs a binary that knows it.
+const OPTIONAL_KEYS: &[&str] = &["GRAFHOME_CA_X509_DIR"];
+
+/// Keys that no longer configure anything. Releases before each retirement
+/// require them, so they stay accepted until every host runs a newer binary;
+/// a site then deletes them. They are dropped at load so no consumer can come
+/// to depend on one again.
 ///
-/// `GRAFHOME_CA_PROXY_ACME_WEBROOT` is retired with ACME and ignored. It stays
-/// accepted because releases before the retirement require it, so a site keeps
-/// it until every host runs a newer binary.
-const OPTIONAL_KEYS: &[&str] = &["GRAFHOME_CA_X509_DIR", "GRAFHOME_CA_PROXY_ACME_WEBROOT"];
+/// - `GRAFHOME_CA_PROXY_ACME_WEBROOT`: retired with ACME.
+/// - `GRAFHOME_CA_PROXY_TLS_DIR` and `GRAFHOME_CA_APACHE_CONF_AVAILABLE`: only
+///   placed and filled in a rendered Apache proxy fragment that `render` no
+///   longer produces; the reverse proxy's site owns that configuration.
+/// - `GRAFHOME_CA_HELPER_BIN`: named the helper for root-run rollout plans,
+///   which were removed; nothing executes it.
+const RETIRED_KEYS: &[&str] = &[
+    "GRAFHOME_CA_PROXY_ACME_WEBROOT",
+    "GRAFHOME_CA_PROXY_TLS_DIR",
+    "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
+    "GRAFHOME_CA_HELPER_BIN",
+];
 
 /// Default root for host-held X.509 certificates and keys.
 const DEFAULT_X509_DIR: &str = "/etc/grafhome-ca/x509";
@@ -92,6 +103,9 @@ impl Deployment {
                 });
             }
         }
+        // Drop retired keys only after the parse checks above, so this binary
+        // still rejects a file that older binaries sharing it would reject.
+        values.retain(|key, _| !RETIRED_KEYS.contains(&key.as_str()));
 
         let deployment = Self {
             path: path.to_path_buf(),
@@ -161,10 +175,8 @@ impl Deployment {
                 || key.ends_with("_BIN")
                 || key.ends_with("_FILE")
                 || key.ends_with("_PATH")
-                || key.ends_with("_AVAILABLE")
                 || key == "GRAFHOME_CA_STATE_DIR"
-                || key == "GRAFHOME_CA_SERVER_STEPPATH"
-                || key == "GRAFHOME_CA_PROXY_ACME_WEBROOT")
+                || key == "GRAFHOME_CA_SERVER_STEPPATH")
                 && !value.starts_with('/')
             {
                 return Err(Error::Validation {
@@ -216,7 +228,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Deployment, REQUIRED_KEYS};
+    use super::{Deployment, REQUIRED_KEYS, RETIRED_KEYS};
 
     #[test]
     fn rejects_derived_steppath_key() {
@@ -374,6 +386,62 @@ mod tests {
         let (_dir, path) = minimal_env("GRAFHOME_CA_X509_DIR=relative/x509\n");
         let error = Deployment::load(&path).unwrap_err().to_string();
         assert!(error.contains("system path must be absolute"));
+    }
+
+    /// Lines an older site file carries for each retired key.
+    const RETIRED_LINES: &str = "GRAFHOME_CA_PROXY_ACME_WEBROOT=/var/www/html\n\
+        GRAFHOME_CA_PROXY_TLS_DIR=/etc/ssl/example-ca\n\
+        GRAFHOME_CA_APACHE_CONF_AVAILABLE=/etc/apache2/conf-available\n\
+        GRAFHOME_CA_HELPER_BIN=/root/.local/bin/grafhome-ca\n";
+
+    #[test]
+    fn deployment_accepts_and_drops_retired_keys() {
+        let (_dir, path) = minimal_env(RETIRED_LINES);
+        let deployment = Deployment::load(&path).unwrap();
+        for key in RETIRED_KEYS {
+            assert!(!deployment.values.contains_key(*key), "{key} kept");
+        }
+    }
+
+    #[test]
+    fn deployment_ignores_retired_key_values() {
+        // A retired key configures nothing, so even a value the live keys
+        // would reject must not block loading an older site file.
+        let (_dir, path) = minimal_env("GRAFHOME_CA_HELPER_BIN=relative/grafhome-ca\n");
+        Deployment::load(&path).unwrap();
+    }
+
+    #[test]
+    fn deployment_rejects_duplicate_retired_key() {
+        // Older binaries reject the duplicate, so a shared file must fail here
+        // too rather than load on one host and break another.
+        let (_dir, path) = minimal_env(
+            "GRAFHOME_CA_HELPER_BIN=/root/.local/bin/grafhome-ca\n\
+             GRAFHOME_CA_HELPER_BIN=/root/.local/bin/grafhome-ca\n",
+        );
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("duplicate key GRAFHOME_CA_HELPER_BIN"));
+    }
+
+    #[test]
+    fn deployment_rejects_unknown_key() {
+        let (_dir, path) = minimal_env("GRAFHOME_CA_NOT_A_KEY=/srv/example\n");
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("unknown deployment key"));
+    }
+
+    #[test]
+    fn deployment_rejects_missing_required_key() {
+        let (_dir, path) = minimal_env("");
+        let text = fs::read_to_string(&path).unwrap();
+        let without = text
+            .lines()
+            .filter(|line| !line.starts_with("GRAFHOME_CA_STEP_CA_BIN="))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(&path, without).unwrap();
+        let error = Deployment::load(&path).unwrap_err().to_string();
+        assert!(error.contains("missing required deployment key"));
     }
 
     #[test]

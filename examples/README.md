@@ -20,7 +20,8 @@ user inventory out of this public example.
 
 `legacy-site-config/` preserves the previous six-file policy shape as a
 migration and compatibility fixture. It is not the recommended authoring
-layout for new deployments.
+layout for new deployments. Its `deployment.env` deliberately keeps the
+retired keys so tests prove older site files still load.
 
 To adapt the example for a real deployment, copy the `site-config/` contents to
 that XDG location in a private repository or private host configuration system,

@@ -483,14 +483,7 @@ fn prepare_integration_config(
     std::fs::copy(step.trim(), bin.join("step")).unwrap();
     #[cfg(unix)]
     std::fs::set_permissions(bin.join("step"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    for name in [
-        "chmod",
-        "chown",
-        "ssh-keygen",
-        "sshd",
-        "systemctl",
-        "grafhome-ca-helper",
-    ] {
+    for name in ["chmod", "chown", "ssh-keygen", "sshd", "systemctl"] {
         write_executable(&bin.join(name), "#!/bin/sh\nexit 0\n");
     }
     let host_key = temp.join("load-root-model-host-key");
@@ -512,13 +505,6 @@ fn prepare_integration_config(
         .replace(
             "GRAFHOME_CA_ROOT_STEP_BIN=/root/.local/bin/step",
             &format!("GRAFHOME_CA_ROOT_STEP_BIN={}", bin.join("step").display()),
-        )
-        .replace(
-            "GRAFHOME_CA_HELPER_BIN=/root/.local/bin/grafhome-ca",
-            &format!(
-                "GRAFHOME_CA_HELPER_BIN={}",
-                bin.join("grafhome-ca-helper").display()
-            ),
         )
         .replace(
             "GRAFHOME_CA_HOST_KEY_PATH=/etc/ssh/ssh_host_ed25519_key",

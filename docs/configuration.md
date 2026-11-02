@@ -47,11 +47,11 @@ app-private `$PREFIX/tmp` rather than requiring an inherited `TMPDIR`.
 This file uses literal `KEY=value` lines. It is not shell-sourced; do not quote
 values.
 
-Most values are target-host runtime paths. Keys whose names include `ROOT` or
-refer to the `grafhome-ca` helper are command-runner paths for root-run
-commands, because CA reconciliation, host policy, renewal, and export run with
-root privileges on the target host. On shdeps-managed hosts where
-root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
+Most values are target-host runtime paths. Keys whose names include `ROOT` are
+command-runner paths for root-run commands, because CA reconciliation, host
+policy, renewal, and export run with root privileges on the target host. On
+shdeps-managed hosts where root uses dotfiles, those tool paths normally live
+under `/root/.local/bin`.
 
 `GRAFHOME_CA_STATE_DIR`
 : Root directory for CA-owned mutable state on the CA host. The untracked,
@@ -72,24 +72,12 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
 `GRAFHOME_CA_AUTH_PRINCIPALS_DIR`
 : Directory used by `AuthorizedPrincipalsFile` snippets.
 
-`GRAFHOME_CA_PROXY_TLS_DIR`
-: Directory holding the `root_ca.crt` that the rendered Apache proxy
-  configuration trusts to verify the HTTPS CA origin before proxying.
-  `grafhome-ca` does not install it: copy the root there once when setting up
-  the proxy. The root does not change when leaf certificates renew.
-
 `GRAFHOME_CA_X509_DIR`
 : Optional absolute directory for host-held X.509 certificates and keys,
   defaulting to `/etc/grafhome-ca/x509`. Each declared certificate lives in
   `<name>/cert.pem` and `<name>/key.pem` beneath it. Releases before the
   X.509 lifecycle reject the key as unknown, so set it only once every host
   runs a newer binary.
-
-`GRAFHOME_CA_PROXY_ACME_WEBROOT`
-: Retired with ACME and ignored. Optional, and still accepted because releases
-  before the retirement require it: keep it until every host runs a newer
-  binary, then delete it. The proxy's own certificate is an ordinary
-  `x509_certs` declaration renewed with `x509 renew`.
 
 `GRAFHOME_CA_STEP_CA_BIN`
 : Absolute path to the `step-ca` server binary.
@@ -105,11 +93,6 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
   On macOS, install `step` with
   Homebrew as a normal user and copy it into `/usr/local/bin/step` with root
   ownership for privileged host operations; never run Homebrew as root.
-
-`GRAFHOME_CA_HELPER_BIN`
-: Absolute path where the root-run `grafhome-ca` helper is installed. For
-  shdeps-managed hosts where root also uses dotfiles, this is normally
-  `/root/.local/bin/grafhome-ca`.
 
 `GRAFHOME_CA_HOST_KEY_PATH`
 : Absolute path to the SSH host private key used by host certificate renewal.
@@ -138,8 +121,20 @@ policy shape.
 `GRAFHOME_CA_SERVICE_USER`
 : Unix service account and primary service group that run the CA server.
 
-`GRAFHOME_CA_APACHE_CONF_AVAILABLE`
-: Apache `conf-available` directory used by reverse-proxy templates.
+Retired keys configure nothing. Releases before each retirement require them,
+so they are still accepted, then dropped at load. Keep each key until every
+host runs a release whose copy of this page lists it as retired, then delete
+it.
+
+- `GRAFHOME_CA_PROXY_ACME_WEBROOT`: retired with ACME. The proxy's own
+  certificate is an ordinary `x509_certs` declaration renewed with
+  `x509 renew`.
+- `GRAFHOME_CA_PROXY_TLS_DIR` and `GRAFHOME_CA_APACHE_CONF_AVAILABLE`: placed
+  and filled in a rendered Apache proxy fragment that `render` no longer
+  produces. The reverse proxy's site owns its own configuration, including the
+  root certificate it trusts for the CA origin.
+- `GRAFHOME_CA_HELPER_BIN`: named the helper for root-run rollout plans, which
+  were removed; nothing executes it.
 
 ## Policy Terms
 

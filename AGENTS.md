@@ -17,7 +17,7 @@ real site data.
   `x509`;
   `smallstep` is only a placeholder type.
 - `schemas/` (canonical policy schemas versioned under
-  `schemas/policy/canonical/`), `templates/` (non-secret SSH, Apache,
+  `schemas/policy/canonical/`), `templates/` (non-secret SSH,
   systemd, and Smallstep), `examples/site-config/` (the sanitized fixture
   tree), and `docs/`.
 - `tests/`: Rust integration tests, plus `shell/` for the installer and
