@@ -351,13 +351,6 @@ fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
             ),
         )
         .replace(
-            "GRAFHOME_CA_HELPER_BIN=/root/.local/bin/grafhome-ca",
-            &format!(
-                "GRAFHOME_CA_HELPER_BIN={}",
-                fake_bin.join("grafhome-ca").display()
-            ),
-        )
-        .replace(
             "GRAFHOME_CA_HOST_KEY_PATH=/etc/ssh/ssh_host_ed25519_key",
             &format!("GRAFHOME_CA_HOST_KEY_PATH={}", host_key.display()),
         )
@@ -587,7 +580,6 @@ aVXF2GUB0FzWyZNJBGBdIwsLJSjUsFMF+216+CkBLucOD2YTRAkWruHHcQ=='
 esac
 "#,
     );
-    write_executable(&fake_bin.join("grafhome-ca"), "#!/bin/sh\nexit 0\n");
     write_executable(
         &fake_bin.join("ssh-keygen"),
         r#"#!/bin/sh
@@ -4647,9 +4639,7 @@ fn render_dry_run_lists_staged_files() {
         .stdout(predicate::str::contains(
             "hosts/ca-host/srv/example-ca/step/config/ca.json",
         ))
-        .stdout(predicate::str::contains(
-            "hosts/proxy-host/etc/apache2/conf-available/grafhome-ca-proxy.conf",
-        ));
+        .stdout(predicate::str::contains("apache2").not());
 }
 
 #[test]

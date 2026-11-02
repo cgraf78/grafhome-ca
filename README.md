@@ -55,7 +55,7 @@ real site data.
 - `examples/site-config/`: sanitized example tree mirroring
   `${XDG_CONFIG_HOME:-~/.config}/grafhome-ca`.
 - `schemas/`: JSON Schemas for checked-in config, policy, and public exports.
-- `templates/`: non-secret SSH, Apache, systemd, and Smallstep templates.
+- `templates/`: non-secret SSH, systemd, and Smallstep templates.
 - `src/`: Rust core APIs and CLIs.
 - `scripts/`: release helpers using generated commit-timestamp versions.
 

@@ -32,10 +32,8 @@ pub struct RenderedFile {
 /// Render all currently modeled deployment files.
 pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
     let mut files = Vec::new();
-    let ca_api = required_endpoint(model, ENDPOINT_ROLE_CA_API)?;
     let ca_origin = required_endpoint(model, ENDPOINT_ROLE_CA_ORIGIN)?;
     let ca_host = required_host(model, &ca_origin.target)?;
-    let proxy_host = required_host(model, &ca_api.target)?;
     let variables = variables(model)?;
 
     files.push(RenderedFile {
@@ -61,20 +59,6 @@ pub fn render(model: &SiteModel) -> Result<Vec<RenderedFile>> {
         path: host_path(&ca_host.host, "usr/libexec/grafhome-ca-wait-origin")?,
         mode: 0o755,
         content: include_str!("../templates/systemd/grafhome-ca-wait-origin").to_owned(),
-    });
-    files.push(RenderedFile {
-        path: host_path(
-            &proxy_host.host,
-            absolute_child(
-                &model.deployment.values["GRAFHOME_CA_APACHE_CONF_AVAILABLE"],
-                "grafhome-ca-proxy.conf",
-            )?,
-        )?,
-        mode: 0o644,
-        content: render_template(
-            include_str!("../templates/apache/grafhome-ca.conf.template"),
-            &variables,
-        )?,
     });
 
     for host in model
@@ -1014,9 +998,7 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/user_ca_keys.pem".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/revoked_user_certs".to_owned()));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/grafhome/ssh_known_hosts".to_owned()));
-        assert!(paths.contains(
-            &"hosts/proxy-host/etc/apache2/conf-available/grafhome-ca-proxy.conf".to_owned()
-        ));
+        assert!(!paths.iter().any(|path| path.contains("apache2")));
         assert!(paths.contains(&"hosts/ca-host/etc/ssh/auth_principals/alice".to_owned()));
         assert!(paths.iter().all(|path| !path.starts_with('/')));
     }
@@ -1282,37 +1264,6 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
         ));
         assert!(sshd.content.contains("StrictModes no"));
         assert!(sshd.content.contains("AuthorizedKeysFile none"));
-    }
-
-    #[test]
-    fn rendered_apache_proxy_fragment_verifies_https_origin() {
-        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
-        let files = render(&model).unwrap();
-        let proxy = files
-            .iter()
-            .find(|file| {
-                file.path
-                    == std::path::Path::new(
-                        "hosts/proxy-host/etc/apache2/conf-available/grafhome-ca-proxy.conf",
-                    )
-            })
-            .unwrap();
-
-        assert!(proxy.content.contains("SSLProxyEngine on"));
-        assert!(proxy.content.contains("SSLProxyVerify require"));
-        assert!(proxy.content.contains("SSLProxyVerifyDepth 2"));
-        assert!(proxy.content.contains("SSLProxyCheckPeerName on"));
-        assert!(
-            proxy
-                .content
-                .contains("SSLProxyCACertificateFile /etc/ssl/example-ca/root_ca.crt")
-        );
-        assert!(!proxy.content.contains("acme-challenge"));
-        assert!(
-            proxy
-                .content
-                .contains("ProxyPass        / https://ca-origin.example.test:8443/")
-        );
     }
 
     #[test]

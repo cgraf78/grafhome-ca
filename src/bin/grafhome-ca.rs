@@ -1763,7 +1763,6 @@ fn require_root_or_isolated_test(
         "GRAFHOME_CA_STATE_DIR",
         "GRAFHOME_CA_SERVER_STEPPATH",
         "GRAFHOME_CA_ROOT_STEP_BIN",
-        "GRAFHOME_CA_HELPER_BIN",
         "GRAFHOME_CA_HOST_KEY_PATH",
         "GRAFHOME_CA_PASSWORD_FILE",
     ]
