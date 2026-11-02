@@ -5346,7 +5346,7 @@ fn enroll_host_restart_requires_existing_enrollment_material() {
         .failure()
         .stderr(predicate::str::contains("cannot restart because"))
         .stderr(predicate::str::contains(
-            "run enroll host without --restart",
+            "run ssh enroll host without --restart",
         ));
 }
 
@@ -5846,7 +5846,7 @@ fn enroll_user_restart_requires_existing_enrollment_material() {
         .failure()
         .stderr(predicate::str::contains("cannot restart because"))
         .stderr(predicate::str::contains(
-            "run enroll user without --restart",
+            "run ssh enroll user without --restart",
         ));
 }
 

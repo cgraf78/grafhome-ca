@@ -42,6 +42,8 @@ certificate lifecycle:
 The SSH commands live under `grafhome-ca ssh`. The older top-level spellings
 (`enroll`, `approve`, `renew`, `revoke`, `enrollment`, `status`, and
 `apply host`) still work as hidden aliases but are no longer listed in `--help`.
+They are deprecated and will be removed in a later release; use the `ssh`
+spellings.
 
 Only explicit commands change live state: enrollment, approval, renewal,
 revocation, apply, and the one-time migrations. Distributing private site config is left to your
