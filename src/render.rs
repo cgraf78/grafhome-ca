@@ -529,15 +529,13 @@ pub fn ca_authority_policy(model: &SiteModel) -> Result<Value> {
 
 fn provisioners_json(provisioners: &[Provisioner]) -> Result<String> {
     let mut rendered = Vec::new();
-    for provisioner in provisioners.iter().filter(|entry| entry.status.is_active()) {
-        let claims = provisioner_claims(provisioner)?;
+    // Retired ACME rows stay readable policy but must never reach a CA.
+    for provisioner in provisioners
+        .iter()
+        .filter(|entry| entry.status.is_active() && entry.role != PROVISIONER_ROLE_PROXY_X509)
+    {
         let value = match provisioner.r#type.as_str() {
             "JWK" => json!(provisioner_placeholder(&provisioner.name)),
-            "ACME" => json!({
-                "type": "ACME",
-                "name": provisioner.name,
-                "claims": claims
-            }),
             other => {
                 return Err(Error::Validation {
                     field: ca_policy_field("provisioners", &provisioner.role, "type"),
@@ -584,10 +582,6 @@ fn provisioner_claims(provisioner: &Provisioner) -> Result<Value> {
             "defaultUserSSHCertDuration": provisioner.default_ttl,
             "maxUserSSHCertDuration": step_max_ttl(&provisioner.max_ttl),
             "enableSSHCA": true
-        }),
-        PROVISIONER_ROLE_PROXY_X509 => json!({
-            "defaultTLSCertDuration": provisioner.default_ttl,
-            "maxTLSCertDuration": step_max_ttl(&provisioner.max_ttl)
         }),
         other => {
             return Err(Error::Validation {
@@ -1313,11 +1307,7 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
                 .content
                 .contains("SSLProxyCACertificateFile /etc/ssl/example-ca/root_ca.crt")
         );
-        assert!(
-            proxy
-                .content
-                .contains("ProxyPass        /.well-known/acme-challenge/ !")
-        );
+        assert!(!proxy.content.contains("acme-challenge"));
         assert!(
             proxy
                 .content
@@ -1560,8 +1550,15 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
     }
 
     #[test]
-    fn rendered_acme_provisioner_does_not_enable_ssh_ca() {
-        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+    fn retired_acme_row_is_never_rendered() {
+        // The legacy example still declares an active ACME row: old policy must
+        // keep loading, but no ACME provisioner may reach a rendered CA.
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/legacy-site-config");
+        let model = crate::model::SiteModel::load(&root).unwrap();
+        assert!(model.policy.provisioners.iter().any(|row| {
+            row.role == crate::policy::PROVISIONER_ROLE_PROXY_X509 && row.status.is_active()
+        }));
         let files = render(&model).unwrap();
         let ca_json = files
             .iter()
@@ -1572,15 +1569,13 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&ca_json.content).unwrap();
         let provisioners = value["authority"]["provisioners"].as_array().unwrap();
-        let acme = provisioners
-            .iter()
-            .find(|item| item["name"] == "grafhome-x509-ca-proxy")
-            .unwrap();
-
-        assert_eq!(acme["type"], "ACME");
-        assert!(acme["claims"].get("enableSSHCA").is_none());
-        assert!(acme["claims"].get("defaultUserSSHCertDuration").is_none());
-        assert!(acme["claims"].get("defaultHostSSHCertDuration").is_none());
+        assert!(!provisioners.is_empty());
+        assert!(provisioners.iter().all(|item| item["type"] != "ACME"));
+        assert!(
+            provisioners
+                .iter()
+                .all(|item| item["name"] != "grafhome-x509-ca-proxy")
+        );
     }
 
     #[test]

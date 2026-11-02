@@ -33,7 +33,11 @@ pub const ENDPOINT_ROLE_CA_ORIGIN: &str = "ca_origin";
 pub const PROVISIONER_ROLE_HOST_BOOTSTRAP: &str = "host_bootstrap";
 /// Interactive user enrollment provisioner role.
 pub const PROVISIONER_ROLE_USER_ENROLLMENT: &str = "user_enrollment";
-/// Proxy ACME provisioner role.
+/// Retired ACME proxy provisioner role.
+///
+/// Policy rows with this role still parse, so older site configs keep loading,
+/// but they are inert: nothing renders them, and `apply ca` removes every live
+/// ACME provisioner whatever the row's status.
 pub const PROVISIONER_ROLE_PROXY_X509: &str = "proxy_x509";
 
 /// Lifecycle state for a policy object or relationship.

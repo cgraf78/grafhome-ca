@@ -19,8 +19,8 @@ use crate::enrollment::{parse_host_provisioner_name, parse_user_provisioner_name
 use crate::error::{Error, Result};
 use crate::model::SiteModel;
 use crate::policy::{
-    PROVISIONER_ROLE_HOST_BOOTSTRAP, PROVISIONER_ROLE_PROXY_X509, PROVISIONER_ROLE_USER_ENROLLMENT,
-    Provisioner, ca_policy_field, canonical_ssh_public_key, step_max_ttl,
+    PROVISIONER_ROLE_HOST_BOOTSTRAP, PROVISIONER_ROLE_USER_ENROLLMENT, Provisioner,
+    ca_policy_field, canonical_ssh_public_key, step_max_ttl,
 };
 use crate::x509::{self, is_deny_template, parse_x509_provisioner_name};
 
@@ -73,12 +73,9 @@ pub fn reconcile_claims(
     let mut config = read_json(ca_json)?;
     let user = active_provisioner(model, PROVISIONER_ROLE_USER_ENROLLMENT)?;
     let host = active_provisioner(model, PROVISIONER_ROLE_HOST_BOOTSTRAP)?;
-    // The ACME proxy provisioner is being retired, so a disabled or absent row
-    // is valid policy; only its live claims are skipped.
-    let proxy = optional_active_provisioner(model, PROVISIONER_ROLE_PROXY_X509);
     let authority_policy_updated = reconcile_authority_policy(model, &mut config, ca_json)?;
     let provisioners = provisioners_mut(&mut config, ca_json)?;
-    let removed = remove_retired_provisioners(model, provisioners, proxy)?;
+    let removed = remove_retired_provisioners(model, provisioners)?;
     let mut updated = Vec::new();
 
     for item in provisioners.iter_mut() {
@@ -101,8 +98,6 @@ pub fn reconcile_claims(
             host_claims(host)
         } else if parse_host_provisioner_name(&name).is_some() {
             host_renewal_claims(model, host)
-        } else if let Some(proxy) = proxy.filter(|proxy| name == proxy.name) {
-            proxy_claims(proxy)
         } else {
             continue;
         };
@@ -138,21 +133,21 @@ fn is_x509_provisioner(item: &Value) -> bool {
 
 /// Drop provisioners that policy no longer permits to exist.
 ///
-/// Every ACME provisioner other than the active policy row goes, not only a
-/// disabled one: ACME has no name limit of its own, so any that survives keeps a
-/// rogue responder able to obtain a certificate `tlshd` would accept. Tombstoned
-/// X.509 provisioners go too, so restoring an old `ca.json` cannot revive them.
+/// Every ACME provisioner goes, whatever its name or any `proxy_x509` policy
+/// row says: ACME is retired, and it has no name limit of its own, so any that
+/// survives keeps a rogue responder able to obtain a certificate `tlshd` would
+/// accept. Tombstoned X.509 provisioners go too, so restoring an old `ca.json`
+/// cannot revive them.
 fn remove_retired_provisioners(
     model: &SiteModel,
     provisioners: &mut Vec<Value>,
-    proxy: Option<&Provisioner>,
 ) -> Result<Vec<String>> {
     let mut removed = Vec::new();
     let mut kept = Vec::with_capacity(provisioners.len());
     for item in provisioners.drain(..) {
         let name = item.get("name").and_then(Value::as_str);
         let retired = if item.get("type").and_then(Value::as_str) == Some("ACME") {
-            proxy.is_none_or(|proxy| name != Some(proxy.name.as_str()))
+            true
         } else {
             is_x509_provisioner(&item) && x509::is_revoked(&model.policy, &item)?
         };
@@ -320,19 +315,6 @@ fn host_claims_for(default_ttl: &str, max_ttl: &str) -> Map<String, Value> {
             Value::String(step_max_ttl(max_ttl).to_owned()),
         ),
         ("enableSSHCA".to_owned(), Value::Bool(true)),
-    ])
-}
-
-fn proxy_claims(provisioner: &Provisioner) -> Map<String, Value> {
-    Map::from_iter([
-        (
-            "defaultTLSCertDuration".to_owned(),
-            Value::String(provisioner.default_ttl.clone()),
-        ),
-        (
-            "maxTLSCertDuration".to_owned(),
-            Value::String(step_max_ttl(&provisioner.max_ttl).to_owned()),
-        ),
     ])
 }
 
@@ -1552,7 +1534,9 @@ mod tests {
         .unwrap();
 
         let result = reconcile_claims(&model, &ca_json).unwrap();
-        assert_eq!(result.updated.len(), 4);
+        assert_eq!(result.updated.len(), 3);
+        // ACME is retired: a live ACME provisioner is removed, never reconciled.
+        assert_eq!(result.removed, vec!["grafhome-x509-ca-proxy".to_owned()]);
         let value: Value = serde_json::from_str(&result.config).unwrap();
         let provisioners = value["authority"]["provisioners"].as_array().unwrap();
         let by_name = provisioners
@@ -1578,10 +1562,7 @@ mod tests {
             by_name[host_name.as_str()]["claims"]["maxHostSSHCertDuration"],
             "720h"
         );
-        assert_eq!(
-            by_name["grafhome-x509-ca-proxy"]["claims"]["maxTLSCertDuration"],
-            "720h"
-        );
+        assert!(!by_name.contains_key("grafhome-x509-ca-proxy"));
         assert_eq!(
             by_name["operator-owned"]["claims"]["maxUserSSHCertDuration"],
             "1h"
@@ -1863,11 +1844,7 @@ mod tests {
         assert_eq!(host_renewal["claims"]["defaultHostSSHCertDuration"], "168h");
         assert_eq!(host_renewal["claims"]["maxHostSSHCertDuration"], "720h");
         assert!(!provisioners.iter().any(|item| item["type"] == "SSHPOP"));
-        assert!(
-            provisioners
-                .iter()
-                .any(|item| item["name"] == "grafhome-x509-ca-proxy")
-        );
+        assert!(!provisioners.iter().any(|item| item["type"] == "ACME"));
     }
 
     #[test]

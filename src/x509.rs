@@ -92,8 +92,8 @@ pub fn x509_provisioner_name(host: &str, name: &str) -> String {
 /// Decode an X.509 provisioner name into its host and policy name.
 ///
 /// Only the exact form [`x509_provisioner_name`] produces parses. This keeps the
-/// ACME `grafhome-x509-ca-proxy` out, and a name is what exempts a provisioner
-/// from the X.509 deny check, so no spelling variant may qualify.
+/// retired ACME name `grafhome-x509-ca-proxy` out, and a name is what exempts a
+/// provisioner from the X.509 deny check, so no spelling variant may qualify.
 #[must_use]
 pub fn parse_x509_provisioner_name(name: &str) -> Option<(String, String)> {
     let (host, certificate) = name.strip_prefix(PROVISIONER_PREFIX)?.split_once('-')?;

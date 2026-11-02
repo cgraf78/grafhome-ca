@@ -18,7 +18,6 @@ const REQUIRED_KEYS: &[&str] = &[
     "GRAFHOME_CA_SSH_TRUST_DIR",
     "GRAFHOME_CA_AUTH_PRINCIPALS_DIR",
     "GRAFHOME_CA_PROXY_TLS_DIR",
-    "GRAFHOME_CA_PROXY_ACME_WEBROOT",
     "GRAFHOME_CA_STEP_CA_BIN",
     "GRAFHOME_CA_ROOT_STEP_BIN",
     "GRAFHOME_CA_HELPER_BIN",
@@ -30,7 +29,11 @@ const REQUIRED_KEYS: &[&str] = &[
 
 /// Keys a deployment may omit. Sites leave them unset so older binaries, which
 /// reject unknown keys, keep loading the same file.
-const OPTIONAL_KEYS: &[&str] = &["GRAFHOME_CA_X509_DIR"];
+///
+/// `GRAFHOME_CA_PROXY_ACME_WEBROOT` is retired with ACME and ignored. It stays
+/// accepted because releases before the retirement require it, so a site keeps
+/// it until every host runs a newer binary.
+const OPTIONAL_KEYS: &[&str] = &["GRAFHOME_CA_X509_DIR", "GRAFHOME_CA_PROXY_ACME_WEBROOT"];
 
 /// Default root for host-held X.509 certificates and keys.
 const DEFAULT_X509_DIR: &str = "/etc/grafhome-ca/x509";
