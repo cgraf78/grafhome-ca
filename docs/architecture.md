@@ -38,32 +38,33 @@ implementations.
 Hosted Linux CI checks Android archives structurally (AArch64 ELF plus the
 Bionic interpreter). A separate x86_64 Android build runs a lifecycle smoke
 test inside the official Termux app: `check` against the public fixture tree,
-checks that the packaged OpenSSH configs load both drop-in directories, a
-quiet unenrolled `status`, request-only `enroll user` plus a rerun that reuses
-the stored renewal password, a real Termux `sshd`, configured with an
+checks that the packaged OpenSSH configs load both drop-in directories, a quiet
+unenrolled `ssh status`, request-only `ssh enroll user` plus a rerun that
+reuses the stored renewal password, a real Termux `sshd`, configured with an
 `ssh-keygen` test CA and principals file, that must accept a CA-signed
 certificate and reject an unsigned key and KRL-revoked certificates, and the
-rootless host backend (`apply ca` refusal, symlinked credential path
-rejection, `enroll host`, `apply host`, and `renew host`) in an isolated app
-prefix with command shims.
-The AArch64 release artifact retains structural cross-build coverage.
+rootless host backend (`apply ca` refusal, symlinked credential path rejection,
+`ssh enroll host`, `ssh apply`, and `ssh renew host`) in an isolated app prefix
+with command shims. The AArch64 release artifact retains structural cross-build
+coverage.
 
 ## Safety Contract
 
-Enrollment and identity revocation are the narrow live-mutation boundary.
-`approve user` and `approve host` install device-bound renewal JWK provisioners
-on the CA origin and roll back if CA activation or health verification fails.
-Private JWK material never leaves its enrolled host. Successful approval also
-records the SSH public key and canonical renewal public JWK in an owner-only,
-untracked registry on the CA origin. Routine renewal does not depend on that
-registry. Existing deployments backfill it by exporting target-local public
-material. Import verifies the live renewal JWK, binds the legacy provisioner's
-SSH template to the asserted key, and activates the registry only after a
-restart and health check. `revoke user` and `revoke host` use the registry to
-remove those provisioners and append exact plain public keys plus renewal JWK
-fingerprints to private tracked policy, without certificate serial lookup.
-Revoked registry and tracked records remain permanent tombstones, so a logical
-identity can be reused only with new SSH and renewal keys.
+Enrollment and identity revocation are the narrow live-mutation boundary. `ssh
+approve user` and `ssh approve host` install device-bound renewal JWK
+provisioners on the CA origin and roll back if CA activation or health
+verification fails. Private JWK material never leaves its enrolled host.
+Successful approval also records the SSH public key and canonical renewal
+public JWK in an owner-only, untracked registry on the CA origin. Routine
+renewal does not depend on that registry. Existing deployments backfill it by
+exporting target-local public material. Import verifies the live renewal JWK,
+binds the legacy provisioner's SSH template to the asserted key, and activates
+the registry only after a restart and health check. `ssh revoke user` and `ssh
+revoke host` use the registry to remove those provisioners and append exact
+plain public keys plus renewal JWK fingerprints to private tracked policy,
+without certificate serial lookup. Revoked registry and tracked records remain
+permanent tombstones, so a logical identity can be reused only with new SSH and
+renewal keys.
 
 OpenSSH does not perform online CA revocation checks. Host policy application
 therefore compiles the tracked user keys into the server-side `RevokedKeys` KRL
@@ -72,35 +73,34 @@ plain key also rejects certificates renewed later for that key. KRL generation
 and validation occur before live writes; SSH configuration validation and
 reload share the existing rollback transaction. The tracked policy update is
 written before CA activation so a failed revoke can leave only a conservative,
-retryable state.
-The two broad enrollment provisioners keep only their public JWKs in `ca.json`.
-Their encrypted private JWKs and independent passwords are server-local inputs
-to operator token creation, so `/provisioners` cannot publish an offline
-password-cracking target. Enrollment provisioners deny X.509 issuance and force
-the intended SSH certificate type. Device-bound renewal provisioners pin exact
-principals and the enrolled SSH public key, deny X.509 issuance, and enforce
-finite renewal claims. The broad enrollment issuers compare the requested SSH
-key with a signed custom token claim, so initial issuance is key-bound too.
-Authority-wide SSH allow-lists provide a final policy check over all configured
-user and host principals.
-Each enrolled X.509 certificate has its own JWK provisioner. Its template emits
-only policy values and refuses any CSR key other than the enrolled one, so a
-stolen renewal JWK yields nothing without the certificate key. Renewal is off
-because `/renew` and `/rekey` would otherwise accept any unexpired certificate,
-bypassing the JWK and surviving revocation.
-Routine user enrollment grants retain document version 1. An exceptional
-effectively-infinite grant uses version 2, which makes pre-feature clients fail
-before issuance. A compatible client preserves that initial certificate and
-tests the finite renewal path with temporary output. This version boundary is
-deliberate because silently treating the exceptional grant as routine would
-replace the operator-approved certificate.
+retryable state. The two broad enrollment provisioners keep only their public
+JWKs in `ca.json`. Their encrypted private JWKs and independent passwords are
+server-local inputs to operator token creation, so `/provisioners` cannot
+publish an offline password-cracking target. Enrollment provisioners deny X.509
+issuance and force the intended SSH certificate type. Device-bound renewal
+provisioners pin exact principals and the enrolled SSH public key, deny X.509
+issuance, and enforce finite renewal claims. The broad enrollment issuers
+compare the requested SSH key with a signed custom token claim, so initial
+issuance is key-bound too. Authority-wide SSH allow-lists provide a final
+policy check over all configured user and host principals. Each enrolled X.509
+certificate has its own JWK provisioner. Its template emits only policy values
+and refuses any CSR key other than the enrolled one, so a stolen renewal JWK
+yields nothing without the certificate key. Renewal is off because `/renew` and
+`/rekey` would otherwise accept any unexpired certificate, bypassing the JWK
+and surviving revocation. Routine user enrollment grants retain document
+version 1. An exceptional effectively-infinite grant uses version 2, which
+makes pre-feature clients fail before issuance. A compatible client preserves
+that initial certificate and tests the finite renewal path with temporary
+output. This version boundary is deliberate because silently treating the
+exceptional grant as routine would replace the operator-approved certificate.
 Enrollment grants are bound to the requesting host's keys and the configured
 `ca_api` URL. Their root fingerprints use the fixed SHA-256 hexadecimal form;
 the copied grant remains the out-of-band trust handoff for first bootstrap.
-`enroll host` installs only host-specific SSH trust/configuration after issuing
-the host certificate, validates JWK renewal and `sshd`, and reloads it. Broader
-firewall, DNS, Apache, CA initialization, backup, and fleet rollout changes
-remain owned by private configuration management and explicit operator runbooks.
+`ssh enroll host` installs only host-specific SSH trust/configuration after
+issuing the host certificate, validates JWK renewal and `sshd`, and reloads it.
+Broader firewall, DNS, Apache, CA initialization, backup, and fleet rollout
+changes remain owned by private configuration management and explicit operator
+runbooks.
 
 Rendered files are staging artifacts, not an imperative deploy. They must
 either contain complete non-secret support files, such as plain revocation key
@@ -108,12 +108,12 @@ sources, or explicitly point at operator-provided runtime secret material.
 OpenSSH fragments in particular must not reference missing support files,
 because `RevokedKeys` failures can break all public-key authentication.
 `HostCertificate` is the deliberate exception: it points at the runtime host
-certificate generated by `enroll host` or `renew host`, so the certificate must
-exist before the fragment is activated.
-Rollout staging should use `render --clean` or a fresh output directory so stale
-files from previous renders cannot be installed accidentally. Clean renders
-remove generated top-level roots, such as `hosts/`, rather than deleting every
-child in the staging directory.
+certificate generated by `ssh enroll host` or `ssh renew host`, so the
+certificate must exist before the fragment is activated. Rollout staging should
+use `render --clean` or a fresh output directory so stale files from previous
+renders cannot be installed accidentally. Clean renders remove generated
+top-level roots, such as `hosts/`, rather than deleting every child in the
+staging directory.
 
 `export` is a read-only bridge from initialized Smallstep state to
 rollout inputs. It reads the root certificate and SSH CA public keys, computes

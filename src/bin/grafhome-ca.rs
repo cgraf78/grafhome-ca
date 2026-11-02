@@ -3000,7 +3000,7 @@ fn reserve_approval_record(
             // of the pinned key, so a lost record has to be restored from a backup.
             let recovery = match candidate {
                 EnrollmentRecord::X509 { .. } => "restore the enrollment registry from a backup",
-                _ => "run `grafhome-ca enrollment import` first",
+                _ => "run `grafhome-ca ssh enrollment import` first",
             };
             return Err(grafhome_ca::Error::Validation {
                 field: "approve enrollment".to_owned(),
@@ -3407,7 +3407,7 @@ fn require_user_restart_material(user_name: &str, host: &str) -> grafhome_ca::Re
             return Err(grafhome_ca::Error::Validation {
                 field: "enroll user --restart".to_owned(),
                 message: format!(
-                    "cannot restart because {} is missing; run enroll user without --restart",
+                    "cannot restart because {} is missing; run ssh enroll user without --restart",
                     path.display()
                 ),
             });
@@ -3636,7 +3636,7 @@ fn publish_user_request(
         "{action} a public enrollment request for {}@{}.",
         request.user, request.host
     );
-    eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve user");
+    eprintln!("Copy the REQUEST line to: sudo grafhome-ca ssh approve user");
     outln!("REQUEST:{text}");
     std::io::stdout()
         .flush()
@@ -3700,7 +3700,7 @@ fn approve_user_enrollment(
         grant.mark_effectively_infinite_certificate();
     }
     eprintln!("Approved {}@{}.", request.user, request.host);
-    eprintln!("Copy the GRANT line back to the pending enroll user command.");
+    eprintln!("Copy the GRANT line back to the pending ssh enroll user command.");
     outln!(
         "GRANT:{}",
         serde_json::to_string(&grant).expect("user grant serializes")
@@ -3838,7 +3838,7 @@ fn require_host_restart_material(model: &SiteModel, host_name: &str) -> grafhome
             return Err(grafhome_ca::Error::Validation {
                 field: "enroll host --restart".to_owned(),
                 message: format!(
-                    "cannot restart because {} is missing; run enroll host without --restart",
+                    "cannot restart because {} is missing; run ssh enroll host without --restart",
                     path.display()
                 ),
             });
@@ -3918,7 +3918,7 @@ fn publish_host_request(
         "{action} a public host enrollment request for {}.",
         request.host
     );
-    eprintln!("Copy the REQUEST line to: sudo grafhome-ca approve host");
+    eprintln!("Copy the REQUEST line to: sudo grafhome-ca ssh approve host");
     outln!("REQUEST:{text}");
     std::io::stdout()
         .flush()
@@ -3979,7 +3979,7 @@ fn approve_host_enrollment(
         String::from_utf8_lossy(&token).trim(),
     );
     eprintln!("Approved {}.", request.host);
-    eprintln!("Copy the GRANT line back to the pending enroll host command.");
+    eprintln!("Copy the GRANT line back to the pending ssh enroll host command.");
     outln!(
         "GRANT:{}",
         serde_json::to_string(&grant).expect("host grant serializes")
@@ -5356,7 +5356,7 @@ fn renew_host(model: &SiteModel, host_name: &str, quiet: bool) -> grafhome_ca::R
     if !private_jwk.exists() || !password_file.exists() {
         return Err(grafhome_ca::Error::Validation {
             field: material_dir.display().to_string(),
-            message: "host renewal credential is missing; run enroll host".to_owned(),
+            message: "host renewal credential is missing; run ssh enroll host".to_owned(),
         });
     }
     let step_bin = root_step_bin(model)?;
@@ -5741,7 +5741,7 @@ fn revoke_host(
 }
 
 /// What an SSH revocation still needs: servers read keys from the distributed KRL.
-const SSH_REVOCATION_NEXT_STEP: &str = "run `grafhome-ca apply host` on managed SSH hosts";
+const SSH_REVOCATION_NEXT_STEP: &str = "run `grafhome-ca ssh apply` on managed SSH hosts";
 
 fn revoke_x509(
     model: &SiteModel,
@@ -5943,7 +5943,7 @@ fn require_registry_coverage(
     Err(grafhome_ca::Error::Validation {
         field: "revoke enrollment".to_owned(),
         message: format!(
-            "live enrollment keys are absent from the CA registry: {}; before revoking, export SSH enrollments on each target and run `grafhome-ca enrollment import`, or restore X.509 enrollments from a registry backup",
+            "live enrollment keys are absent from the CA registry: {}; before revoking, export SSH enrollments on each target and run `grafhome-ca ssh enrollment import`, or restore X.509 enrollments from a registry backup",
             missing.join(", ")
         ),
     })

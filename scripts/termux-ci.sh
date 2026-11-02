@@ -75,7 +75,7 @@ sshd -t
 # preflight without changing either tree. This exercises package modes,
 # executable provenance, and the complete existing OpenSSH subtree.
 set +e
-TERMUX_VERSION="${TERMUX_VERSION:-ci}" .termux-ci/grafhome-ca status \
+TERMUX_VERSION="${TERMUX_VERSION:-ci}" .termux-ci/grafhome-ca ssh status \
   --config-root examples/site-config \
   --host proxy-host \
   --quiet >"$tmp/real-prefix-status.out" 2>"$tmp/real-prefix-status.err"
@@ -89,7 +89,7 @@ if [[ "$status_rc" -ne 1 ]] || [[ -s "$tmp/real-prefix-status.out" ]] ||
 fi
 mkdir -p "$tmp/home"
 printf '%s\n' 'termux-ci-renewal-password' | env -u TERMUX_VERSION HOME="$tmp/home" \
-  .termux-ci/grafhome-ca enroll user \
+  .termux-ci/grafhome-ca ssh enroll user \
   --config-root examples/site-config \
   --user alice \
   --host ca-host \
@@ -106,7 +106,7 @@ test "$(stat -c '%a' "$credential")" = 600
 # validate and reuse it.
 rm "$tmp/home/.config/grafhome-ca/users/alice/hosts/ca-host/pending-enrollment.json"
 rm "$tmp/home/.ssh/id_ed25519" "$tmp/home/.ssh/id_ed25519.pub"
-env -u TERMUX_VERSION HOME="$tmp/home" .termux-ci/grafhome-ca enroll user \
+env -u TERMUX_VERSION HOME="$tmp/home" .termux-ci/grafhome-ca ssh enroll user \
   --config-root examples/site-config \
   --user alice \
   --host ca-host \
@@ -407,7 +407,7 @@ if env \
   TERMUX_VERSION=ci \
   PATH="$termux_bin" \
   TERMUX_SERVER_LOG="$termux_log" \
-  .termux-ci/grafhome-ca enroll host \
+  .termux-ci/grafhome-ca ssh enroll host \
   --host proxy-host \
   --config-root "$bad_home/site-config" \
   --request-only >"$tmp/bad-host-request" 2>"$tmp/bad-host-error"; then
@@ -422,7 +422,7 @@ fi
 test ! -e "$exposed/host-step"
 printf '%s\n' 'ok: Termux host credentials reject symlinked paths'
 
-"${termux_env[@]}" .termux-ci/grafhome-ca enroll host \
+"${termux_env[@]}" .termux-ci/grafhome-ca ssh enroll host \
   --host proxy-host \
   --config-root "$termux_config" \
   --request-only >"$tmp/host-request"
@@ -450,7 +450,7 @@ chmod 0644 "$host_step/certs/root_ca.crt"
 
 (
   umask 000
-  "${termux_env[@]}" .termux-ci/grafhome-ca apply host \
+  "${termux_env[@]}" .termux-ci/grafhome-ca ssh apply \
     --host proxy-host \
     --config-root "$termux_config"
 )
@@ -471,7 +471,7 @@ for krl in revoked_user_certs revoked_host_keys; do
   test "$(head -n 1 "$termux_ssh/grafhome/$krl")" = FAKE-KRL
 done
 
-"${termux_env[@]}" .termux-ci/grafhome-ca renew host \
+"${termux_env[@]}" .termux-ci/grafhome-ca ssh renew host \
   --host proxy-host \
   --config-root "$termux_config"
 test -s "$termux_ssh/ssh_host_ed25519_key-cert.pub"
