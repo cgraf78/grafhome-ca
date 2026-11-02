@@ -2598,12 +2598,7 @@ fn apply_ca_updates_authority_policy_only_and_removes_retired_principals() {
 fn apply_ca_accepts_disabled_proxy_x509() {
     let (_dir, fixture) = exec_fixture();
     prepare_apply_ca(&fixture);
-    let ca_policy = fixture.config_root.join("policy/ca.toml");
-    // proxy_x509 is the last table in the fixture, so appended keys belong to it.
-    let mut policy = fs::read_to_string(&ca_policy).unwrap();
-    assert!(policy.trim_end().ends_with("max_ttl = \"720h\""));
-    policy.push_str("status = \"disabled\"\n");
-    fs::write(ca_policy, policy).unwrap();
+    add_proxy_x509_row(&fixture, "disabled");
 
     apply_ca_command(&fixture).assert().success();
 }
@@ -9674,12 +9669,16 @@ fn apply_ca_refuses_an_undeclared_x509_provisioner() {
     assert_eq!(fs::read(&ca_json).unwrap(), before);
 }
 
+/// Append a retired `proxy_x509` row, as a site configured before ACME's
+/// retirement still has. The row must keep parsing whatever its status.
 #[cfg(unix)]
-fn disable_proxy_x509(fixture: &ExecFixture) {
+fn add_proxy_x509_row(fixture: &ExecFixture, status: &str) {
     let ca_policy = fixture.config_root.join("policy/ca.toml");
     let mut policy = fs::read_to_string(&ca_policy).unwrap();
-    assert!(policy.trim_end().ends_with("max_ttl = \"720h\""));
-    policy.push_str("status = \"disabled\"\n");
+    policy.push_str(&format!(
+        "\n[provisioners.proxy_x509]\nname = \"grafhome-x509-ca-proxy\"\n\
+         default_ttl = \"720h\"\nmax_ttl = \"720h\"\nstatus = \"{status}\"\n"
+    ));
     fs::write(ca_policy, policy).unwrap();
 }
 
@@ -9699,7 +9698,7 @@ fn apply_ca_removes_disabled_acme() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = prepare_apply_ca(&fixture);
     add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
-    disable_proxy_x509(&fixture);
+    add_proxy_x509_row(&fixture, "disabled");
 
     apply_ca_command(&fixture)
         .assert()
@@ -9719,7 +9718,7 @@ fn apply_ca_removes_only_disabled_acme_after_a_dry_run() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = prepare_apply_ca(&fixture);
     add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
-    disable_proxy_x509(&fixture);
+    add_proxy_x509_row(&fixture, "disabled");
     let before = fs::read(&ca_json).unwrap();
 
     apply_ca_command(&fixture)
@@ -9733,17 +9732,21 @@ fn apply_ca_removes_only_disabled_acme_after_a_dry_run() {
 
 #[cfg(unix)]
 #[test]
-fn apply_ca_keeps_active_acme_but_removes_a_stray_one() {
+fn apply_ca_removes_every_acme_even_with_an_active_policy_row() {
+    // An old site's active proxy_x509 row still loads, but no longer keeps
+    // its ACME provisioner alive.
     let (_dir, fixture) = exec_fixture();
     let ca_json = prepare_apply_ca(&fixture);
     add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
     add_live_acme(&ca_json, "stray-acme");
+    add_proxy_x509_row(&fixture, "active");
 
     apply_ca_command(&fixture).assert().success();
 
     let names = live_provisioner_names(&ca_json);
-    assert!(names.contains(&"grafhome-x509-ca-proxy".to_owned()));
+    assert!(!names.contains(&"grafhome-x509-ca-proxy".to_owned()));
     assert!(!names.contains(&"stray-acme".to_owned()));
+    assert!(!fs::read_to_string(&ca_json).unwrap().contains("ACME"));
 }
 
 /// Every X.509 deny text a release has written to a live provisioner.
@@ -9824,26 +9827,20 @@ fn tree_state(
 }
 
 /// Release runs this path unattended through the merge hook, on a CA that still
-/// holds its ACME row and every deny text an earlier release wrote.
+/// holds every deny text an earlier release wrote.
 #[cfg(unix)]
 #[test]
 fn apply_ca_leaves_settled_release_state_untouched() {
     let (dir, fixture) = exec_fixture();
     let ca_json = prepare_apply_ca(&fixture);
-    add_live_acme(&ca_json, "grafhome-x509-ca-proxy");
     let historic = add_historic_renewal_provisioners(&ca_json);
 
-    // The first run settles claims and the allow-list. If it also dropped the ACME
-    // row or rewrote a deny text, the run under test would be a no-op only because
-    // the state it was meant to preserve had already gone.
+    // The first run settles claims and the allow-list. If it also rewrote a deny
+    // text, the run under test would be a no-op only because the state it was
+    // meant to preserve had already gone.
     apply_ca_command(&fixture).assert().success();
     let settled: serde_json::Value = serde_json::from_slice(&fs::read(&ca_json).unwrap()).unwrap();
     let provisioners = settled["authority"]["provisioners"].as_array().unwrap();
-    assert!(
-        provisioners
-            .iter()
-            .any(|item| item["type"] == "ACME" && item["name"] == "grafhome-x509-ca-proxy")
-    );
     for (name, template) in &historic {
         let item = provisioners
             .iter()

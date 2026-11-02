@@ -359,7 +359,7 @@ and rollback path used by enrollment; a no-op does not restart the CA.
 
 `apply ca` is also where issuance authority is narrowed. It refuses to run
 while any JWK provisioner other than an enrolled X.509 one lacks the X.509 deny
-template, removes every ACME provisioner except the active `proxy_x509` row, and
+template, removes every ACME provisioner, and
 removes X.509 provisioners whose key is tombstoned. A live X.509 provisioner with
 no active policy declaration stops the command until the declaration is restored
 or the enrollment is revoked. That refusal stops the command, not the provisioner,

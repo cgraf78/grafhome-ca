@@ -20,8 +20,3 @@ name = "grafhome-user-enrollment"
 default_ttl = "24h"
 max_ttl = "unlimited"
 renewal_max_ttl = "48h"
-
-[provisioners.proxy_x509]
-name = "grafhome-x509-ca-proxy"
-default_ttl = "720h"
-max_ttl = "720h"

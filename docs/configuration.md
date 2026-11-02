@@ -78,10 +78,10 @@ root uses dotfiles, those tool paths normally live under `/root/.local/bin`.
   CA origin before proxying.
 
 `GRAFHOME_CA_PROXY_ACME_WEBROOT`
-: Absolute path to the webroot directory used by `step ca certificate
-  --webroot` for proxy X.509 certificate issuance and renewal. The proxy web
-  server must serve `${GRAFHOME_CA_PROXY_ACME_WEBROOT}/.well-known/acme-challenge/`
-  over HTTP for the `ca_api` DNS name without requiring authentication.
+: Retired with ACME and ignored. Optional, and still accepted because releases
+  before the retirement require it: keep it until every host runs a newer
+  binary, then delete it. The proxy's own certificate is an ordinary
+  `x509_certs` declaration renewed with `x509 renew`.
 
 `GRAFHOME_CA_STEP_CA_BIN`
 : Absolute path to the `step-ca` server binary.
@@ -260,8 +260,12 @@ binaries reject unknown ones.
 
 The authority X.509 DNS allow-list is derived, not configured: the `ca_api` and
 `ca_origin` endpoint names plus every active declared name. Policy without
-`x509_certs` renders the same allow-list as before. The `proxy_x509`
-provisioner may be `disabled`; `apply ca` then skips its claims.
+`x509_certs` renders the same allow-list as before.
+
+ACME is retired. A `[provisioners.proxy_x509]` row still parses in any status,
+so older policy keeps loading, but it is inert: nothing renders an ACME
+provisioner, and `apply ca` removes every live one. Delete the row once every
+host runs a binary with this behavior.
 
 ## Migrating Legacy Policy
 
