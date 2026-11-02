@@ -2595,7 +2595,7 @@ fn apply_ca_updates_authority_policy_only_and_removes_retired_principals() {
 
 #[cfg(unix)]
 #[test]
-fn apply_ca_accepts_disabled_proxy_x509() {
+fn apply_ca_accepts_a_retired_proxy_x509_row() {
     let (_dir, fixture) = exec_fixture();
     prepare_apply_ca(&fixture);
     add_proxy_x509_row(&fixture, "disabled");
@@ -9714,7 +9714,7 @@ fn apply_ca_removes_disabled_acme() {
 
 #[cfg(unix)]
 #[test]
-fn apply_ca_removes_only_disabled_acme_after_a_dry_run() {
+fn apply_ca_dry_run_reports_acme_removal_without_writing() {
     let (_dir, fixture) = exec_fixture();
     let ca_json = prepare_apply_ca(&fixture);
     add_live_acme(&ca_json, "grafhome-x509-ca-proxy");

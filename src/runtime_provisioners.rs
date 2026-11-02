@@ -136,8 +136,8 @@ fn is_x509_provisioner(item: &Value) -> bool {
 /// Every ACME provisioner goes, whatever its name or any `proxy_x509` policy
 /// row says: ACME is retired, and it has no name limit of its own, so any that
 /// survives keeps a rogue responder able to obtain a certificate `tlshd` would
-/// accept. Tombstoned
-/// X.509 provisioners go too, so restoring an old `ca.json` cannot revive them.
+/// accept. Tombstoned X.509 provisioners go too, so restoring an old `ca.json`
+/// cannot revive them.
 fn remove_retired_provisioners(
     model: &SiteModel,
     provisioners: &mut Vec<Value>,

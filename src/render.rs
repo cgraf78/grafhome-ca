@@ -534,7 +534,6 @@ fn provisioners_json(provisioners: &[Provisioner]) -> Result<String> {
         .iter()
         .filter(|entry| entry.status.is_active() && entry.role != PROVISIONER_ROLE_PROXY_X509)
     {
-        provisioner_claims(provisioner)?;
         let value = match provisioner.r#type.as_str() {
             "JWK" => json!(provisioner_placeholder(&provisioner.name)),
             other => {
