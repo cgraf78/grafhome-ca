@@ -159,42 +159,45 @@ enum Command {
         #[command(subcommand)]
         command: X509Command,
     },
+    // The variants below are internal dispatch targets, not CLI spellings:
+    // `ssh ...` normalizes into them so one handler serves each operation.
+    // `skip` keeps the parser from accepting the retired top-level forms.
     /// Approve a public enrollment request on the CA origin.
-    #[command(hide = true)]
+    #[command(skip)]
     Approve {
         #[command(subcommand)]
         command: ApproveCommand,
     },
     /// Enroll a host or user using a grant read from stdin by default.
-    #[command(hide = true)]
+    #[command(skip)]
     Enroll {
         #[command(subcommand)]
         command: EnrollCommand,
     },
     /// Renew a host or user SSH certificate.
-    #[command(hide = true)]
+    #[command(skip)]
     Renew {
         #[command(subcommand)]
         command: RenewCommand,
     },
     /// Disable future issuance and renewal for a host or user.
-    #[command(hide = true)]
+    #[command(skip)]
     Revoke {
         #[command(subcommand)]
         command: RevokeCommand,
     },
     /// Export or import public enrollment key inventory.
-    #[command(hide = true)]
+    #[command(skip)]
     Enrollment {
         #[command(subcommand)]
         command: EnrollmentCommand,
     },
     /// Report enrollment and local renewal readiness from live CA state.
-    #[command(hide = true)]
+    #[command(skip)]
     Status(StatusArgs),
 }
 
-/// Options shared by `ssh status` and its hidden legacy spelling `status`.
+/// Options for `ssh status`.
 #[derive(Debug, Args)]
 struct StatusArgs {
     /// Site config root containing config/ and policy/.
@@ -328,8 +331,8 @@ enum X509Command {
 }
 
 impl Command {
-    /// Rewrites `ssh ...` into the legacy command it aliases, so one handler
-    /// serves both spellings and they cannot drift apart.
+    /// Rewrites `ssh ...` into its internal dispatch variant, so each
+    /// operation keeps one handler.
     fn normalize(self) -> Self {
         let Command::Ssh { command } = self else {
             return self;
@@ -445,12 +448,14 @@ enum ApplyCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Reconcile this host's Grafhome-managed OpenSSH policy.
-    #[command(hide = true)]
+    /// Reconcile this host's Grafhome-managed OpenSSH policy. Internal
+    /// dispatch target for `ssh apply`; the retired `apply host` spelling is
+    /// not parsed.
+    #[command(skip)]
     Host(ApplyHostArgs),
 }
 
-/// Options shared by `ssh apply` and its hidden legacy spelling `apply host`.
+/// Options for `ssh apply`.
 #[derive(Debug, Args)]
 struct ApplyHostArgs {
     /// Site config root containing config/ and policy/.
@@ -817,7 +822,7 @@ fn run() -> grafhome_ca::Result<()> {
                     quiet,
                 }),
         } => {
-            let model = load_host_model(config_root, "apply host", true)?;
+            let model = load_host_model(config_root, "ssh apply", true)?;
             let host = resolve_host(host.as_deref())?;
             if if_enrolled && !local_renewal_ready(&model, None, Some(&host))? {
                 return Ok(());
@@ -834,7 +839,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_ca_mutation_model(config_root, "approve host")?;
+            let model = load_ca_mutation_model(config_root, "ssh approve host")?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -858,7 +863,7 @@ fn run() -> grafhome_ca::Result<()> {
                     restart,
                 },
         } => {
-            let model = load_host_model(config_root, "enroll host", !request_only)?;
+            let model = load_host_model(config_root, "ssh enroll host", !request_only)?;
             enroll_host_flow(
                 &model,
                 host.as_deref(),
@@ -877,7 +882,7 @@ fn run() -> grafhome_ca::Result<()> {
                     quiet,
                 },
         } => {
-            let model = load_host_model(config_root, "renew host", false)?;
+            let model = load_host_model(config_root, "ssh renew host", false)?;
             let host = resolve_host(host.as_deref())?;
             if if_enrolled && !local_renewal_ready(&model, None, Some(&host))? {
                 return Ok(());
@@ -931,7 +936,7 @@ fn run() -> grafhome_ca::Result<()> {
                     yes,
                 },
         } => {
-            let model = load_ca_mutation_model(config_root, "approve user")?;
+            let model = load_ca_mutation_model(config_root, "ssh approve user")?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -971,7 +976,7 @@ fn run() -> grafhome_ca::Result<()> {
                     reason,
                 },
         } => {
-            let model = load_ca_mutation_model(config_root, "revoke user")?;
+            let model = load_ca_mutation_model(config_root, "ssh revoke user")?;
             revoke_user(&model, &user, host.as_deref(), reason.as_deref())
         }
         Command::Revoke {
@@ -982,7 +987,7 @@ fn run() -> grafhome_ca::Result<()> {
                     reason,
                 },
         } => {
-            let model = load_ca_mutation_model(config_root, "revoke host")?;
+            let model = load_ca_mutation_model(config_root, "ssh revoke host")?;
             revoke_host(&model, &host, reason.as_deref())
         }
         Command::X509 {
@@ -1073,7 +1078,7 @@ fn run() -> grafhome_ca::Result<()> {
                     command: EnrollmentExportCommand::Host { config_root, host },
                 },
         } => {
-            let model = load_host_model(config_root, "enrollment export host", false)?;
+            let model = load_host_model(config_root, "ssh enrollment export host", false)?;
             let host = resolve_host(host.as_deref())?;
             let request = host_request_from_material(&model, &host)?;
             outln!(
@@ -1110,7 +1115,7 @@ fn run() -> grafhome_ca::Result<()> {
                     request_file,
                 },
         } => {
-            let model = load_ca_mutation_model(config_root, "enrollment import")?;
+            let model = load_ca_mutation_model(config_root, "ssh enrollment import")?;
             let mut stdin = std::io::stdin().lock();
             let text = read_document_or_file(
                 request_file.as_deref(),
@@ -2915,7 +2920,7 @@ fn import_enrollment(model: &SiteModel, text: &str) -> grafhome_ca::Result<()> {
     let (candidate, provisioner, ssh_public_key) = match &imported {
         ImportedEnrollment::Host(request) => {
             request.validate()?;
-            validate_explicit_host_identity("enrollment import host", &request.host)?;
+            validate_explicit_host_identity("ssh enrollment import host", &request.host)?;
             (
                 EnrollmentRecord::pending_host(request, &timestamp)?,
                 host_provisioner_name(&request.host),
@@ -2924,8 +2929,8 @@ fn import_enrollment(model: &SiteModel, text: &str) -> grafhome_ca::Result<()> {
         }
         ImportedEnrollment::User(request) => {
             request.validate()?;
-            validate_explicit_user_identity("enrollment import user", &request.user)?;
-            validate_explicit_host_identity("enrollment import client host", &request.host)?;
+            validate_explicit_user_identity("ssh enrollment import user", &request.user)?;
+            validate_explicit_host_identity("ssh enrollment import client host", &request.host)?;
             (
                 EnrollmentRecord::pending_user(request, &timestamp)?,
                 user_provisioner_name(&request.user, &request.host),
@@ -3368,15 +3373,15 @@ fn ensure_user_keys(
 }
 
 fn user_request_from_material(user_name: &str, host: &str) -> grafhome_ca::Result<UserRequest> {
-    validate_explicit_user_identity("enrollment export user", user_name)?;
-    validate_explicit_host_identity("enrollment export client host", host)?;
+    validate_explicit_user_identity("ssh enrollment export user", user_name)?;
+    validate_explicit_host_identity("ssh enrollment export client host", host)?;
     let public_key = user_public_key_path()?;
     let material_dir = user_client_material_dir(user_name, host)?;
     let public_jwk = material_dir.join("provisioner.pub.json");
     for path in [&public_key, &public_jwk] {
         if !path.is_file() {
             return Err(grafhome_ca::Error::Validation {
-                field: "enrollment export user".to_owned(),
+                field: "ssh enrollment export user".to_owned(),
                 message: format!("public enrollment material is missing: {}", path.display()),
             });
         }
@@ -3405,7 +3410,7 @@ fn require_user_restart_material(user_name: &str, host: &str) -> grafhome_ca::Re
     for path in [&private_key, &public_key, &private_jwk, &public_jwk] {
         if !path.is_file() {
             return Err(grafhome_ca::Error::Validation {
-                field: "enroll user --restart".to_owned(),
+                field: "ssh enroll user --restart".to_owned(),
                 message: format!(
                     "cannot restart because {} is missing; run ssh enroll user without --restart",
                     path.display()
@@ -3447,7 +3452,7 @@ fn validate_renewal_password(
 fn confirm_user_approval(request: &UserRequest) -> grafhome_ca::Result<()> {
     confirm_approval(
         &format!("{}@{}", request.user, request.host),
-        "approve user",
+        "ssh approve user",
     )
 }
 
@@ -3471,7 +3476,7 @@ fn require_effectively_infinite_confirmation(approved: bool) -> grafhome_ca::Res
         Ok(())
     } else {
         Err(grafhome_ca::Error::Validation {
-            field: "approve user".to_owned(),
+            field: "ssh approve user".to_owned(),
             message: "effectively-infinite certificate was not approved".to_owned(),
         })
     }
@@ -3495,7 +3500,7 @@ fn ssh_public_key_fingerprint(public_key: &str) -> grafhome_ca::Result<String> {
 }
 
 fn confirm_host_approval(request: &HostRequest) -> grafhome_ca::Result<()> {
-    confirm_approval(&request.host, "approve host")
+    confirm_approval(&request.host, "ssh approve host")
 }
 
 fn confirm_approval(identity: &str, command: &str) -> grafhome_ca::Result<()> {
@@ -3652,7 +3657,7 @@ fn approve_user_enrollment(
 ) -> grafhome_ca::Result<()> {
     request.validate()?;
     if let Some(ttl) = token_ttl {
-        checked_ttl("approve user.ttl", ttl)?;
+        checked_ttl("ssh approve user.ttl", ttl)?;
     }
     let public_jwk =
         serde_json::to_string(&request.renewal_public_jwk).expect("public renewal JWK serializes");
@@ -3738,11 +3743,14 @@ fn user_approval_cert_ttl(
         return Ok(STEP_EFFECTIVE_UNLIMITED_TTL.to_owned());
     }
 
-    let cert_ttl = checked_ttl("approve user.cert_ttl", cert_ttl.unwrap_or(&user.cert_ttl))?;
+    let cert_ttl = checked_ttl(
+        "ssh approve user.cert_ttl",
+        cert_ttl.unwrap_or(&user.cert_ttl),
+    )?;
     let renewal_max_ttl = model.policy.renewal_max_ttl(provisioner);
     if !duration_at_most(&cert_ttl, renewal_max_ttl) {
         return Err(grafhome_ca::Error::Validation {
-            field: "approve user.cert_ttl".to_owned(),
+            field: "ssh approve user.cert_ttl".to_owned(),
             message: format!(
                 "must not exceed renewal_max_ttl ({}) without --effectively-infinite",
                 renewal_max_ttl
@@ -3800,14 +3808,14 @@ fn host_request_from_material(
     model: &SiteModel,
     host_name: &str,
 ) -> grafhome_ca::Result<HostRequest> {
-    validate_explicit_host_identity("enrollment export host", host_name)?;
+    validate_explicit_host_identity("ssh enrollment export host", host_name)?;
     let material_dir = host_material_dir(model, host_name);
     let public_jwk = material_dir.join("provisioner.pub.json");
     let public_key = host_public_key_path(model);
     for path in [&public_key, &public_jwk] {
         if !path.is_file() {
             return Err(grafhome_ca::Error::Validation {
-                field: "enrollment export host".to_owned(),
+                field: "ssh enrollment export host".to_owned(),
                 message: format!("public enrollment material is missing: {}", path.display()),
             });
         }
@@ -3836,7 +3844,7 @@ fn require_host_restart_material(model: &SiteModel, host_name: &str) -> grafhome
     for path in [&public_key, &private_jwk, &public_jwk, &password_file] {
         if !path.is_file() {
             return Err(grafhome_ca::Error::Validation {
-                field: "enroll host --restart".to_owned(),
+                field: "ssh enroll host --restart".to_owned(),
                 message: format!(
                     "cannot restart because {} is missing; run ssh enroll host without --restart",
                     path.display()
@@ -3933,10 +3941,10 @@ fn approve_host_enrollment(
 ) -> grafhome_ca::Result<()> {
     request.validate()?;
     if let Some(ttl) = token_ttl {
-        checked_ttl("approve host.ttl", ttl)?;
+        checked_ttl("ssh approve host.ttl", ttl)?;
     }
     if let Some(ttl) = cert_ttl {
-        checked_ttl("approve host.cert_ttl", ttl)?;
+        checked_ttl("ssh approve host.cert_ttl", ttl)?;
     }
     required_host(model, &request.host)?;
     let public_jwk =
@@ -4583,7 +4591,7 @@ fn apply_host_policy_locked(
         let rollback = restore_host_policy_files(&previous)
             .and_then(|()| validate_and_reload_ssh(model, host_name, false, reload_server));
         return Err(grafhome_ca::Error::Validation {
-            field: "apply host".to_owned(),
+            field: "ssh apply".to_owned(),
             message: match rollback {
                 Ok(()) => format!("{error}; restored the previous host policy"),
                 Err(rollback_error) => {
@@ -5630,7 +5638,7 @@ fn revoke_user(
 ) -> grafhome_ca::Result<()> {
     if user_name.trim().is_empty() {
         return Err(grafhome_ca::Error::Validation {
-            field: "revoke user.user".to_owned(),
+            field: "ssh revoke user.user".to_owned(),
             message: "user must not be empty".to_owned(),
         });
     }
@@ -5690,7 +5698,7 @@ fn revoke_host(
 ) -> grafhome_ca::Result<()> {
     if host_name.trim().is_empty() {
         return Err(grafhome_ca::Error::Validation {
-            field: "revoke host.host".to_owned(),
+            field: "ssh revoke host.host".to_owned(),
             message: "host must not be empty".to_owned(),
         });
     }
@@ -6405,7 +6413,7 @@ fn renewal_already_running(scope: &str, silent: bool) -> grafhome_ca::Result<()>
         Ok(())
     } else {
         Err(grafhome_ca::Error::Validation {
-            field: format!("renew {scope}"),
+            field: format!("ssh renew {scope}"),
             message: "another renewal is already running".to_owned(),
         })
     }
@@ -7867,7 +7875,7 @@ revoked_at = "2026-07-24T20:14:15Z"
         let error = renewal_already_running("user", false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("renew user: another renewal is already running"));
+        assert!(error.contains("ssh renew user: another renewal is already running"));
     }
 
     #[test]

@@ -620,7 +620,7 @@ pub fn bind_existing_renewal_provisioner(
         != jwk_public_material(renewal_public_jwk, "imported renewal public JWK")?
     {
         return Err(Error::Validation {
-            field: "enrollment import".to_owned(),
+            field: "ssh enrollment import".to_owned(),
             message: format!("export does not match live provisioner {name}"),
         });
     }
@@ -639,7 +639,7 @@ pub fn bind_existing_renewal_provisioner(
         USER_CLIENT_X509_DENY_TEMPLATE
     } else {
         return Err(Error::Validation {
-            field: "enrollment import".to_owned(),
+            field: "ssh enrollment import".to_owned(),
             message: format!("provisioner {name} is not a Grafhome renewal provisioner"),
         });
     };
