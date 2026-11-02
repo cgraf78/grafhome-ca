@@ -27,8 +27,8 @@ const REQUIRED_KEYS: &[&str] = &[
     "GRAFHOME_CA_APACHE_CONF_AVAILABLE",
 ];
 
-/// Keys a deployment may omit. Sites leave them unset so older binaries, which
-/// reject unknown keys, keep loading the same file.
+/// Keys a deployment may omit. Binaries that predate a key reject it as
+/// unknown, so a site sets one only once every host runs a binary that knows it.
 ///
 /// `GRAFHOME_CA_PROXY_ACME_WEBROOT` is retired with ACME and ignored. It stays
 /// accepted because releases before the retirement require it, so a site keeps
