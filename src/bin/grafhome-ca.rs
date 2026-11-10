@@ -365,6 +365,16 @@ enum PolicyCommand {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Emit JSON describing whether local policy expects this host to hold an
+    /// SSH host certificate, and where that certificate lives.
+    HostCertificate {
+        /// Site config root containing config/ and policy/.
+        #[arg(long, value_name = "DIR")]
+        config_root: Option<PathBuf>,
+        /// Policy host; defaults to the same identity as host enrollment.
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 /// Machine-readable policy decision, distinct from live enrollment readiness.
@@ -373,6 +383,18 @@ struct UserEnrollmentPolicy {
     user: String,
     host: String,
     enabled: bool,
+}
+
+/// Machine-readable host certificate expectation for offline health checks.
+///
+/// Clients trust SSH servers only through the host CA, so a server whose
+/// certificate lapses becomes unreachable; this lets a monitor find and
+/// read the certificate without root, the CA, or enrollment secrets.
+#[derive(serde::Serialize)]
+struct HostCertificatePolicy {
+    host: String,
+    enabled: bool,
+    certificate: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -669,6 +691,30 @@ fn run() -> grafhome_ca::Result<()> {
             let decision = UserEnrollmentPolicy {
                 enabled: policy.user_enrollment_enabled(&user, &host),
                 user,
+                host,
+            };
+            outln!(
+                "{}",
+                serde_json::to_string(&decision).expect("policy decision serializes")
+            );
+            Ok(())
+        }
+        Command::Policy {
+            command: PolicyCommand::HostCertificate { config_root, host },
+        } => {
+            let root = resolve_config_root(config_root)?;
+            let mut model = load_valid_model_from_root(&root)?;
+            // Termux keeps host keys under $PREFIX rather than the configured
+            // system path, exactly as host enrollment and renewal see them.
+            localize_termux_host_model(&mut model)?;
+            let host = resolve_host(host.as_deref())?;
+            let decision = HostCertificatePolicy {
+                enabled: model
+                    .policy
+                    .hosts
+                    .iter()
+                    .any(|entry| entry.host == host && entry.has_ssh_role(SshRole::Server)),
+                certificate: host_cert_path(&model),
                 host,
             };
             outln!(

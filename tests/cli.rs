@@ -111,6 +111,108 @@ fn policy_user_enrollment_rejects_invalid_policy() {
         .stdout("");
 }
 
+fn host_certificate_query(root: &Path, host: &str) -> serde_json::Value {
+    let output = Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["policy", "host-certificate", "--config-root"])
+        .arg(root)
+        .args(["--host", host])
+        .env_remove("TERMUX_VERSION")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+#[test]
+fn policy_host_certificate_reports_server_certificate_offline() {
+    assert_eq!(
+        host_certificate_query(&example_config_root(), "edge-host"),
+        serde_json::json!({
+            "host": "edge-host",
+            "enabled": true,
+            "certificate": "/etc/ssh/ssh_host_ed25519_key-cert.pub"
+        })
+    );
+}
+
+#[test]
+fn policy_host_certificate_is_disabled_for_client_only_and_absent_hosts() {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    fs::write(
+        dir.path().join("policy/hosts/kiosk.toml"),
+        "ssh_roles = [\"client\"]\nprincipals = [\"kiosk\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        host_certificate_query(dir.path(), "kiosk")["enabled"],
+        false
+    );
+    assert_eq!(
+        host_certificate_query(dir.path(), "absent")["enabled"],
+        false
+    );
+}
+
+#[test]
+fn policy_host_certificate_accepts_legacy_policy() {
+    assert_eq!(
+        host_certificate_query(&legacy_config_root(), "laptop-a")["enabled"],
+        true
+    );
+}
+
+#[test]
+fn policy_host_certificate_uses_local_identity_override() {
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["policy", "host-certificate", "--config-root"])
+        .arg(example_config_root())
+        .env("GRAFHOME_CA_LOCAL_HOST", "edge-host")
+        .env_remove("TERMUX_VERSION")
+        .assert()
+        .success()
+        .stdout(
+            "{\"host\":\"edge-host\",\"enabled\":true,\
+             \"certificate\":\"/etc/ssh/ssh_host_ed25519_key-cert.pub\"}\n",
+        );
+}
+
+#[test]
+fn policy_host_certificate_derives_the_path_from_the_host_key() {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    let deployment = dir.path().join("config/deployment.env");
+    let text = fs::read_to_string(&deployment).unwrap().replace(
+        "GRAFHOME_CA_HOST_KEY_PATH=/etc/ssh/ssh_host_ed25519_key",
+        "GRAFHOME_CA_HOST_KEY_PATH=/srv/ssh/edge_host_key",
+    );
+    fs::write(&deployment, text).unwrap();
+    assert_eq!(
+        host_certificate_query(dir.path(), "edge-host")["certificate"],
+        "/srv/ssh/edge_host_key-cert.pub"
+    );
+}
+
+#[test]
+fn policy_host_certificate_rejects_invalid_policy() {
+    let dir = tempdir().unwrap();
+    copy_dir(&example_config_root(), dir.path());
+    fs::write(dir.path().join("policy/ca.toml"), "not TOML").unwrap();
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["policy", "host-certificate", "--config-root"])
+        .arg(dir.path())
+        .args(["--host", "edge-host"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("ca.toml"));
+}
+
 fn enrollment_with_status(status: &str) -> serde_json::Value {
     let dir = tempdir().unwrap();
     copy_dir(&example_config_root(), dir.path());

@@ -121,6 +121,16 @@ Invalid or missing policy exits unsuccessfully without a decision. The query
 does not contact the CA, invoke Smallstep, or read local enrollment credentials
 and certificates, making it suitable for offline health checks.
 
+`grafhome-ca policy host-certificate` emits `host`, a boolean `enabled` that is
+true when policy gives the host the SSH server role, and `certificate`, the
+host certificate path derived from `GRAFHOME_CA_HOST_KEY_PATH` (under
+`$PREFIX` on Termux). It uses the host enrollment default
+(`GRAFHOME_CA_LOCAL_HOST`, then the hostname) and accepts `--host` and
+`--config-root`. Because clients trust SSH servers only through the host CA,
+a server whose certificate lapses becomes unreachable; a monitor can use this
+query to find and read the public certificate without root or the CA. Exit
+behavior matches `user-enrollment`.
+
 Validate site policy and config from the default XDG location:
 
 ```sh
