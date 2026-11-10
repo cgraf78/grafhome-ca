@@ -279,7 +279,12 @@ fn exec_fixture() -> (tempfile::TempDir, ExecFixture) {
                 config_root
                     .join("policy/hosts")
                     .join(format!("{origin_host}.toml")),
-                format!("ssh_roles = []\nprincipals = [\"test-origin-{origin_host}\"]\n"),
+                // Host principals must be lowercase; runner hostnames
+                // (notably macOS) may not be.
+                format!(
+                    "ssh_roles = []\nprincipals = [\"test-origin-{}\"]\n",
+                    origin_host.to_ascii_lowercase()
+                ),
             )
             .unwrap();
         }
@@ -437,11 +442,16 @@ case "$1 $2" in
     printf 'signed %s\n' "$cert"
     ;;
   "ssh config")
-    if printf '%s\n' "$*" | grep -q -- '--host'; then
-      printf 'ssh-ed25519 AAAAhostca grafhome-host-ca\n'
-    else
-      printf 'ssh-ed25519 AAAAuserca grafhome-user-ca\n'
-    fi
+    # A shell pattern, not grep: Termux tests run with PATH limited to a
+    # prefix that has no grep, which would answer the host query with the
+    # user CA.
+    case " $* " in
+      *" --host "*)
+        [ "${FAKE_STEP_EMPTY_HOST_CA:-}" = "1" ] && exit 0
+        printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbBudFnaXXZ5XQffMctzK+GN2aeCm/Ke1QD1HFnlHK6 grafhome-host-ca\n'
+        ;;
+      *) printf 'ssh-ed25519 AAAAuserca grafhome-user-ca\n' ;;
+    esac
     ;;
   "crypto jwk")
     pub="$4"
@@ -1772,7 +1782,7 @@ fn real_sshd_and_client_refuse_revoked_keys_from_applied_policy() {
     let step = fs::read_to_string(fixture.fake_bin.join("step")).unwrap();
     let patched = step
         .replace(
-            r"printf 'ssh-ed25519 AAAAhostca grafhome-host-ca\n'",
+            r"printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbBudFnaXXZ5XQffMctzK+GN2aeCm/Ke1QD1HFnlHK6 grafhome-host-ca\n'",
             r#"cat "$FAKE_HOST_CA_PUB""#,
         )
         .replace(
@@ -2037,6 +2047,32 @@ fn apply_host_krl_generation_failure_writes_no_managed_files() {
     let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(log.contains("ssh-keygen args=-k"));
     assert!(!log.contains("sshd args=-t"));
+    assert!(!log.contains("systemctl args=reload"));
+}
+
+/// Clients trust site servers only through the host CA line, so an empty
+/// CA response must not install trust that would reject every server.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn apply_host_refuses_client_trust_without_a_host_ca_key() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install");
+    prepare_apply_host(&fixture);
+
+    apply_host_command(&fixture, &install_root)
+        .env("FAKE_STEP_EMPTY_HOST_CA", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("returned no SSH host CA key"));
+
+    let trust = install_root.join("etc/ssh/grafhome");
+    assert!(!trust.join("ssh_known_hosts").exists());
+    assert!(
+        !install_root
+            .join("etc/ssh/ssh_config.d/grafhome-ca.conf")
+            .exists()
+    );
+    let log = fs::read_to_string(&fixture.log).unwrap();
     assert!(!log.contains("systemctl args=reload"));
 }
 
@@ -4751,7 +4787,7 @@ fn export_writes_trust_bundle_and_manifest() {
     .unwrap();
     fs::write(
         ca_state.join("step/certs/ssh_host_ca_key.pub"),
-        "ssh-ed25519 AAAAhost grafhome-host-ca\n",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbBudFnaXXZ5XQffMctzK+GN2aeCm/Ke1QD1HFnlHK6 grafhome-host-ca\n",
     )
     .unwrap();
     fs::write(
@@ -4799,7 +4835,9 @@ fn export_writes_trust_bundle_and_manifest() {
     let known_hosts = fs::read_to_string(out_dir.join("ssh_known_hosts")).unwrap();
     assert!(known_hosts.contains("@cert-authority"));
     assert!(known_hosts.contains("ca-origin.example.test"));
-    assert!(known_hosts.contains("ssh-ed25519 AAAAhost"));
+    assert!(known_hosts.contains(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbBudFnaXXZ5XQffMctzK+GN2aeCm/Ke1QD1HFnlHK6"
+    ));
 
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("schemas/public/export-manifest.schema.json");
@@ -7021,6 +7059,75 @@ fn enroll_host_redacts_token_from_failed_step_error() {
         .failure()
         .stderr(predicate::str::contains("[REDACTED]"))
         .stderr(predicate::str::contains("sensitive-host-token").not());
+}
+
+/// Enrollment completion builds the same client trust as `ssh apply`, so it
+/// must refuse an empty host CA response before writing the client fragment.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn enroll_host_refuses_client_trust_without_a_host_ca_key() {
+    let (dir, fixture) = exec_fixture();
+    let install_root = dir.path().join("install-root");
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "ssh",
+            "enroll",
+            "host",
+            "--host",
+            "proxy-host",
+            "--request-only",
+        ])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .assert()
+        .success();
+
+    let grant = serde_json::json!({
+        "version": 1,
+        "kind": "grafhome-host-enrollment-grant",
+        "host": "proxy-host",
+        "ssh_public_key": VALID_SSH_KEY,
+        "renewal_public_jwk": {"kty":"OKP","crv":"Ed25519","x":"public"},
+        "ca_url": "https://ca.example.test",
+        "root_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "token": "host-token"
+    });
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args(["ssh", "enroll", "host", "--host", "proxy-host"])
+        .arg("--config-root")
+        .arg(&fixture.config_root)
+        .env("GRAFHOME_CA_INSTALL_ROOT", &install_root)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_STEP_EMPTY_HOST_CA", "1")
+        .write_stdin(format!("GRANT:{grant}\n"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("returned no SSH host CA key"));
+
+    // The guard runs before the grant is redeemed, so no certificate was
+    // issued and the grant can be retried once the CA answers correctly.
+    assert!(
+        !fs::read_to_string(&fixture.log)
+            .unwrap()
+            .contains("ssh certificate proxy-host")
+    );
+    assert!(!PathBuf::from(format!("{}-cert.pub", fixture.host_key.display())).exists());
+
+    assert!(
+        !install_root
+            .join("etc/ssh/grafhome/ssh_known_hosts")
+            .exists()
+    );
+    assert!(
+        !install_root
+            .join("etc/ssh/ssh_config.d/grafhome-ca.conf")
+            .exists()
+    );
 }
 
 #[cfg(unix)]

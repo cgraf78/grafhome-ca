@@ -780,9 +780,51 @@ device-bound OpenSSH files required for certificate operation, validates
   `user_ca_keys.pem` with the exported SSH user CA public key before certificate
   auth is expected to work.
 - Rendered SSH client fragments point at
-  `${GRAFHOME_CA_SSH_TRUST_DIR}/ssh_known_hosts`. Rollout must replace that
-  placeholder with the exported host-CA known-hosts file before host
-  certificates are expected to verify.
+  `${GRAFHOME_CA_SSH_TRUST_DIR}/ssh_known_hosts`, and rendering writes an
+  empty placeholder there. Because the fragment trusts managed servers only
+  through that file (next item), a client running it beside the empty
+  placeholder rejects every managed server. Install the populated host-CA
+  known-hosts file together with the fragment, never the fragment alone.
+  `ssh apply` and `ssh enroll host` do this and check the CA's keys first.
+- Rendered SSH client fragments also make every SSH server principal CA-only.
+  A `Match final host` block, built from the same principal list as the
+  `@cert-authority` line, sets `UserKnownHostsFile none`, limits
+  `GlobalKnownHostsFile` to the Grafhome trust file (so the system
+  `ssh_known_hosts` is ignored too), and sets `StrictHostKeyChecking yes`,
+  `VerifyHostKeyDNS no`, `KnownHostsCommand none`, and `UpdateHostKeys no`
+  for those names. A missing, expired, revoked, or misnamed host certificate
+  then fails the connection instead of falling back to a saved plain key, an
+  SSHFP record, or a prompt to save one. `final` evaluates the block after
+  `HostName` substitution and hostname canonicalization, so aliases whose
+  `HostName` is a principal are covered. Names that do not exactly match a
+  principal (another alias, a trailing dot) keep normal known-hosts checking.
+  Only host verification changes; user authentication is untouched.
+  - The fragment needs OpenSSH 8.5 or newer on every client
+    (`KnownHostsCommand`; `Match final` needs 8.0). Older clients reject an
+    unknown keyword and would fail every connection, not just managed ones.
+  - Host principals must be lowercase host names or addresses (`a-z`,
+    `0-9`, `.`, `-`, `_`, `:`, starting with a letter or digit). ssh
+    lowercases the name it dials but compares certificate principals
+    exactly, a comma, space, wildcard, or `!` would change which hosts an
+    OpenSSH pattern list trusts, and every host's principals also form the
+    CA's SSH host allowlist, where a wildcard would widen what it may issue.
+  - OpenSSH keeps the first value it obtains and reads `~/.ssh/config` before
+    `ssh_config.d`, so a user `Host` block that sets these options for a
+    managed name overrides this policy for that user.
+  - `ssh apply` and `ssh enroll host` refuse to install client trust when
+    the CA returns no SSH host CA key or a line that is not an OpenSSH public
+    key, because ssh skips unparsable lines and an empty trust file would
+    reject every managed server. Enroll a new server (`ssh enroll host`) before its principals
+    reach clients' policy; until then clients refuse to connect to it.
+  - To reach a host while its certificate is broken (for example to renew
+    it), override the policy for one connection after checking the key
+    fingerprint by another route: `ssh -o UserKnownHostsFile=~/.ssh/known_hosts
+    -o StrictHostKeyChecking=ask <host>`. Command-line options take
+    precedence over every config file, but `-o` does not reach a `ProxyJump`
+    hop. Repair a broken jump host by connecting to it directly, or carry the
+    override into the hop with `-o ProxyCommand='ssh -o
+    UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=ask -W
+    %h:%p <jump>'`.
 - Rendered sshd fragments include `HostCertificate` for the certificate derived
   from `GRAFHOME_CA_HOST_KEY_PATH`. `ssh enroll host` issues the initial host
   certificate before activating that fragment.

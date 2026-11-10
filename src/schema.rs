@@ -180,6 +180,85 @@ mod tests {
         crate::schema::validate_config_root(example_config_root()).expect("schema validation");
     }
 
+    /// Every schema that constrains host principals uses the same pattern as
+    /// policy validation, so editors, exports, and the CLI agree.
+    #[test]
+    fn host_principal_schemas_match_policy_validation() {
+        let pattern = crate::policy::HOST_PRINCIPAL_PATTERN;
+        for (name, text, pointer) in [
+            (
+                "host",
+                include_str!("../schemas/policy/host.schema.json"),
+                "/properties/principals/items/pattern",
+            ),
+            (
+                "legacy hosts",
+                include_str!("../schemas/policy/legacy/hosts.schema.json"),
+                "/properties/hosts/items/properties/principals/items/pattern",
+            ),
+            (
+                "export manifest",
+                include_str!("../schemas/public/export-manifest.schema.json"),
+                "/properties/host_principals/items/pattern",
+            ),
+        ] {
+            let schema: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                schema.pointer(pointer).and_then(serde_json::Value::as_str),
+                Some(pattern),
+                "{name} schema"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_rejects_host_principals_that_are_not_lowercase_names() {
+        for bad in ["Edge-Host", "edge,host", "*.example.test", "-edge"] {
+            let dir = tempdir().unwrap();
+            copy_dir(&example_config_root(), dir.path());
+            let host = dir.path().join("policy/hosts/edge-host.toml");
+            let text = fs::read_to_string(&host).unwrap().replace(
+                "principals = [\"edge-host\", \"edge-host.example.test\"]",
+                &format!("principals = [\"edge-host\", \"{bad}\"]"),
+            );
+            fs::write(&host, text).unwrap();
+
+            let error = crate::schema::validate_config_root(dir.path())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("policy/hosts/edge-host.toml"),
+                "{bad}: {error}"
+            );
+            assert!(error.contains(bad), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn schemas_apply_the_principal_rule_to_client_only_hosts() {
+        let dir = tempdir().unwrap();
+        copy_dir(&example_config_root(), dir.path());
+        fs::write(
+            dir.path().join("policy/hosts/kiosk.toml"),
+            "ssh_roles = [\"client\"]\nprincipals = [\"Kiosk\"]\n",
+        )
+        .unwrap();
+        let error = crate::schema::validate_config_root(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Kiosk"), "{error}");
+
+        let legacy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("schemas/policy/legacy/hosts.schema.json");
+        let document = serde_json::json!({"hosts": [{
+            "host": "kiosk",
+            "ssh_server": false,
+            "ssh_client": true,
+            "principals": ["Kiosk"],
+        }]});
+        assert!(crate::schema::validate(&legacy, &document).is_err());
+    }
+
     #[test]
     fn schema_rejects_unknown_toml_fields() {
         let dir = tempdir().unwrap();

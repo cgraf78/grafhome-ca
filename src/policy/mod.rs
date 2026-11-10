@@ -450,6 +450,24 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Sorted, deduplicated certificate principals of every SSH server host.
+    ///
+    /// Clients trust exactly these names through the host CA. The
+    /// `@cert-authority` known-hosts line and the client's CA-only trust block
+    /// both come from this list so the two cannot drift apart.
+    #[must_use]
+    pub fn ssh_server_principals(&self) -> Vec<String> {
+        let mut principals = self
+            .hosts
+            .iter()
+            .filter(|host| host.has_ssh_role(SshRole::Server))
+            .flat_map(|host| host.principals.iter().cloned())
+            .collect::<Vec<_>>();
+        principals.sort_unstable();
+        principals.dedup();
+        principals
+    }
+
     /// X.509 certificates declared by one host, in declaration order.
     #[must_use]
     pub fn x509_certs_for_host(&self, host: &str) -> Vec<&X509Cert> {
@@ -1001,6 +1019,23 @@ impl Policy {
         let mut certificate_principals = user_principals;
         for host in &self.hosts {
             for principal in &host.principals {
+                // Host principals reach step-ca's SSH host allowlist and host
+                // tokens for every enrolled host, and clients write server
+                // principals into comma-separated OpenSSH pattern lists (the
+                // `@cert-authority` line and `Match final host`). A wildcard
+                // would widen what the CA may issue, and a comma, space, or
+                // negation would change which hosts clients trust, so allow
+                // only host names and addresses.
+                if !is_host_principal(principal) {
+                    return Err(Error::Validation {
+                        field: host_policy_field(&host.host, "principals"),
+                        message: format!(
+                            "host principal {principal:?} must be a lowercase host name \
+                             or address (a-z, 0-9, '.', '-', '_', ':', starting with a \
+                             letter or digit)"
+                        ),
+                    });
+                }
                 if !certificate_principals.insert(principal.clone()) {
                     return Err(Error::Validation {
                         field: host_policy_field(&host.host, "principals"),
@@ -1460,6 +1495,32 @@ pub fn user_policy_field(user: &str, field: &str) -> String {
 pub fn host_policy_field(host: &str, field: &str) -> String {
     format!("{HOST_POLICY_DIR}/{host}.toml:{field}")
 }
+
+/// Return whether a host principal is a plain host name or address that is
+/// safe inside an OpenSSH comma-separated host pattern list.
+///
+/// Lowercase only: ssh lowercases the name it dials but compares certificate
+/// principals exactly, so an uppercase principal could never verify. The
+/// first character is a letter or digit so a principal never reads as an
+/// option or a relative path.
+///
+/// `schemas/policy/host.schema.json`, `schemas/policy/legacy/hosts.schema.json`,
+/// and `schemas/public/export-manifest.schema.json` carry the same rule as
+/// [`HOST_PRINCIPAL_PATTERN`]; a schema test keeps them aligned.
+fn is_host_principal(principal: &str) -> bool {
+    let mut bytes = principal.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'-' | b'_' | b':')
+        })
+}
+
+/// JSON Schema pattern equivalent to the host principal check in policy validation.
+pub const HOST_PRINCIPAL_PATTERN: &str = "^[a-z0-9][a-z0-9._:-]*$";
 
 fn reject_root_identity(table: &str, row_id: &str, field: &str, identity: &str) -> Result<()> {
     if identity == "root" {
@@ -2156,6 +2217,79 @@ revoked_at = "2026-07-24T20:14:15-07:00"
 
         let error = Policy::load(dir.path()).unwrap_err().to_string();
         assert!(error.contains("root SSH identities are not supported"));
+    }
+
+    #[test]
+    fn rejects_host_principals_that_are_not_plain_names() {
+        // Each of these would change an OpenSSH comma-separated pattern list:
+        // split it, add a wildcard, negate a name, or break the line.
+        for bad in [
+            "edge,other",
+            "edge host",
+            "*.example.test",
+            "edge?",
+            "!edge",
+            "edge\n",
+            "",
+            "Edge",
+            "-edge",
+            ".edge",
+        ] {
+            let (_dir, root) = copy_canonical_policy();
+            let host = root.join("policy/hosts/edge-host.toml");
+            let text = fs::read_to_string(&host).unwrap().replace(
+                "principals = [\"edge-host\", \"edge-host.example.test\"]",
+                &format!("principals = [\"edge-host\", {bad:?}]"),
+            );
+            fs::write(&host, text).unwrap();
+
+            let error = Policy::load(&root).unwrap_err().to_string();
+            assert!(
+                error.contains("policy/hosts/edge-host.toml:principals")
+                    && error.contains("must be a lowercase host name or address"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
+    /// Client-only hosts also enroll for host certificates, so their
+    /// principals reach step-ca's host allowlist and fall under the same rule.
+    #[test]
+    fn rejects_unsafe_principals_on_client_only_hosts() {
+        let (_dir, root) = copy_canonical_policy();
+        fs::write(
+            root.join("policy/hosts/kiosk.toml"),
+            "ssh_roles = [\"client\"]\nprincipals = [\"*.example.test\"]\n",
+        )
+        .unwrap();
+        let error = Policy::load(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("policy/hosts/kiosk.toml:principals"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn accepts_host_principals_that_are_names_or_addresses() {
+        let (_dir, root) = copy_canonical_policy();
+        let host = root.join("policy/hosts/edge-host.toml");
+        let text = fs::read_to_string(&host).unwrap().replace(
+            "principals = [\"edge-host\", \"edge-host.example.test\"]",
+            "principals = [\"edge-host\", \"edge-host.example.test\", \
+             \"edge_host.example.test\", \"192.0.2.10\", \"2001:db8::10\"]",
+        );
+        fs::write(&host, text).unwrap();
+
+        let policy = Policy::load(&root).unwrap();
+        let principals = policy.ssh_server_principals();
+        for expected in ["edge_host.example.test", "192.0.2.10", "2001:db8::10"] {
+            assert!(principals.iter().any(|p| p == expected), "{principals:?}");
+        }
+        // Sorted and free of duplicates, so every consumer renders one list.
+        let mut sorted = principals.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(principals, sorted);
     }
 
     #[test]

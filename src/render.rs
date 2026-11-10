@@ -424,6 +424,13 @@ fn variables(model: &SiteModel) -> Result<BTreeMap<String, String>> {
         ca_origin.address.clone(),
     );
     variables.insert(
+        "GRAFHOME_CA_SSH_CA_ONLY_HOSTS".to_owned(),
+        ca_only_host_block(
+            &model.policy.ssh_server_principals(),
+            &model.deployment.values["GRAFHOME_CA_SSH_TRUST_DIR"],
+        ),
+    );
+    variables.insert(
         "GRAFHOME_CA_HOST_CERT_PATH".to_owned(),
         format!("{}-cert.pub", variables["GRAFHOME_CA_HOST_KEY_PATH"]),
     );
@@ -667,6 +674,44 @@ fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedF
     Ok(files)
 }
 
+/// Client `ssh_config` block that makes every site SSH server CA-only.
+///
+/// Without it, a host whose certificate is expired, revoked, or does not name
+/// it still connects through any plain key in `~/.ssh/known_hosts` or
+/// `/etc/ssh/ssh_known_hosts`, and ssh offers to save one when none exists.
+/// For the policy's server principals the block therefore narrows host-key
+/// sources to the CA trust file alone (which holds only `@cert-authority`
+/// lines) and turns off the other ways ssh can accept a plain key: SSHFP DNS
+/// records and a known-hosts command.
+///
+/// `Match final host` is evaluated on ssh's last configuration pass, after
+/// `HostName` substitution and any hostname canonicalization, so an alias or
+/// short name that resolves to a principal is covered. Plain `Match host`
+/// would let a first pass for the short name pick up the `Host *`-style
+/// defaults, which then win because ssh keeps the first value it reads; the
+/// fragment's defaults are final-pass only for the same reason. Names outside
+/// the policy, such as raw addresses or unmanaged devices, keep normal
+/// known-hosts checking. With no SSH servers the block is omitted, since an
+/// empty `Match host` list is invalid.
+fn ca_only_host_block(principals: &[String], trust_dir: &str) -> String {
+    if principals.is_empty() {
+        return String::new();
+    }
+    format!(
+        "# Site SSH servers are trusted only through the host CA. Saved keys are\n\
+         # ignored, and a missing, expired, revoked, or misnamed host certificate\n\
+         # fails the connection instead of prompting to trust the key.\n\
+         Match final host {}\n    \
+         UserKnownHostsFile none\n    \
+         GlobalKnownHostsFile {trust_dir}/ssh_known_hosts\n    \
+         StrictHostKeyChecking yes\n    \
+         VerifyHostKeyDNS no\n    \
+         KnownHostsCommand none\n    \
+         UpdateHostKeys no\n",
+        principals.join(",")
+    )
+}
+
 fn render_template(template: &str, variables: &BTreeMap<String, String>) -> Result<String> {
     let mut rendered = template.to_owned();
     for (key, value) in variables {
@@ -853,8 +898,8 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use super::render;
-    use crate::policy::{RevokedSshKey, Status};
+    use super::{RenderedFile, render, render_template, variables};
+    use crate::policy::{RevokedSshKey, SshRole, Status};
 
     fn rendered_ca_origin_waiter() -> super::RenderedFile {
         let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
@@ -1192,6 +1237,210 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
                 .content
                 .contains("RevokedHostKeys /etc/ssh/grafhome/revoked_host_keys")
         );
+    }
+
+    fn client_fragment(files: &[RenderedFile], host: &str) -> String {
+        files
+            .iter()
+            .find(|file| {
+                file.path.ends_with(format!(
+                    "hosts/{host}/etc/ssh/ssh_config.d/grafhome-ca.conf"
+                ))
+            })
+            .unwrap()
+            .content
+            .clone()
+    }
+
+    #[test]
+    fn client_fragment_trusts_server_principals_only_through_the_ca() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let principals = model.policy.ssh_server_principals();
+        assert!(!principals.is_empty());
+
+        for host in model
+            .policy
+            .hosts
+            .iter()
+            .filter(|host| host.has_ssh_role(SshRole::Client))
+        {
+            let content = client_fragment(&files, &host.host);
+            let match_line = format!("Match final host {}\n", principals.join(","));
+            let block = content
+                .find(&match_line)
+                .unwrap_or_else(|| panic!("{} lacks {match_line:?}:\n{content}", host.host));
+            // ssh keeps the first value it reads, so the CA-only settings must
+            // come before the final-pass defaults that name ~/.ssh/known_hosts.
+            let defaults = content.find("Match final\n").unwrap();
+            assert!(block < defaults, "{content}");
+            let settings = &content[block..defaults];
+            for setting in [
+                "    UserKnownHostsFile none\n",
+                "    GlobalKnownHostsFile /etc/ssh/grafhome/ssh_known_hosts\n",
+                "    StrictHostKeyChecking yes\n",
+                "    VerifyHostKeyDNS no\n",
+                "    KnownHostsCommand none\n",
+                "    UpdateHostKeys no\n",
+            ] {
+                assert!(
+                    settings.contains(setting),
+                    "{setting:?} missing:\n{content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn client_only_hosts_are_not_trusted_as_servers() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.policy.hosts.push(crate::policy::Host {
+            host: "kiosk".to_owned(),
+            ssh_roles: [SshRole::Client].into_iter().collect(),
+            principals: vec!["kiosk".to_owned(), "kiosk.example.test".to_owned()],
+        });
+        let principals = model.policy.ssh_server_principals();
+        assert!(!principals.iter().any(|name| name.starts_with("kiosk")));
+
+        // The client-only host still receives the fragment, but no client
+        // trusts its names as a server.
+        let files = render(&model).unwrap();
+        let content = client_fragment(&files, "kiosk");
+        let match_line = content
+            .lines()
+            .find(|line| line.starts_with("Match final host "))
+            .unwrap();
+        assert_eq!(
+            match_line,
+            format!("Match final host {}", principals.join(","))
+        );
+        assert!(!match_line.contains("kiosk"), "{match_line}");
+    }
+
+    #[test]
+    fn client_fragment_omits_the_ca_only_block_without_servers() {
+        assert_eq!(super::ca_only_host_block(&[], "/etc/ssh/grafhome"), "");
+
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        for host in &mut model.policy.hosts {
+            host.ssh_roles.remove(&SshRole::Server);
+        }
+        let template = include_str!("../templates/ssh_config.d/grafhome-ca.conf.template");
+        let content = render_template(template, &variables(&model).unwrap()).unwrap();
+        assert!(!content.contains("UserKnownHostsFile none"), "{content}");
+        assert!(content.contains("Match final\n"), "{content}");
+        assert!(!content.contains("Match final host"), "{content}");
+    }
+
+    /// Prove the rendered block changes what OpenSSH itself resolves, not just
+    /// the text: managed names (typed directly or reached through a HostName
+    /// alias) become CA-only, while other names keep the user's known_hosts.
+    #[test]
+    fn openssh_applies_the_ca_only_block_to_managed_names_only() {
+        let Ok(output) = std::process::Command::new("ssh").arg("-V").output() else {
+            eprintln!("skipping: ssh is not installed");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("skipping: ssh -V failed");
+            return;
+        }
+        // The fragment needs OpenSSH 8.5 (`KnownHostsCommand`); older clients
+        // reject it outright, which the README documents as the minimum.
+        let banner = String::from_utf8_lossy(&output.stderr);
+        let version = banner.strip_prefix("OpenSSH_").and_then(|rest| {
+            let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+            Some((
+                parts.next()?.parse::<u32>().ok()?,
+                parts.next()?.parse::<u32>().ok()?,
+            ))
+        });
+        if version.is_none_or(|version| version < (8, 5)) {
+            eprintln!("skipping: needs OpenSSH 8.5 or newer, found {banner}");
+            return;
+        }
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let principal = model.policy.ssh_server_principals()[0].clone();
+        let client = model
+            .policy
+            .hosts
+            .iter()
+            .find(|host| host.has_ssh_role(SshRole::Client))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("ssh_config");
+        // A user config sets HostName before the system fragment is read, as
+        // ~/.ssh/config does before /etc/ssh/ssh_config.d in real use.
+        std::fs::write(
+            &config,
+            format!(
+                "Host short-alias\n    HostName {principal}\n\n{}",
+                client_fragment(&files, &client.host)
+            ),
+        )
+        .unwrap();
+        let resolve_with = |options: &[&str], name: &str| {
+            let output = std::process::Command::new("ssh")
+                .arg("-G")
+                .arg("-F")
+                .arg(&config)
+                .args(options)
+                .arg(name)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            let value = |key: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(&format!("{key} ")))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            [
+                "userknownhostsfile",
+                "globalknownhostsfile",
+                "stricthostkeychecking",
+                "verifyhostkeydns",
+                "knownhostscommand",
+                "updatehostkeys",
+            ]
+            .map(value)
+        };
+        let resolve = |name: &str| resolve_with(&[], name);
+
+        for managed in [principal.as_str(), "short-alias"] {
+            let [user, global, strict, dns, command, update] = resolve(managed);
+            assert_eq!(user, "none", "{managed}");
+            // Only the CA trust file: a plain key in /etc/ssh/ssh_known_hosts
+            // would otherwise reopen the fallback.
+            assert_eq!(global, "/etc/ssh/grafhome/ssh_known_hosts", "{managed}");
+            assert_eq!(strict, "true", "{managed}");
+            assert_eq!(dns, "false", "{managed}");
+            assert!(
+                command.is_empty() || command == "none",
+                "{managed}: {command}"
+            );
+            assert_eq!(update, "false", "{managed}");
+        }
+        let [user, global, strict, ..] = resolve("unmanaged.example.test");
+        assert!(user.ends_with("/.ssh/known_hosts"), "{user}");
+        assert!(global.starts_with("/etc/ssh/ssh_known_hosts "), "{global}");
+        assert_ne!(strict, "true");
+
+        // The documented escape hatch: command-line options beat every config
+        // file, restoring saved-key checking for one connection.
+        let [user, _, strict, ..] = resolve_with(
+            &[
+                "-o",
+                "UserKnownHostsFile=~/.ssh/known_hosts",
+                "-o",
+                "StrictHostKeyChecking=ask",
+            ],
+            &principal,
+        );
+        assert!(user.ends_with("/.ssh/known_hosts"), "{user}");
+        assert_eq!(strict, "ask");
     }
 
     #[test]

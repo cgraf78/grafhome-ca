@@ -4338,8 +4338,11 @@ fn complete_host_enrollment(model: &SiteModel, grant: &HostGrant) -> grafhome_ca
         &grant.ca_url,
         &grant.root_fingerprint,
     )?;
-    enroll_host(model, &grant.host, &grant.token)?;
+    // Build the trust files before redeeming the one-time grant: they need
+    // only the bootstrapped CA trust, and a CA response the client-trust
+    // guard rejects must fail with the grant still unused and nothing issued.
     let mut desired = desired_host_ssh_files(model, &grant.host, &grant.ca_url)?;
+    enroll_host(model, &grant.host, &grant.token)?;
     with_host_policy_lock(model, &grant.host, || {
         compile_host_krls(model, &mut desired)?;
         apply_host_policy_locked(model, &grant.host, &desired, true, true)
@@ -4418,7 +4421,7 @@ fn desired_host_ssh_files(
     } else {
         String::new()
     };
-    let known_hosts = known_hosts_from_roots(model, &host_ca_keys);
+    let known_hosts = client_known_hosts(model, host, &host_ca_keys)?;
     let mut desired = BTreeMap::new();
     for file in grafhome_ca::render::render(model)? {
         let Some(target) = rendered_host_target(&file.path, host_name) else {
@@ -5178,22 +5181,46 @@ fn rendered_host_target(path: &Path, expected_host: &str) -> Option<String> {
     ))
 }
 
-fn known_hosts_from_roots(model: &SiteModel, roots: &str) -> String {
-    let mut principals = model
-        .policy
-        .hosts
-        .iter()
-        .filter(|host| host.has_ssh_role(SshRole::Server))
-        .flat_map(|host| host.principals.iter().map(String::as_str))
-        .collect::<Vec<_>>();
-    principals.sort_unstable();
-    principals.dedup();
-    roots
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|key| format!("@cert-authority {} {key}\n", principals.join(",")))
-        .collect()
+/// Build this host's known-hosts file, refusing client trust without a key.
+///
+/// The client fragment trusts site servers only through this file, so
+/// installing it without a CA line would make every managed server fail
+/// verification. Callers run this before writing anything, and enrollment
+/// before redeeming its grant. Hosts without the client
+/// role, and sites without SSH servers, need no host CA key.
+fn client_known_hosts(model: &SiteModel, host: &Host, roots: &str) -> grafhome_ca::Result<String> {
+    let known_hosts = known_hosts_from_roots(model, roots)?;
+    if host.has_ssh_role(SshRole::Client)
+        && !model.policy.ssh_server_principals().is_empty()
+        && known_hosts.is_empty()
+    {
+        return Err(grafhome_ca::Error::Validation {
+            field: "step ssh config --host --roots".to_owned(),
+            message: "the CA returned no SSH host CA key; refusing to install client trust \
+                      that would reject every managed server"
+                .to_owned(),
+        });
+    }
+    Ok(known_hosts)
+}
+
+/// Build the client known-hosts file from the CA's SSH host CA keys.
+///
+/// Clients trust site servers only through these lines, and ssh silently skips
+/// a line it cannot parse, so a banner, comment, or truncated key would leave
+/// a file that looks populated but rejects every managed server. Every line
+/// must therefore parse as an OpenSSH public key.
+fn known_hosts_from_roots(model: &SiteModel, roots: &str) -> grafhome_ca::Result<String> {
+    let principals = model.policy.ssh_server_principals().join(",");
+    let mut known_hosts = String::new();
+    for key in roots.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        ssh_key::PublicKey::from_openssh(key).map_err(|_| grafhome_ca::Error::Validation {
+            field: "step ssh config --host --roots".to_owned(),
+            message: "the CA returned a line that is not an OpenSSH public key".to_owned(),
+        })?;
+        known_hosts.push_str(&format!("@cert-authority {principals} {key}\n"));
+    }
+    Ok(known_hosts)
 }
 
 fn install_target(target: &str) -> PathBuf {
@@ -7443,9 +7470,9 @@ mod tests {
     use super::managed_directory_metadata_for_uid;
     use super::{
         CA_REACHABILITY_TIMEOUT, Endpoint, ExistingIdentityChoice, NoncanonicalTerminalMode,
-        TermuxHostRuntime, effectively_infinite_warning, endpoint_reachable_with,
-        hostnames_match_origin, managed_directory_metadata, normalize_regular_file_mode,
-        parse_enrollment_document, prepare_existing_user_identity,
+        TermuxHostRuntime, client_known_hosts, effectively_infinite_warning,
+        endpoint_reachable_with, hostnames_match_origin, managed_directory_metadata,
+        normalize_regular_file_mode, parse_enrollment_document, prepare_existing_user_identity,
         prepare_revocation_policy_update, read_app_private_credential, read_interactive_document,
         read_terminal_document, renewal_already_running, require_effectively_infinite_confirmation,
         scratch_root_from, ssh_public_keys_match, store_app_private_credential, try_renewal_lock,
@@ -7453,6 +7480,104 @@ mod tests {
     };
 
     const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
+
+    const HOST_CA_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbBudFnaXXZ5XQffMctzK+GN2aeCm/Ke1QD1HFnlHK6";
+
+    fn example_model() -> (tempfile::TempDir, grafhome_ca::model::SiteModel) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("grafhome-ca");
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/site-config"),
+            &root,
+        );
+        fs::write(root.join("policy/revocations.toml"), "format_version = 1\n").unwrap();
+        let model = grafhome_ca::model::SiteModel::load(&root).unwrap();
+        (dir, model)
+    }
+
+    fn host_with_roles(
+        model: &grafhome_ca::model::SiteModel,
+        roles: &[grafhome_ca::policy::SshRole],
+    ) -> grafhome_ca::policy::Host {
+        let mut host = model.policy.hosts[0].clone();
+        host.ssh_roles = roles.iter().copied().collect();
+        host
+    }
+
+    #[test]
+    fn client_known_hosts_trusts_each_ca_key_for_every_server_principal() {
+        use grafhome_ca::policy::SshRole;
+        let (_dir, model) = example_model();
+        let client = host_with_roles(&model, &[SshRole::Client]);
+        let known_hosts =
+            client_known_hosts(&model, &client, &format!("{HOST_CA_KEY}\n\n")).unwrap();
+        assert_eq!(
+            known_hosts,
+            format!(
+                "@cert-authority {} {HOST_CA_KEY}\n",
+                model.policy.ssh_server_principals().join(",")
+            )
+        );
+    }
+
+    /// ssh skips unparsable known-hosts lines, so these would install trust
+    /// that looks populated but rejects every managed server.
+    #[test]
+    fn client_known_hosts_rejects_ca_output_that_is_not_a_key() {
+        use grafhome_ca::policy::SshRole;
+        let (_dir, model) = example_model();
+        let client = host_with_roles(&model, &[SshRole::Client]);
+        for roots in [
+            "# host CA keys\n".to_owned(),
+            "ssh-ed25519\n".to_owned(),
+            "ssh-ed25519 AAAAhostca grafhome-host-ca\n".to_owned(),
+            format!("{HOST_CA_KEY}\nWarning: banner\n"),
+        ] {
+            let error = client_known_hosts(&model, &client, &roots)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not an OpenSSH public key"),
+                "{roots:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_known_hosts_refuses_client_trust_without_a_key() {
+        use grafhome_ca::policy::SshRole;
+        let (_dir, model) = example_model();
+        let client = host_with_roles(&model, &[SshRole::Client]);
+        for roots in ["", " \n\t\n"] {
+            let error = client_known_hosts(&model, &client, roots)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("returned no SSH host CA key"),
+                "{roots:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_known_hosts_needs_no_key_for_server_only_hosts() {
+        use grafhome_ca::policy::SshRole;
+        let (_dir, model) = example_model();
+        let server = host_with_roles(&model, &[SshRole::Server]);
+        assert_eq!(client_known_hosts(&model, &server, "").unwrap(), "");
+    }
+
+    #[test]
+    fn client_known_hosts_needs_no_key_without_ssh_servers() {
+        use grafhome_ca::policy::SshRole;
+        let (_dir, mut model) = example_model();
+        for host in &mut model.policy.hosts {
+            host.ssh_roles.remove(&SshRole::Server);
+        }
+        let client = host_with_roles(&model, &[SshRole::Client]);
+        assert_eq!(client_known_hosts(&model, &client, "").unwrap(), "");
+    }
 
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         fs::create_dir_all(to).unwrap();
