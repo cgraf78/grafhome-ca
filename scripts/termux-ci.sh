@@ -271,7 +271,7 @@ case "$1 $2" in
     ;;
   'ssh config')
     case " $* " in
-      *' --host '*) printf '%s\n' 'ssh-ed25519 AAAAhostca grafhome-host-ca' ;;
+      *' --host '*) printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJbBudFnaXXZ5XQffMctzK+GN2aeCm/Ke1QD1HFnlHK6 grafhome-host-ca' ;;
       *) printf '%s\n' 'ssh-ed25519 AAAAuserca grafhome-user-ca' ;;
     esac
     ;;

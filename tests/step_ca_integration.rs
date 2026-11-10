@@ -472,7 +472,12 @@ fn prepare_integration_config(
                 config_root
                     .join("policy/hosts")
                     .join(format!("{local_host}.toml")),
-                format!("ssh_roles = []\nprincipals = [\"test-origin-{local_host}\"]\n"),
+                // Host principals must be lowercase; runner hostnames
+                // (notably macOS) may not be.
+                format!(
+                    "ssh_roles = []\nprincipals = [\"test-origin-{}\"]\n",
+                    local_host.to_ascii_lowercase()
+                ),
             )
             .unwrap();
         }

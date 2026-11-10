@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::executable::root_step_bin;
 use crate::model::SiteModel;
-use crate::policy::{ENDPOINT_ROLE_CA_API, Host, SshRole, ca_policy_field};
+use crate::policy::{ENDPOINT_ROLE_CA_API, ca_policy_field};
 use crate::render::RenderedFile;
 
 const ROOT_CERT: &str = "root_ca.crt";
@@ -68,7 +68,7 @@ pub fn collect(model: &SiteModel) -> Result<Vec<RenderedFile>> {
     let user_ca_key = read_public_key(&ca_cert_path(model, SSH_USER_CA_KEY))?;
     let root_cert = read_public_text(&root_cert_path)?;
     let root_fingerprint = root_fingerprint(model, &root_cert_path)?;
-    let host_principals = host_principals(&model.policy.hosts);
+    let host_principals = model.policy.ssh_server_principals();
     let known_hosts = known_hosts_line(&host_principals, &host_ca_key)?;
     let manifest = PublicMaterialManifest {
         ca_url,
@@ -169,20 +169,6 @@ fn root_fingerprint(model: &SiteModel, root_cert_path: &Path) -> Result<String> 
         });
     }
     Ok(fingerprint)
-}
-
-fn host_principals(hosts: &[Host]) -> Vec<String> {
-    let mut principals = hosts
-        .iter()
-        .filter(|host| host.has_ssh_role(SshRole::Server))
-        .flat_map(|host| host.principals.iter().map(String::as_str))
-        .map(str::trim)
-        .filter(|principal| !principal.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    principals.sort();
-    principals.dedup();
-    principals
 }
 
 fn known_hosts_line(principals: &[String], host_ca_key: &str) -> Result<String> {
