@@ -978,13 +978,26 @@ fn macos_user_renew_command(fixture: &ExecFixture, home: &Path) -> Command {
     command
 }
 
+/// Point `ca_api` at a loopback port nothing listens on.
 #[cfg(unix)]
 fn configure_unreachable_ca(fixture: &ExecFixture) {
+    set_ca_api_port(fixture, 1);
+}
+
+/// Point the `ca_api` name, which the reachability probe resolves, at a
+/// loopback port. The policy address stays on its unroutable example value:
+/// renewal never connects to it, so the probe must not either.
+#[cfg(unix)]
+fn set_ca_api_port(fixture: &ExecFixture, port: u16) {
     let path = fixture.config_root.join("policy/ca.toml");
-    let text = fs::read_to_string(&path).unwrap();
-    let text = text
-        .replacen("address = \"198.51.100.21\"", "address = \"127.0.0.1\"", 1)
-        .replacen("port = 443", "port = 1", 1);
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replacen(
+            "dns_name = \"ca.example.test\"",
+            "dns_name = \"localhost\"",
+            1,
+        )
+        .replacen("port = 443", &format!("port = {port}"), 1);
     fs::write(path, text).unwrap();
 }
 
@@ -7737,6 +7750,46 @@ fn renew_user_if_reachable_silently_skips_offline_ca() {
 
 #[cfg(unix)]
 #[test]
+fn renew_user_if_reachable_probes_ca_name_not_policy_address() {
+    // Off site, the policy address is unroutable while the CA name renewal
+    // uses still resolves to a live endpoint; renewal must proceed.
+    let (dir, fixture) = exec_fixture();
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/id_ed25519-cert.pub"), "cert\n").unwrap();
+    let ca = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    set_ca_api_port(&fixture, ca.local_addr().unwrap().port());
+
+    Command::cargo_bin("grafhome-ca")
+        .unwrap()
+        .args([
+            "ssh",
+            "renew",
+            "user",
+            "--user",
+            "alice",
+            "--host",
+            "ca-host",
+            "--if-reachable",
+            "--quiet",
+            "--config-root",
+        ])
+        .arg(&fixture.config_root)
+        .env("HOME", &home)
+        .env("PATH", prepend_path(&fixture.fake_bin))
+        .env("FAKE_LOG", &fixture.log)
+        .env("FAKE_CERT_FRESH", "1")
+        .assert()
+        .success()
+        .stderr("");
+
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("ssh needs-renewal"));
+    assert!(!log.contains("ca token"));
+}
+
+#[cfg(unix)]
+#[test]
 fn quiet_renew_user_reports_redacted_renewal_failures() {
     let (dir, fixture) = exec_fixture();
     let home = dir.path().join("home");
@@ -10404,12 +10457,18 @@ fn open_ca_origin(fixture: &ExecFixture) -> std::net::TcpListener {
     listener
 }
 
+/// Point the `ca_origin` name at a loopback port, leaving its unroutable
+/// policy address alone as `set_ca_api_port` does.
 #[cfg(unix)]
 fn set_ca_origin_port(fixture: &ExecFixture, port: u16) {
     let path = fixture.config_root.join("policy/ca.toml");
     let text = fs::read_to_string(&path)
         .unwrap()
-        .replacen("address = \"198.51.100.20\"", "address = \"127.0.0.1\"", 1)
+        .replacen(
+            "dns_name = \"ca-origin.example.test\"",
+            "dns_name = \"localhost\"",
+            1,
+        )
         .replacen("port = 8443", &format!("port = {port}"), 1);
     fs::write(path, text).unwrap();
 }
@@ -10856,23 +10915,14 @@ fn if_reachable_uses_certificate_endpoint() {
         .success();
     assert_eq!(sign_count(&fixture), 1);
     let port = origin.local_addr().unwrap().port();
-    assert!(fake_log(&fixture).contains(&format!("https://ca-origin.example.test:{port}")));
+    assert!(fake_log(&fixture).contains(&format!("https://localhost:{port}")));
 
     // Only `ca_api` is up, so this one must see its own endpoint as down.
     let (_dir, fixture, cert_dir) = enrolled_x509();
     seed_certificate(&cert_dir, hours(1));
     close_ca_origin(&fixture);
     let api = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let path = fixture.config_root.join("policy/ca.toml");
-    let text = fs::read_to_string(&path)
-        .unwrap()
-        .replacen("address = \"198.51.100.21\"", "address = \"127.0.0.1\"", 1)
-        .replacen(
-            "port = 443",
-            &format!("port = {}", api.local_addr().unwrap().port()),
-            1,
-        );
-    fs::write(path, text).unwrap();
+    set_ca_api_port(&fixture, api.local_addr().unwrap().port());
     renew_x509(&fixture, &["--if-reachable", "--quiet"])
         .assert()
         .success();

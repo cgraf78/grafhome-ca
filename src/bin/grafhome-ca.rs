@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{BufRead, IsTerminal, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -2315,41 +2315,59 @@ fn ca_api_reachable(model: &SiteModel) -> grafhome_ca::Result<bool> {
 }
 
 fn endpoint_reachable(endpoint: &Endpoint) -> grafhome_ca::Result<bool> {
-    endpoint_reachable_with(endpoint, |address, timeout| {
-        TcpStream::connect_timeout(address, timeout).map(drop)
-    })
+    endpoint_reachable_with(
+        endpoint,
+        |name, port| (name, port).to_socket_addrs().map(Iterator::collect),
+        |address, timeout| TcpStream::connect_timeout(address, timeout).map(drop),
+    )
 }
 
+/// Probe what renewal connects to: `dns_name` on the endpoint port, resolved
+/// like `--ca-url`. The policy `address` is the on-site address, so probing it
+/// off site would test a path renewal never takes.
+///
+/// An unresolvable name or a "no path" connect failure is an outage. Other
+/// local socket errors stay visible unless another address reports an outage.
 fn endpoint_reachable_with(
     endpoint: &Endpoint,
-    connect: impl FnOnce(&SocketAddr, Duration) -> std::io::Result<()>,
+    resolve: impl FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> std::io::Result<()>,
 ) -> grafhome_ca::Result<bool> {
-    let address =
-        endpoint
-            .address
-            .parse::<IpAddr>()
-            .map_err(|error| grafhome_ca::Error::Validation {
-                field: ca_policy_field("endpoints", &endpoint.role, "address"),
-                message: format!("invalid IP address {}: {error}", endpoint.address),
-            })?;
-    let address = SocketAddr::new(address, endpoint.port);
-    match connect(&address, CA_REACHABILITY_TIMEOUT) {
-        Ok(()) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::HostUnreachable
-                    | std::io::ErrorKind::NetworkUnreachable
-            ) =>
-        {
-            Ok(false)
+    let Ok(candidates) = resolve(&endpoint.dns_name, endpoint.port) else {
+        return Ok(false);
+    };
+    let mut offline = false;
+    let mut failure = None;
+    for candidate in &candidates {
+        match connect(candidate, CA_REACHABILITY_TIMEOUT) {
+            Ok(()) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::NetworkUnreachable
+                ) =>
+            {
+                offline = true;
+            }
+            Err(source) => {
+                failure.get_or_insert_with(|| {
+                    grafhome_ca::Error::io(
+                        format!(
+                            "CA reachability probe {}:{} at {candidate}",
+                            endpoint.dns_name, endpoint.port
+                        ),
+                        source,
+                    )
+                });
+            }
         }
-        Err(source) => Err(grafhome_ca::Error::io(
-            format!("CA reachability probe {address}"),
-            source,
-        )),
+    }
+    match failure {
+        Some(error) if !offline => Err(error),
+        _ => Ok(false),
     }
 }
 
@@ -7890,54 +7908,122 @@ revoked_at = "2026-07-24T20:14:15Z"
         }
     }
 
+    /// The private on-site address in policy, which the probe must not use.
+    const POLICY_ADDRESS: &str = "192.0.2.21";
+    const PUBLIC_V6: &str = "[2001:db8::21]:8443";
+    const PUBLIC_V4: &str = "203.0.113.21:8443";
+
+    fn socket(address: &str) -> SocketAddr {
+        address.parse().unwrap()
+    }
+
+    /// Public DNS for an off-site client: the name resolves away from the
+    /// policy address, IPv6 first.
+    fn resolves_publicly(name: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        assert_eq!((name, port), ("ca.example.test", 8443));
+        Ok(vec![socket(PUBLIC_V6), socket(PUBLIC_V4)])
+    }
+
+    fn reachable_with_public_dns(
+        connect: impl FnMut(&SocketAddr, Duration) -> std::io::Result<()>,
+    ) -> grafhome_ca::Result<bool> {
+        endpoint_reachable_with(&test_endpoint(POLICY_ADDRESS), resolves_publicly, connect)
+    }
+
     #[test]
-    fn reachability_uses_configured_address_and_bounded_timeout() {
-        let reachable =
-            endpoint_reachable_with(&test_endpoint("192.0.2.21"), |address, timeout| {
-                assert_eq!(address, &"192.0.2.21:8443".parse::<SocketAddr>().unwrap());
-                assert_eq!(timeout, CA_REACHABILITY_TIMEOUT);
-                Ok(())
+    fn reachability_probes_dns_name_with_bounded_timeout_not_policy_address() {
+        let mut attempts = Vec::new();
+        let reachable = reachable_with_public_dns(|address, timeout| {
+            assert_eq!(timeout, CA_REACHABILITY_TIMEOUT);
+            attempts.push(*address);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(reachable);
+        assert_eq!(attempts, [socket(PUBLIC_V6)]);
+    }
+
+    #[test]
+    fn reachability_tries_each_resolved_address() {
+        // A filtered flow (EINTR) or a family without a usable source address
+        // (EADDRNOTAVAIL) on one address must not hide another that works.
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::TimedOut,
+        ] {
+            let mut attempts = Vec::new();
+            let reachable = reachable_with_public_dns(|address, _| {
+                attempts.push(*address);
+                if address == &socket(PUBLIC_V4) {
+                    Ok(())
+                } else {
+                    Err(Error::from(kind))
+                }
             })
             .unwrap();
 
-        assert!(reachable);
+            assert!(reachable, "{kind:?}");
+            assert_eq!(attempts, [socket(PUBLIC_V6), socket(PUBLIC_V4)], "{kind:?}");
+        }
     }
 
     #[test]
     fn reachability_treats_connect_failure_as_offline() {
-        let reachable = endpoint_reachable_with(&test_endpoint("192.0.2.21"), |_, _| {
-            Err(Error::new(ErrorKind::TimedOut, "offline"))
-        })
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+        ] {
+            let reachable = reachable_with_public_dns(|_, _| Err(Error::from(kind))).unwrap();
+
+            assert!(!reachable, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn reachability_treats_unresolvable_name_as_offline() {
+        let reachable = endpoint_reachable_with(
+            &test_endpoint(POLICY_ADDRESS),
+            |_, _| Err(Error::other("failed to lookup address information")),
+            |_, _| panic!("nothing to connect to"),
+        )
+        .unwrap();
+
+        assert!(!reachable);
+
+        let reachable = endpoint_reachable_with(
+            &test_endpoint(POLICY_ADDRESS),
+            |_, _| Ok(Vec::new()),
+            |_, _| panic!("nothing to connect to"),
+        )
         .unwrap();
 
         assert!(!reachable);
     }
 
     #[test]
-    fn reachability_rejects_invalid_policy_address() {
-        let error = endpoint_reachable_with(&test_endpoint("not-an-ip"), |_, _| Ok(()))
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("policy/ca.toml:endpoints.ca_api.address"));
-        assert!(error.contains("invalid IP address"));
-    }
-
-    #[test]
     fn reachability_reports_unexpected_local_socket_error() {
-        let error = endpoint_reachable_with(&test_endpoint("192.0.2.21"), |_, _| {
-            Err(Error::new(ErrorKind::PermissionDenied, "blocked locally"))
+        let error = reachable_with_public_dns(|address, _| {
+            Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("blocked {address}"),
+            ))
         })
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("CA reachability probe 192.0.2.21:8443"));
-        assert!(error.contains("blocked locally"));
+        assert!(
+            error.contains("CA reachability probe ca.example.test:8443 at [2001:db8::21]:8443")
+        );
+        assert!(error.contains("blocked [2001:db8::21]:8443"));
     }
 
     #[test]
     fn reachability_reports_local_address_exhaustion() {
-        let error = endpoint_reachable_with(&test_endpoint("192.0.2.21"), |_, _| {
+        let error = reachable_with_public_dns(|_, _| {
             Err(Error::new(
                 ErrorKind::AddrNotAvailable,
                 "no local address available",
@@ -7946,8 +8032,22 @@ revoked_at = "2026-07-24T20:14:15Z"
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("CA reachability probe 192.0.2.21:8443"));
+        assert!(error.contains("CA reachability probe ca.example.test:8443"));
         assert!(error.contains("no local address available"));
+    }
+
+    #[test]
+    fn reachability_lets_an_outage_answer_explain_local_errors() {
+        let reachable = reachable_with_public_dns(|address, _| {
+            if address == &socket(PUBLIC_V4) {
+                Err(Error::new(ErrorKind::ConnectionRefused, "CA down"))
+            } else {
+                Err(Error::new(ErrorKind::AddrNotAvailable, "no IPv6 source"))
+            }
+        })
+        .unwrap();
+
+        assert!(!reachable);
     }
 
     #[test]
