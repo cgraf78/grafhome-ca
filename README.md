@@ -496,11 +496,14 @@ system OpenSSH host or as the app owner on Termux, and
 `grafhome-ca ssh renew user --if-enrolled --if-reachable --quiet` as the enrolled
 user. Both commands infer the local identity, skip fresh certificates, and
 return successfully without output when enrollment or local renewal material
-is absent. `--if-reachable` also skips while a short TCP connection to the
-configured CA address cannot be established; configuration, trust, and renewal
-errors remain visible. An advisory per-scope lock prevents overlapping renewal
-runs. `grafhome-ca` installs no schedule; run these hourly from cron or a
-systemd timer. User enrollment
+is absent. `--if-reachable` also skips while the DNS name renewal connects to
+does not resolve or none of its addresses accepts a short TCP connection. The
+probe never uses the endpoint's policy `address`, so a client away from the
+site network follows the same name as renewal. Unexpected local socket errors
+remain visible unless another resolved address reported an outage;
+configuration, trust, and renewal errors always do. An advisory per-scope
+lock prevents overlapping renewal runs. `grafhome-ca` installs no schedule;
+run these hourly from cron or a systemd timer. User enrollment
 stores the password in macOS Keychain on macOS. On Linux it uses an encrypted
 systemd credential and also stores the password in Secret Service when
 available. It first attempts a user-scoped credential, supported by systemd 256
