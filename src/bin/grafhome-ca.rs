@@ -6898,10 +6898,7 @@ fn try_store_secret_service(user: &str, host: &str, password: &str) -> bool {
     let Ok(output) = child.wait_with_output() else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
-    true
+    output.status.success()
 }
 
 #[cfg(target_os = "macos")]
