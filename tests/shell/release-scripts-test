@@ -70,14 +70,39 @@ for entry in "${RELEASE_PAYLOAD_DIRS[@]}"; do
   [[ -d "$repo_root/$entry" ]] && scan_dirs+=("$repo_root/$entry")
 done
 
-if [[ "${#scan_dirs[@]}" -gt 0 ]]; then
-  while IFS= read -r candidate; do
+scratch=$(mktemp -d) || fail "cannot create release test scratch directory"
+trap 'rm -rf -- "$scratch"' EXIT
+
+check_payload_files() {
+  local candidate inventory="$scratch/payload.list"
+  # A failed traversal can emit a valid-looking partial inventory. Do not read
+  # any paths until find has confirmed it enumerated the complete payload.
+  find "$@" -type f -print0 >"$inventory" ||
+    fail "cannot enumerate files in packaged payload"
+  while IFS= read -r -d '' candidate; do
     case "$candidate" in
       *.key | *.pem | *_key | *.p12 | *.pfx | *id_ed25519 | *id_rsa)
         fail "key-shaped file inside a packaged tree: ${candidate#"$repo_root/"}"
         ;;
     esac
-  done < <(find "${scan_dirs[@]}" -type f)
+  done <"$inventory"
+}
+
+if [[ "${#scan_dirs[@]}" -gt 0 ]]; then
+  check_payload_files "${scan_dirs[@]}"
+  if scan_error=$(
+    # Simulate partial output independently of the runner's permissions.
+    # This is a synthetic filename, with no corresponding material on disk.
+    find() {
+      printf '%s\0' "$repo_root/examples/incomplete-fixture.key"
+      return 37
+    }
+    check_payload_files "${scan_dirs[@]}" 2>&1
+  ); then
+    fail "the payload check accepted an incomplete traversal"
+  fi
+  [[ "$scan_error" == *'cannot enumerate files in packaged payload'* ]] ||
+    fail "the payload check inspected an incomplete traversal: $scan_error"
 fi
 
 # --- Smoke hook -------------------------------------------------------------
@@ -89,8 +114,7 @@ declare -F release_smoke_check >/dev/null ||
   fail "release-smoke-hook.sh must define release_smoke_check"
 
 # The hook must exercise the bin/ layout, and a failing binary must fail smoke.
-hook_fake=$(mktemp -d)
-trap 'rm -rf "$hook_fake"' EXIT
+hook_fake=$scratch/smoke
 mkdir -p "$hook_fake/bin"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$hook_fake/bin/grafhome-ca"
 chmod +x "$hook_fake/bin/grafhome-ca"
