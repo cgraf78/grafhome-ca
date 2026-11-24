@@ -1,5 +1,9 @@
+use std::collections::HashSet;
 use std::process::Command;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn output(command: &mut Command) -> Option<String> {
     let output = command.output().ok()?;
@@ -38,19 +42,93 @@ fn valid_version(value: &str) -> bool {
         && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Track the checkout's HEAD and the branch storage it points to.
 fn watch_git_head() {
-    if let Some(path) = output(Command::new("git").args(["rev-parse", "--git-path", "HEAD"])) {
-        println!("cargo:rerun-if-changed={path}");
-    }
-    if let Some(reference) = output(Command::new("git").args(["symbolic-ref", "-q", "HEAD"])) {
-        if let Some(path) =
-            output(Command::new("git").args(["rev-parse", "--git-path", &reference]))
-        {
-            println!("cargo:rerun-if-changed={path}");
-        }
+    let Some(head) = git_path("HEAD").filter(|path| path.is_file()) else {
+        watch_git_head_without_git();
+        return;
+    };
+    println!("cargo:rerun-if-changed={}", head.display());
+    if git_output(&["rev-parse", "--show-ref-format"]).as_deref() == Some("reftable") {
+        watch_reftable();
         return;
     }
+    // Git before 2.39 can still report the leaf ref recursively.
+    let Some(mut reference) =
+        symbolic_target("HEAD").or_else(|| git_output(&["symbolic-ref", "--quiet", "HEAD"]))
+    else {
+        return;
+    };
 
+    // Git resolves the shared branch and packed refs correctly in linked worktrees.
+    if let Some(packed) = git_path("packed-refs").filter(|path| path.is_file()) {
+        println!("cargo:rerun-if-changed={}", packed.display());
+    }
+    let mut visited = HashSet::new();
+    while visited.insert(reference.clone()) {
+        let Some(loose) = git_path(&reference) else {
+            return;
+        };
+        // A packed-only branch gets a loose ref on its next update. Watch the
+        // containing directory until then, since Cargo always reruns on missing paths.
+        if let Some(existing) = loose.ancestors().find(|path| path.exists()) {
+            println!("cargo:rerun-if-changed={}", existing.display());
+        }
+        let Some(target) = symbolic_target(&reference) else {
+            break;
+        };
+        reference = target;
+    }
+}
+
+/// Follow one hop so retargeting an intermediate symbolic branch triggers a build.
+fn symbolic_target(reference: &str) -> Option<String> {
+    git_output(&["symbolic-ref", "--quiet", "--no-recurse", reference])
+}
+
+/// Reftable stores branch refs in the common index and linked HEADs in a local index.
+fn watch_reftable() {
+    const INDEX: &str = "reftable/tables.list";
+    let local = git_path(INDEX).filter(|path| path.is_file());
+    if let Some(path) = &local {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    if let Some(common) = git_output(&["rev-parse", "--git-common-dir"])
+        .map(|directory| PathBuf::from(directory).join(INDEX))
+        .filter(|path| path.is_file() && Some(path) != local.as_ref())
+    {
+        println!("cargo:rerun-if-changed={}", common.display());
+    }
+}
+
+fn git_path(path: &str) -> Option<PathBuf> {
+    git_output(&["rev-parse", "--git-path", path]).map(PathBuf::from)
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    output(git_command().args(args))
+}
+
+/// Keep shell-based tool launchers from sourcing the caller's startup files.
+fn tool_command(name: &str) -> Command {
+    let mut command = Command::new(name);
+    command.env_remove("BASH_ENV").env_remove("ENV");
+    command
+}
+
+/// Keep Git discovery scoped to the build checkout.
+fn git_command() -> Command {
+    let mut command = tool_command("git");
+    // Cargo runs in the crate root. An exported snapshot must use its own
+    // explicit commit or the existing fallback, independent of its parent.
+    if !Path::new(".git").exists() {
+        command.env("GIT_DIR", ".git");
+    }
+    command
+}
+
+/// Retain the existing filesystem fallback for builds that cannot query Git.
+fn watch_git_head_without_git() {
     let git_path = Path::new(".git");
     let head_path = if git_path.is_dir() {
         git_path.join("HEAD")
@@ -85,7 +163,7 @@ fn commit() -> String {
     std::env::var("GRAFHOME_CA_BUILD_COMMIT")
         .ok()
         .or_else(|| std::env::var("GITHUB_SHA").ok())
-        .or_else(|| output(Command::new("git").args(["rev-parse", "HEAD"])))
+        .or_else(|| git_output(&["rev-parse", "HEAD"]))
         .filter(|value| valid_commit(value))
         .unwrap_or_else(|| "00000000".to_owned())
 }
@@ -126,14 +204,14 @@ fn timestamp(commit: &str) -> String {
         return value;
     }
 
-    output(Command::new("git").env("TZ", "UTC").args([
+    output(git_command().env("TZ", "UTC").args([
         "show",
         "-s",
         "--date=format-local:%Y%m%d-%H%M%S",
         "--format=%cd",
         commit,
     ]))
-    .or_else(|| output(Command::new("date").args(["-u", "+%Y%m%d-%H%M%S"])))
+    .or_else(|| output(tool_command("date").args(["-u", "+%Y%m%d-%H%M%S"])))
     .filter(|value| valid_timestamp(value))
     .unwrap_or_else(|| "19700101-000000".to_owned())
 }
