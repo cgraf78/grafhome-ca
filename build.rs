@@ -119,6 +119,26 @@ fn tool_command(name: &str) -> Command {
 /// Keep Git discovery scoped to the build checkout.
 fn git_command() -> Command {
     let mut command = tool_command("git");
+    // Git hooks and wrappers can export metadata for a different checkout.
+    // Clear repository selectors before reading HEAD, storage paths, or timestamps.
+    // Keep command configuration so callers can explicitly trust a checkout with
+    // safe.directory, including when the build runs under a different account.
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    ] {
+        command.env_remove(name);
+    }
     // Cargo runs in the crate root. An exported snapshot must use its own
     // explicit commit or the existing fallback, independent of its parent.
     if !Path::new(".git").exists() {
