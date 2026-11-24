@@ -21,7 +21,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fa46009e947ced9ab40dfa59049ae2d725f97480
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@7cc897229a80517e83f09acf989f2da5889961ad
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -118,7 +118,7 @@ jobs:
         test -f "$install_root/data/cgraf78/grafhome-ca/schemas/policy/revocations.schema.json"
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fa46009e947ced9ab40dfa59049ae2d725f97480
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@7cc897229a80517e83f09acf989f2da5889961ad
     with:
       matrix-set: full
       profiles: base
@@ -147,7 +147,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@fa46009e947ced9ab40dfa59049ae2d725f97480
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@7cc897229a80517e83f09acf989f2da5889961ad
 
   # These jobs exercise grafhome-ca product behavior against real OpenSSH and
   # Smallstep packages. They remain caller-owned because putting product
@@ -167,7 +167,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: cgraf78/actions/.github/actions/rust-toolchain@fa46009e947ced9ab40dfa59049ae2d725f97480
+        uses: cgraf78/actions/.github/actions/rust-toolchain@7cc897229a80517e83f09acf989f2da5889961ad
 
       - name: Install OpenSSH server
         shell: bash
@@ -198,7 +198,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: cgraf78/actions/.github/actions/rust-toolchain@fa46009e947ced9ab40dfa59049ae2d725f97480
+        uses: cgraf78/actions/.github/actions/rust-toolchain@7cc897229a80517e83f09acf989f2da5889961ad
 
       - name: Install Smallstep packages
         shell: bash
