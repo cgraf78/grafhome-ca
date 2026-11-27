@@ -620,8 +620,17 @@ fn provisioner_object_secret_name(name: &str) -> String {
     format!("GRAFHOME_CA_PROVISIONER_{suffix}_JSON")
 }
 
+/// Principal name mapped to its optional sshd principal options.
+type PrincipalLines = BTreeMap<String, Option<String>>;
+
 fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedFile>> {
-    let mut by_account = BTreeMap::<String, Vec<String>>::new();
+    // A single explicit principals file serves every account, so merge them
+    // into one map instead of one per Unix account.
+    let single_file = model
+        .deployment
+        .values
+        .get("GRAFHOME_CA_AUTH_PRINCIPALS_FILE");
+    let mut by_account = BTreeMap::<String, PrincipalLines>::new();
     for access in model
         .policy
         .active_ssh_access()
@@ -634,31 +643,40 @@ fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedF
                 field: host_policy_field(&access.host, "user_access"),
                 message: "missing policy user".to_owned(),
             })?;
-        by_account
-            .entry(access.unix_account.clone())
-            .or_default()
-            .push(user.principal.clone());
+        let account = if single_file.is_some() {
+            String::new()
+        } else {
+            access.unix_account.clone()
+        };
+        let options = access.principal_options();
+        let lines = by_account.entry(account).or_default();
+        // sshd accepts a certificate on the first line naming its principal,
+        // so two option sets for one principal would silently pick one.
+        if let Some(existing) = lines.get(&user.principal)
+            && *existing != options
+        {
+            return Err(Error::Validation {
+                field: host_policy_field(&access.host, "user_access"),
+                message: format!(
+                    "principal {} renders with conflicting login restrictions",
+                    user.principal
+                ),
+            });
+        }
+        lines.insert(user.principal.clone(), options);
     }
 
-    if let Some(path) = model
-        .deployment
-        .values
-        .get("GRAFHOME_CA_AUTH_PRINCIPALS_FILE")
-    {
-        let mut principals = by_account.into_values().flatten().collect::<Vec<_>>();
-        principals.sort();
-        principals.dedup();
+    if let Some(path) = single_file {
+        let lines = by_account.into_values().next().unwrap_or_default();
         return Ok(vec![RenderedFile {
             path: host_path(&host.host, path)?,
             mode: 0o644,
-            content: format!("{}\n", principals.join("\n")),
+            content: principal_file_content(&lines),
         }]);
     }
 
     let mut files = Vec::new();
-    for (account, mut principals) in by_account {
-        principals.sort();
-        principals.dedup();
+    for (account, lines) in by_account {
         files.push(RenderedFile {
             path: host_path(
                 &host.host,
@@ -668,10 +686,26 @@ fn authorized_principals(model: &SiteModel, host: &Host) -> Result<Vec<RenderedF
                 )?,
             )?,
             mode: 0o644,
-            content: format!("{}\n", principals.join("\n")),
+            content: principal_file_content(&lines),
         });
     }
     Ok(files)
+}
+
+/// Render `AuthorizedPrincipalsFile` lines, prefixing options when present.
+fn principal_file_content(lines: &PrincipalLines) -> String {
+    // Keep the historical single blank line for an empty file so existing
+    // hosts see no spurious rendered diff.
+    if lines.is_empty() {
+        return "\n".to_owned();
+    }
+    lines
+        .iter()
+        .map(|(principal, options)| match options {
+            Some(options) => format!("{options} {principal}\n"),
+            None => format!("{principal}\n"),
+        })
+        .collect()
 }
 
 /// Client `ssh_config` block that makes every site SSH server CA-only.
@@ -1450,12 +1484,88 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
 
         let files = render(&model).unwrap();
 
-        assert!(files.iter().all(|file| {
-            !file
-                .path
-                .to_string_lossy()
-                .contains("/auth_principals/alice")
+        // Other users may still map to the alice account, so check that no
+        // principals line names the disabled user rather than file absence.
+        let principal_files = files
+            .iter()
+            .filter(|file| file.path.to_string_lossy().contains("/auth_principals/"))
+            .collect::<Vec<_>>();
+        assert!(!principal_files.is_empty());
+        assert!(principal_files.iter().all(|file| {
+            file.content
+                .lines()
+                .all(|line| line.rsplit(' ').next() != Some("alice"))
         }));
+    }
+
+    #[test]
+    fn restricted_logins_render_principal_options() {
+        let model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        let files = render(&model).unwrap();
+        let edge = files
+            .iter()
+            .find(|file| {
+                file.path == std::path::Path::new("hosts/edge-host/etc/ssh/auth_principals/alice")
+            })
+            .unwrap();
+
+        assert_eq!(
+            edge.content,
+            "alice\nfrom=\"192.0.2.20\",restrict,pty console\n"
+        );
+        // Unrestricted hosts keep their historical bare-name format.
+        let ca = files
+            .iter()
+            .find(|file| {
+                file.path == std::path::Path::new("hosts/ca-host/etc/ssh/auth_principals/alice")
+            })
+            .unwrap();
+        assert_eq!(ca.content, "alice\n");
+    }
+
+    #[test]
+    fn single_principals_file_keeps_restricted_options() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.deployment.values.insert(
+            "GRAFHOME_CA_AUTH_PRINCIPALS_FILE".to_owned(),
+            "/data/ssh/authorized_principals".to_owned(),
+        );
+        let files = render(&model).unwrap();
+        let file = files
+            .iter()
+            .find(|file| {
+                file.path == std::path::Path::new("hosts/edge-host/data/ssh/authorized_principals")
+            })
+            .unwrap();
+
+        assert_eq!(
+            file.content,
+            "alice\nfrom=\"192.0.2.20\",restrict,pty console\n"
+        );
+    }
+
+    #[test]
+    fn conflicting_restrictions_for_one_principal_are_rejected() {
+        let mut model = crate::model::SiteModel::load(crate::example_config_root()).unwrap();
+        model.deployment.values.insert(
+            "GRAFHOME_CA_AUTH_PRINCIPALS_FILE".to_owned(),
+            "/data/ssh/authorized_principals".to_owned(),
+        );
+        // A second account for the same user differs only in restrictions;
+        // the merged single file cannot express both.
+        let mut extra = model
+            .policy
+            .user_remotes
+            .iter()
+            .find(|login| login.user == "console")
+            .unwrap()
+            .clone();
+        extra.unix_account = "builder".to_owned();
+        extra.restrict_session = false;
+        model.policy.user_remotes.push(extra);
+
+        let error = render(&model).unwrap_err().to_string();
+        assert!(error.contains("conflicting login restrictions"), "{error}");
     }
 
     #[test]
@@ -1585,7 +1695,7 @@ printf '%s\n' '2: br-test    inet 198.51.100.20/24 scope global br-test'
 
         assert_eq!(
             value["authority"]["policy"]["ssh"]["user"]["allow"]["principal"],
-            serde_json::json!(["alice"])
+            serde_json::json!(["alice", "console"])
         );
         assert_eq!(
             value["authority"]["policy"]["ssh"]["host"]["allow"]["dns"],

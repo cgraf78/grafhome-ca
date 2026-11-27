@@ -140,6 +140,10 @@ struct LoginPolicy {
     unix_account: String,
     #[serde(default, skip_serializing_if = "Status::is_active")]
     status: Status,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restrict_session: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -339,6 +343,8 @@ pub fn load(root: &Path) -> Result<Policy> {
                 unix_account: login.unix_account,
                 allow_ssh: true,
                 status: login.status,
+                source_addresses: login.source_addresses,
+                restrict_session: login.restrict_session,
             }));
         }
     }
@@ -488,6 +494,8 @@ pub(super) fn canonical_files(policy: &Policy) -> Result<Vec<CanonicalFile>> {
                 .push(LoginPolicy {
                     unix_account: login.unix_account.clone(),
                     status,
+                    source_addresses: login.source_addresses.clone(),
+                    restrict_session: login.restrict_session,
                 });
         }
         let document = HostDocument {

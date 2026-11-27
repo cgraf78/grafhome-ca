@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::{
     Host, LEGACY_ENDPOINTS_PATH, LEGACY_HOSTS_PATH, LEGACY_PROVISIONERS_PATH,
     LEGACY_USER_CLIENTS_PATH, LEGACY_USER_REMOTES_PATH, Policy, SshRole, USERS_POLICY_PATH, User,
-    read_toml, read_typed_document,
+    UserRemote, read_toml, read_typed_document,
 };
 use crate::error::{Error, Result};
 
@@ -49,7 +49,20 @@ pub(super) fn load(root: &Path) -> Result<Policy> {
     let users: UsersDocument = read_document(root.join(USERS_POLICY_PATH))?;
     let provisioners = read_array(root.join(LEGACY_PROVISIONERS_PATH), "provisioners")?;
     let user_clients = read_array(root.join(LEGACY_USER_CLIENTS_PATH), "user_clients")?;
-    let user_remotes = read_array(root.join(LEGACY_USER_REMOTES_PATH), "user_remotes")?;
+    let user_remotes: Vec<UserRemote> =
+        read_array(root.join(LEGACY_USER_REMOTES_PATH), "user_remotes")?;
+    // Login restrictions exist only in the canonical format. The shared
+    // `UserRemote` type would otherwise accept them here, out of step with the
+    // frozen legacy schema; migrate to canonical policy to use them.
+    if let Some(remote) = user_remotes
+        .iter()
+        .find(|remote| !remote.source_addresses.is_empty() || remote.restrict_session)
+    {
+        return Err(Error::Validation {
+            field: format!("{LEGACY_USER_REMOTES_PATH}:{}", remote.user),
+            message: "login restrictions require the canonical policy format".to_owned(),
+        });
+    }
     Ok(Policy {
         root: root.to_path_buf(),
         endpoints,
