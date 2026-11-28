@@ -2604,6 +2604,7 @@ revoked_at = "2026-07-24T20:14:15-07:00"
             "2001:db8::1",
             "2001:db8::/32",
             "0.0.0.0/0",
+            "::/0",
         ] {
             let mut policy = Policy::load(crate::example_config_root()).unwrap();
             console_login(&mut policy).source_addresses = vec![source.to_owned()];
@@ -2643,7 +2644,15 @@ revoked_at = "2026-07-24T20:14:15-07:00"
 
     #[test]
     fn login_source_blocks_with_host_bits_are_rejected() {
-        for source in ["192.0.2.1/24", "2001:db8::1/32", "198.51.100.128/24"] {
+        // A zero-length prefix keeps every bit as host bits, so only the
+        // all-zero address forms a valid /0 (sshd rejects 10.0.0.0/0).
+        for source in [
+            "192.0.2.1/24",
+            "2001:db8::1/32",
+            "198.51.100.128/24",
+            "10.0.0.0/0",
+            "2001:db8::/0",
+        ] {
             let mut policy = Policy::load(crate::example_config_root()).unwrap();
             console_login(&mut policy).source_addresses = vec![source.to_owned()];
             let error = policy.validate().unwrap_err().to_string();

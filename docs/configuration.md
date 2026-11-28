@@ -223,10 +223,11 @@ restrict_session = true
 
 `source_addresses` lists literal client IP addresses or CIDR network addresses
 and renders an sshd `from=` option, so a stolen key and certificate cannot log
-in from anywhere else. Host names, wildcards, negations, blocks with host bits
-set, IPv4-mapped addresses, and IPv6 link-local addresses are rejected: they
-depend on reverse DNS, invert intent, or can never match the address sshd
-compares. `restrict_session = true` renders `restrict,pty`: shells, commands,
+in from anywhere else. Host names, wildcards, and negations are rejected
+because they depend on reverse DNS or invert intent. Blocks with host bits set
+are rejected because sshd refuses the whole list, locking the login out from
+every source. IPv4-mapped and IPv6 link-local addresses are rejected because
+they never match the normalized address sshd compares. `restrict_session = true` renders `restrict,pty`: shells, commands,
 and SFTP keep working, while port, agent, X11, and stream-local forwarding and
 `~/.ssh/rc` are refused. The rendered principals line becomes
 `from="192.0.2.20",restrict,pty console`; unrestricted logins keep the bare
