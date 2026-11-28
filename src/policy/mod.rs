@@ -305,6 +305,102 @@ pub struct UserRemote {
     pub allow_ssh: bool,
     /// Policy status.
     pub status: Status,
+    /// Literal client IP addresses or CIDR blocks that may use this login.
+    ///
+    /// Empty means any source. Rendered as an sshd `from=` principal option,
+    /// so a stolen key and certificate cannot log in from anywhere else. This
+    /// holds only while the account has no other key path (for example
+    /// `AuthorizedKeysFile none`), and it does not contain code that already
+    /// runs on an allowed source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_addresses: Vec<String>,
+    /// Whether sshd-level forwarding is refused for the login.
+    ///
+    /// Rendered as `restrict,pty`: sshd refuses port, agent, X11, and
+    /// stream-local forwarding and skips `~/.ssh/rc`, while shells, commands,
+    /// and the SFTP subsystem keep working. A shell can still open its own
+    /// connections, so this narrows features rather than confining the user.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restrict_session: bool,
+}
+
+impl UserRemote {
+    /// Authorized-principals options for this login, if it is restricted.
+    ///
+    /// Callers must validate `source_addresses` first; validation guarantees
+    /// that no value can break out of the quoted `from=` list.
+    #[must_use]
+    pub fn principal_options(&self) -> Option<String> {
+        let mut options = Vec::new();
+        if !self.source_addresses.is_empty() {
+            options.push(format!("from=\"{}\"", self.source_addresses.join(",")));
+        }
+        if self.restrict_session {
+            options.push("restrict,pty".to_owned());
+        }
+        (!options.is_empty()).then(|| options.join(","))
+    }
+}
+
+/// Validate one login source as a literal IP address or CIDR block.
+///
+/// sshd's `from=` also accepts host names and wildcards; those depend on
+/// reverse DNS, so the policy accepts only literal addresses.
+fn validate_source_address(field: &str, value: &str) -> Result<()> {
+    let invalid = || Error::Validation {
+        field: field.to_owned(),
+        message: format!("{value:?} must be a literal IP address or CIDR block"),
+    };
+    let (address, prefix) = match value.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (value, None),
+    };
+    let address = address.parse::<std::net::IpAddr>().map_err(|_| invalid())?;
+    // sshd compares a normalized client address, so these forms parse but can
+    // never match: it rewrites IPv4-mapped clients to plain IPv4, and sees
+    // IPv6 link-local clients with a %interface suffix. Fail at policy time
+    // rather than locking the login out at connect time.
+    if let std::net::IpAddr::V6(v6) = address
+        && (v6.to_ipv4_mapped().is_some() || v6.is_unicast_link_local())
+    {
+        return Err(Error::Validation {
+            field: field.to_owned(),
+            message: format!(
+                "{value:?} can never match: use plain IPv4 instead of an IPv4-mapped address, and no IPv6 link-local address"
+            ),
+        });
+    }
+    if let Some(prefix) = prefix {
+        let max = if address.is_ipv4() { 32 } else { 128 };
+        // Reject signs and leading zeros so the rendered text stays canonical.
+        let bits = match prefix.parse::<u8>() {
+            Ok(bits) if bits <= max && bits.to_string() == prefix => bits,
+            _ => return Err(invalid()),
+        };
+        // sshd's address-list parser rejects a block with host bits set, which
+        // makes the whole from= list fail and refuses every source.
+        if !is_network_address(address, bits) {
+            return Err(Error::Validation {
+                field: field.to_owned(),
+                message: format!("{value:?} has host bits set; use the network address"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether every bit after the first `bits` of `address` is zero.
+fn is_network_address(address: std::net::IpAddr, bits: u8) -> bool {
+    match address {
+        std::net::IpAddr::V4(v4) => {
+            let host_mask = u32::MAX.checked_shr(u32::from(bits)).unwrap_or(0);
+            u32::from(v4) & host_mask == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            let host_mask = u128::MAX.checked_shr(u32::from(bits)).unwrap_or(0);
+            u128::from(v6) & host_mask == 0
+        }
+    }
 }
 
 /// One permanently revoked SSH public key.
@@ -1080,6 +1176,17 @@ impl Policy {
                     &access.unix_account,
                 )?;
             }
+            let mut sources = BTreeSet::new();
+            for source in &access.source_addresses {
+                let field = format!("{access_table}.{}.source_addresses", access.user);
+                validate_source_address(&field, source)?;
+                if !sources.insert(source.as_str()) {
+                    return Err(Error::Validation {
+                        field,
+                        message: format!("duplicate source address {source:?}"),
+                    });
+                }
+            }
             let key = (
                 access.user.clone(),
                 access.host.clone(),
@@ -1112,9 +1219,14 @@ impl Policy {
                     message: "requires at least one active user with ssh_admin = true".to_owned(),
                 });
             }
+            // A source-restricted login cannot recover a host from an
+            // arbitrary network location, so it does not keep an administrator
+            // path open. `restrict_session` alone still allows a shell, sudo
+            // included, from anywhere.
             let hosts_with_admin_access = self
                 .active_ssh_access()
                 .filter(|access| ssh_admins.contains(access.user.as_str()))
+                .filter(|access| access.source_addresses.is_empty())
                 .map(|access| access.host.as_str())
                 .collect::<BTreeSet<_>>();
             for host in self
@@ -2428,6 +2540,8 @@ revoked_at = "2026-07-24T20:14:15-07:00"
                 unix_account: "bob".to_owned(),
                 allow_ssh: true,
                 status: Status::Active,
+                source_addresses: vec!["192.0.2.10".to_owned(), "198.51.100.0/24".to_owned()],
+                restrict_session: true,
             },
             UserRemote {
                 user: "bob".to_owned(),
@@ -2435,6 +2549,8 @@ revoked_at = "2026-07-24T20:14:15-07:00"
                 unix_account: "builder".to_owned(),
                 allow_ssh: true,
                 status: Status::Planned,
+                source_addresses: Vec::new(),
+                restrict_session: false,
             },
             UserRemote {
                 user: "bob".to_owned(),
@@ -2442,6 +2558,8 @@ revoked_at = "2026-07-24T20:14:15-07:00"
                 unix_account: "bob".to_owned(),
                 allow_ssh: true,
                 status: Status::Disabled,
+                source_addresses: Vec::new(),
+                restrict_session: false,
             },
         ]);
 
@@ -2468,6 +2586,218 @@ revoked_at = "2026-07-24T20:14:15-07:00"
             authorization_snapshot(&before.policy),
             authorization_snapshot(&after.policy)
         );
+    }
+
+    fn console_login(policy: &mut Policy) -> &mut UserRemote {
+        policy
+            .user_remotes
+            .iter_mut()
+            .find(|login| login.user == "console")
+            .unwrap()
+    }
+
+    #[test]
+    fn login_source_addresses_accept_literal_ips_and_cidrs() {
+        for source in [
+            "192.0.2.20",
+            "198.51.100.0/24",
+            "2001:db8::1",
+            "2001:db8::/32",
+            "0.0.0.0/0",
+            "::/0",
+        ] {
+            let mut policy = Policy::load(crate::example_config_root()).unwrap();
+            console_login(&mut policy).source_addresses = vec![source.to_owned()];
+            policy
+                .validate()
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
+
+    #[test]
+    fn login_source_addresses_reject_non_literal_or_malformed_values() {
+        for source in [
+            "",
+            "host.example.test",
+            "192.0.2.*",
+            "!192.0.2.20",
+            // A quote would break out of the rendered from="..." list.
+            "192.0.2.20\",permitopen=\"*:*",
+            "192.0.2.20,198.51.100.1",
+            "192.0.2.0/33",
+            "2001:db8::/129",
+            "192.0.2.0/024",
+            "192.0.2.0/+8",
+            "192.0.2.0/",
+            "192.0.2.256",
+        ] {
+            let mut policy = Policy::load(crate::example_config_root()).unwrap();
+            console_login(&mut policy).source_addresses = vec![source.to_owned()];
+            let error = policy.validate().unwrap_err().to_string();
+            assert!(error.contains("source_addresses"), "{source}: {error}");
+            assert!(
+                error.contains("literal IP address or CIDR"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_source_blocks_with_host_bits_are_rejected() {
+        // A zero-length prefix keeps every bit as host bits, so only the
+        // all-zero address forms a valid /0 (sshd rejects 10.0.0.0/0).
+        for source in [
+            "192.0.2.1/24",
+            "2001:db8::1/32",
+            "198.51.100.128/24",
+            "10.0.0.0/0",
+            "2001:db8::/0",
+        ] {
+            let mut policy = Policy::load(crate::example_config_root()).unwrap();
+            console_login(&mut policy).source_addresses = vec![source.to_owned()];
+            let error = policy.validate().unwrap_err().to_string();
+            assert!(error.contains("host bits set"), "{source}: {error}");
+        }
+        // Full-length prefixes name one host and are network addresses.
+        for source in ["192.0.2.1/32", "2001:db8::1/128"] {
+            let mut policy = Policy::load(crate::example_config_root()).unwrap();
+            console_login(&mut policy).source_addresses = vec![source.to_owned()];
+            policy
+                .validate()
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
+
+    #[test]
+    fn login_sources_that_sshd_never_matches_are_rejected() {
+        for source in [
+            "::ffff:192.0.2.20",
+            "::ffff:192.0.2.0/120",
+            "fe80::1",
+            "fe80::/64",
+        ] {
+            let mut policy = Policy::load(crate::example_config_root()).unwrap();
+            console_login(&mut policy).source_addresses = vec![source.to_owned()];
+            let error = policy.validate().unwrap_err().to_string();
+            assert!(error.contains("can never match"), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn legacy_policy_rejects_login_restrictions() {
+        let legacy_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/legacy-site-config");
+        for addition in [
+            "source_addresses = [\"192.0.2.20\"]",
+            "restrict_session = true",
+        ] {
+            let dir = tempdir().unwrap();
+            copy_tree(&legacy_root, dir.path());
+            let remotes = dir.path().join("policy/user-remotes.toml");
+            let text = fs::read_to_string(&remotes).unwrap().replacen(
+                "allow_ssh = true\n",
+                &format!("allow_ssh = true\n{addition}\n"),
+                1,
+            );
+            fs::write(&remotes, text).unwrap();
+
+            let error = Policy::load(dir.path()).unwrap_err().to_string();
+            assert!(
+                error.contains("canonical policy format"),
+                "{addition}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_login_source_addresses_are_rejected() {
+        let mut policy = Policy::load(crate::example_config_root()).unwrap();
+        console_login(&mut policy).source_addresses =
+            vec!["192.0.2.20".to_owned(), "192.0.2.20".to_owned()];
+
+        let error = policy.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate source address"), "{error}");
+    }
+
+    #[test]
+    fn principal_options_render_only_the_requested_restrictions() {
+        let mut policy = Policy::load(crate::example_config_root()).unwrap();
+        let login = console_login(&mut policy);
+        assert_eq!(
+            login.principal_options().as_deref(),
+            Some("from=\"192.0.2.20\",restrict,pty")
+        );
+        login.restrict_session = false;
+        assert_eq!(
+            login.principal_options().as_deref(),
+            Some("from=\"192.0.2.20\"")
+        );
+        login.source_addresses.push("198.51.100.0/24".to_owned());
+        assert_eq!(
+            login.principal_options().as_deref(),
+            Some("from=\"192.0.2.20,198.51.100.0/24\"")
+        );
+        login.source_addresses.clear();
+        login.restrict_session = true;
+        assert_eq!(login.principal_options().as_deref(), Some("restrict,pty"));
+        login.restrict_session = false;
+        assert!(login.principal_options().is_none());
+    }
+
+    #[test]
+    fn session_only_restriction_still_satisfies_admin_access() {
+        let mut policy = Policy::load(crate::example_config_root()).unwrap();
+        // restrict_session still allows a shell from anywhere, so the admin
+        // keeps a recovery path and the safeguard must not fire.
+        policy
+            .user_remotes
+            .iter_mut()
+            .find(|login| login.user == "alice" && login.host == "edge-host")
+            .unwrap()
+            .restrict_session = true;
+
+        policy.validate().unwrap();
+    }
+
+    #[test]
+    fn restricted_admin_login_does_not_satisfy_admin_access() {
+        let mut policy = Policy::load(crate::example_config_root()).unwrap();
+        // The admin's only edge-host login becomes source-restricted, which
+        // could strand recovery; the lockout safeguard must reject it.
+        policy
+            .user_remotes
+            .iter_mut()
+            .find(|login| login.user == "alice" && login.host == "edge-host")
+            .unwrap()
+            .source_addresses = vec!["192.0.2.30".to_owned()];
+
+        let error = policy.validate().unwrap_err().to_string();
+        assert!(error.contains("edge-host"), "{error}");
+        assert!(error.contains("ssh_admin = true"), "{error}");
+    }
+
+    #[test]
+    fn canonical_login_restrictions_round_trip() {
+        let policy = Policy::load(crate::example_config_root()).unwrap();
+        let dir = tempdir().unwrap();
+        super::write_canonical(&policy, dir.path().join("policy")).unwrap();
+        let text = fs::read_to_string(dir.path().join("policy/hosts/edge-host.toml")).unwrap();
+        assert!(
+            text.contains("source_addresses = [\"192.0.2.20\"]"),
+            "{text}"
+        );
+        assert!(text.contains("restrict_session = true"), "{text}");
+        // Unrestricted logins keep their compact historical form.
+        assert!(!text.contains("restrict_session = false"), "{text}");
+
+        let reloaded = Policy::load(dir.path()).unwrap();
+        let login = reloaded
+            .user_remotes
+            .iter()
+            .find(|login| login.user == "console")
+            .unwrap();
+        assert_eq!(login.source_addresses, ["192.0.2.20"]);
+        assert!(login.restrict_session);
     }
 
     #[test]

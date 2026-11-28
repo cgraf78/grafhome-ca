@@ -211,6 +211,44 @@ future or historical row. A default enrollment uses `enrollment = true`; its
 nested table is needed only for non-default options such as
 `allow_effectively_infinite_cert` or a non-active status.
 
+A `logins` row may narrow how its certificate is used, which suits a service
+identity such as a browser terminal that logs in as a person's account:
+
+```toml
+[[user_access.console.logins]]
+unix_account = "alice"
+source_addresses = ["192.0.2.20"]
+restrict_session = true
+```
+
+`source_addresses` lists literal client IP addresses or CIDR network addresses
+and renders an sshd `from=` option, so a stolen key and certificate cannot log
+in from anywhere else. Host names, wildcards, and negations are rejected
+because they depend on reverse DNS or invert intent. Blocks with host bits set
+are rejected because sshd refuses the whole list, locking the login out from
+every source. IPv4-mapped and IPv6 link-local addresses are rejected because
+they never match the normalized address sshd compares. `restrict_session = true` renders `restrict,pty`: shells, commands,
+and SFTP keep working, while port, agent, X11, and stream-local forwarding and
+`~/.ssh/rc` are refused. The rendered principals line becomes
+`from="192.0.2.20",restrict,pty console`; unrestricted logins keep the bare
+principal name.
+
+These options narrow how the certificate is used; they do not confine the
+account. The source restriction holds only on a server where the account has
+no other key path, such as `AuthorizedKeysFile none`; otherwise anyone with a
+shell from an allowed source can install a plain key. A shell can also open its
+own outbound connections, and code already running on an allowed source host is
+not contained at all.
+
+With a single `GRAFHOME_CA_AUTH_PRINCIPALS_FILE`, every account reads the same
+lines, so a principal's options apply to all of them, and two logins that give
+one principal different options are rejected at render time. A
+source-restricted login does not count toward `require_ssh_admin_access`,
+because it cannot recover a host from an arbitrary location; `restrict_session`
+alone does. Login restrictions require the canonical policy format. Each host
+must run a binary that understands these fields before the policy uses them;
+older binaries reject the unknown keys.
+
 Operational inventories such as schedulers, static keys, emergency access, and
 CA operators are intentionally outside Grafhome CA policy. The CLI does not
 enforce them, so keeping them beside executable authorization policy would give

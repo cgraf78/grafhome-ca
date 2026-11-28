@@ -307,6 +307,42 @@ unexpected = true
     }
 
     #[test]
+    fn schema_accepts_example_login_restrictions() {
+        crate::schema::validate_config_root(example_config_root()).unwrap();
+    }
+
+    #[test]
+    fn schema_rejects_bad_login_restrictions() {
+        for to in [
+            // A redundant false is rejected like other inert switches.
+            "restrict_session = false",
+            "source_addresses = []",
+            "source_addresses = [\"host.example.test\"]",
+            "source_addresses = [\"192.0.2.20\", \"192.0.2.20\"]",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            copy_tree(&example_config_root(), dir.path());
+            let host = dir.path().join("policy/hosts/edge-host.toml");
+            let from = if to.starts_with("restrict_session") {
+                "restrict_session = true"
+            } else {
+                "source_addresses = [\"192.0.2.20\"]"
+            };
+            let text = fs::read_to_string(&host).unwrap();
+            assert!(text.contains(from));
+            fs::write(&host, text.replace(from, to)).unwrap();
+
+            let error = crate::schema::validate_config_root(dir.path())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("policy/hosts/edge-host.toml"),
+                "{to}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn schema_rejects_bad_x509_declarations() {
         for (from, to, needle) in [
             ("role = \"client\"", "role = \"both\"", "both"),
